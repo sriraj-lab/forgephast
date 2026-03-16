@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgephast"
+version = "0.1.0"
+description = "HapStore-native population amplifier and polygenic phenotype simulator"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "hapstore>=0.1.0",
+    "numpy>=2.0,<3.0",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+    "scipy>=1.13,<2.0",
+    "scikit-learn>=1.5",
+    "matplotlib>=3.8",
+    "pysam>=0.22",
+    "zarr>=2.16,<3",
+    "numcodecs>=0.12,<0.16",
+]
+
+[project.optional-dependencies]
+accel = ["numba>=0.61", "cython>=3.0"]
+msprime = ["msprime>=1.3", "tskit>=0.6"]
+dev = ["pytest>=8.0", "pytest-benchmark>=4.0"]
+
+[project.scripts]
+forgephast = "forgephast.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
