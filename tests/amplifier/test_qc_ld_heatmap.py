@@ -7,8 +7,8 @@ from forgephast.amplifier.config import from_yaml
 from forgephast.amplifier.donors import build_manifest_from_config
 from forgephast.amplifier.merge import merge_chromosome
 from forgephast.amplifier.qc import run_qc
-from forgephast.amplifier.qc.ld_heatmap import ld_heatmap_binned_from_genotypes
-from forgephast.amplifier.simulation import simulate_chromosome
+from forgephast.amplifier.qc.metrics.ld_heatmap import ld_heatmap_binned_from_genotypes
+from forgephast.amplifier.simulation import simulate_chromosome_population_shard_pool
 
 from .conftest import write_test_config
 
@@ -85,8 +85,7 @@ def test_ld_heatmap_plot_written_in_qc(tmp_path):
 
     cfg = from_yaml(cfg_path)
     build_manifest_from_config(cfg)
-    simulate_chromosome(cfg, chrom=21, shard_id=0, n_shards=2)
-    simulate_chromosome(cfg, chrom=21, shard_id=1, n_shards=2)
+    simulate_chromosome_population_shard_pool(cfg, chrom=21, n_shards=2, task_workers=2, threads_per_task=1, task_start_method="fork")
     merge_chromosome(cfg, chrom=21, n_shards=2)
     report = run_qc(cfg, chrom=21, n_shards=2)
 

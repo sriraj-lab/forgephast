@@ -12,7 +12,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from forgephast._internal.seeding import stable_seed as _shared_stable_seed
+from hapstore.seeding import stable_seed as _shared_stable_seed
 from forgephast._internal.logging import setup_logging as _shared_setup_logging
 
 logger = logging.getLogger(__name__)

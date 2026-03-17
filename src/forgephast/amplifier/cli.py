@@ -12,9 +12,7 @@ from .api import (
     merge,
     qc,
     qc_donor_round_robin,
-    qc_synthetic_premerge_round_robin,
     simulate,
-    simulate_pool,
 )
 from .utils import resolve_log_file_path, setup_logging
 
@@ -49,27 +47,21 @@ def _parse_args() -> argparse.Namespace:
     p_manifest = sub.add_parser("build-manifest", help="Build donor manifests")
     p_manifest.add_argument("--config", required=True)
 
-    p_cache = sub.add_parser("build-cache", help="Stage 0: build donor panel caches")
+    p_cache = sub.add_parser("build-cache", help="Stage 0: build donor HapStore caches")
     p_cache.add_argument("--config", required=True)
     p_cache.add_argument("--chrom", type=int, action="append", default=None)
     p_cache.add_argument("--force", action="store_true")
 
-    p_sim = sub.add_parser("simulate", help="Simulate a chromosome (optionally shard)")
+    p_sim = sub.add_parser(
+        "simulate",
+        help="Simulate a chromosome with the shard-pool engine (`n_shards=1` preserves single-shard behavior)",
+    )
     p_sim.add_argument("--config", required=True)
     p_sim.add_argument("--chrom", required=True, type=int)
-    p_sim.add_argument("--shard-id", type=int, default=0)
-    p_sim.add_argument("--n-shards", type=int, default=1)
-
-    p_sim_pool = sub.add_parser(
-        "simulate-pool",
-        help="Run chromosome simulation as a multiprocessing pool over (population, shard) tasks",
-    )
-    p_sim_pool.add_argument("--config", required=True)
-    p_sim_pool.add_argument("--chrom", required=True, type=int)
-    p_sim_pool.add_argument("--n-shards", type=int, default=None)
-    p_sim_pool.add_argument("--workers", type=int, default=None)
-    p_sim_pool.add_argument("--threads-per-task", type=int, default=None)
-    p_sim_pool.add_argument("--task-start-method", choices=["fork", "spawn", "forkserver"], default=None)
+    p_sim.add_argument("--n-shards", type=int, default=None)
+    p_sim.add_argument("--workers", type=int, default=None)
+    p_sim.add_argument("--threads-per-task", type=int, default=None)
+    p_sim.add_argument("--task-start-method", choices=["fork", "spawn", "forkserver"], default=None)
 
     p_merge = sub.add_parser("merge", help="Merge shard outputs for a chromosome")
     p_merge.add_argument("--config", required=True)
@@ -100,23 +92,6 @@ def _parse_args() -> argparse.Namespace:
     p_qc_rr.add_argument("--seed", type=int, default=42)
     p_qc_rr.add_argument("--workers", type=int, default=1)
     p_qc_rr.add_argument("--population", action="append", default=None)
-
-    p_qc_syn_rr = sub.add_parser(
-        "qc-synthetic-premerge-round-robin",
-        help="Compute within-pop synthetic FST spread from shard outputs before merge",
-    )
-    p_qc_syn_rr.add_argument("--config", required=True)
-    p_qc_syn_rr.add_argument("--chrom", required=True, type=int)
-    p_qc_syn_rr.add_argument("--n-shards", required=True, type=int)
-    p_qc_syn_rr.add_argument(
-        "--n-folds",
-        type=int,
-        default=None,
-        help="Deprecated no-op for synthetic RR; retained for compatibility.",
-    )
-    p_qc_syn_rr.add_argument("--seed", type=int, default=42)
-    p_qc_syn_rr.add_argument("--workers", type=int, default=1)
-    p_qc_syn_rr.add_argument("--population", action="append", default=None)
 
     return parser.parse_args()
 
@@ -184,22 +159,6 @@ def main() -> None:
         result = simulate(
             config_path=args.config,
             chrom=args.chrom,
-            shard_id=args.shard_id,
-            n_shards=args.n_shards,
-        )
-        logger.info("combined_vcf=%s", result.combined_vcf)
-        logger.info("combined_hapstore=%s", result.combined_hapstore)
-        logger.info("sample_manifest=%s", result.sample_manifest_path)
-        if result.combined_pgen_prefix is not None:
-            logger.info("combined_pgen_prefix=%s", result.combined_pgen_prefix)
-        logger.info("elapsed_sec=%.3f", result.elapsed_seconds)
-        logger.info("stage_timings=%s", json.dumps(result.stage_timings, sort_keys=True))
-        return
-
-    if args.command == "simulate-pool":
-        result = simulate_pool(
-            config_path=args.config,
-            chrom=args.chrom,
             n_shards=args.n_shards,
             workers=args.workers,
             threads_per_task=args.threads_per_task,
@@ -209,6 +168,12 @@ def main() -> None:
         logger.info("sample_manifest_paths=%s", json.dumps([str(x) for x in result.sample_manifest_paths], sort_keys=True))
         logger.info("elapsed_sec=%.3f", result.elapsed_seconds)
         logger.info("stage_timings=%s", json.dumps(result.stage_timings, sort_keys=True))
+        if result.n_shards == 1:
+            logger.info("combined_vcf=%s", result.combined_vcf)
+            logger.info("combined_hapstore=%s", result.combined_hapstore)
+            logger.info("sample_manifest=%s", result.sample_manifest_path)
+            if result.combined_pgen_prefix is not None:
+                logger.info("combined_pgen_prefix=%s", result.combined_pgen_prefix)
         return
 
     if args.command == "merge":
@@ -219,15 +184,11 @@ def main() -> None:
             n_shards=args.n_shards,
             merge_combined=args.merge_combined,
         )
-        logger.info("merged_vcf=%s", result.merged_vcf)
         logger.info("combined_hapstore=%s", result.combined_hapstore)
         logger.info("merged_manifest=%s", result.merged_manifest)
-        logger.info("population_merged_vcfs=%s", json.dumps({k: str(v) for k, v in result.population_merged_vcfs.items()}, sort_keys=True))
         logger.info("population_merged_hapstores=%s", json.dumps({k: str(v) for k, v in result.population_merged_hapstores.items()}, sort_keys=True))
         if result.merged_pgen_prefix is not None:
             logger.info("merged_pgen_prefix=%s", result.merged_pgen_prefix)
-        logger.info("merge_backend=%s", result.merge_backend)
-        logger.info("combined_merge_backend=%s", result.combined_merge_backend)
         logger.info("thread_plan=%s", json.dumps(result.thread_plan, sort_keys=True))
         logger.info("stage_timings=%s", json.dumps(result.stage_timings, sort_keys=True))
         return
@@ -245,22 +206,6 @@ def main() -> None:
             args.config,
             chrom=args.chrom,
             fold_fraction=args.fold_fraction,
-            seed=args.seed,
-            workers=args.workers,
-            populations=args.population,
-        )
-        logger.info("diagnostics=%s", result.diagnostics_path)
-        logger.info("table=%s", result.table_path)
-        logger.info("n_records=%s", result.n_records)
-        logger.info("summary_by_population=%s", json.dumps(result.summary_by_population, sort_keys=True))
-        return
-
-    if args.command == "qc-synthetic-premerge-round-robin":
-        result = qc_synthetic_premerge_round_robin(
-            args.config,
-            chrom=args.chrom,
-            n_shards=args.n_shards,
-            n_folds=args.n_folds,
             seed=args.seed,
             workers=args.workers,
             populations=args.population,

@@ -9,6 +9,27 @@ from typing import Any
 import yaml
 
 
+def _check_positive(value, name):
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+
+def _check_non_negative(value, name):
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
+
+def _check_in_range(value, lo, hi, name):
+    if value < lo or value > hi:
+        raise ValueError(f"{name} must be in [{lo}, {hi}]")
+
+def _check_one_of(value, choices, name):
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {choices}")
+
+def _check_non_empty(value, name):
+    if not value:
+        raise ValueError(f"{name} cannot be empty")
+
+
 @dataclass
 class InputConfig:
     metadata_path: str
@@ -152,7 +173,7 @@ class SimulationConfig:
     threads_per_task: int = 1
     donor_io_workers: int = 1
 
-    # simulate-pool settings (optional unless using `forgephast amplify simulate-pool`).
+    # Unified simulate settings for shard-pool execution.
     n_shards: int | None = None
     task_workers: int | None = None
     task_start_method: str = "fork"
@@ -190,65 +211,29 @@ class OutputConfig:
     hapstore_store_genotypes: bool = False
     write_combined_shard_output: bool = True
     merge_combined_populations: bool = True
-    bgzf_compression_level: int = 6
     plink2_path: str = "plink2"
-    plink1_path: str = "plink"
-    pgen_source_preference: str = "auto"
     hapstore_vcf_plink2_location: str | None = "system"
     hapstore_vcf_keep_intermediate_pgen: bool = False
     hapstore_vcf_n_shards: int = 1
-    merge_backend: str = "auto"
-    hapstore_merge_strategy: str = "streaming"
     hapstore_merge_batch_size: int = 20
     merge_population_workers: int = 1
-    bcftools_path: str = "bcftools"
-    bcftools_threads: int = 1
-    bcftools_no_index: bool = True
 
     def validate(self) -> None:
-        valid_backends = {"auto", "python", "bcftools"}
-        valid_pgen_source_preferences = {"auto", "hapstore_direct", "vcf_bridge"}
-        valid_hapstore_merge_strategies = {"streaming", "legacy_materialize"}
-        if not self.root:
-            raise ValueError("outputs.root cannot be empty")
-        if not (0 <= self.bgzf_compression_level <= 9):
-            raise ValueError("outputs.bgzf_compression_level must be in [0, 9]")
-        if not self.write_phased_vcf and not self.write_pgen and not self.write_hapstore:
-            raise ValueError(
-                "At least one of outputs.write_phased_vcf, outputs.write_pgen, or outputs.write_hapstore must be true"
-            )
-        if self.hapstore_chunk_variant_size <= 0:
-            raise ValueError("outputs.hapstore_chunk_variant_size must be > 0")
-        if self.hapstore_chunk_haplotype_size is not None and self.hapstore_chunk_haplotype_size <= 0:
-            raise ValueError("outputs.hapstore_chunk_haplotype_size must be > 0 when provided")
-        if self.hapstore_chunk_sample_size is not None and self.hapstore_chunk_sample_size <= 0:
-            raise ValueError("outputs.hapstore_chunk_sample_size must be > 0 when provided")
-        if self.hapstore_compression_level < 0:
-            raise ValueError("outputs.hapstore_compression_level must be >= 0")
-        if self.merge_backend not in valid_backends:
-            raise ValueError(f"outputs.merge_backend must be one of {valid_backends}")
-        if self.pgen_source_preference not in valid_pgen_source_preferences:
-            raise ValueError(
-                "outputs.pgen_source_preference must be one of "
-                f"{valid_pgen_source_preferences}"
-            )
+        _check_non_empty(self.root, "outputs.root")
+        if not self.write_hapstore:
+            raise ValueError("outputs.write_hapstore must be true; amplifier outputs are HapStore-native")
+        _check_positive(self.hapstore_chunk_variant_size, "outputs.hapstore_chunk_variant_size")
+        if self.hapstore_chunk_haplotype_size is not None:
+            _check_positive(self.hapstore_chunk_haplotype_size, "outputs.hapstore_chunk_haplotype_size")
+        if self.hapstore_chunk_sample_size is not None:
+            _check_positive(self.hapstore_chunk_sample_size, "outputs.hapstore_chunk_sample_size")
+        _check_non_negative(self.hapstore_compression_level, "outputs.hapstore_compression_level")
         if self.hapstore_vcf_plink2_location is not None and not str(self.hapstore_vcf_plink2_location).strip():
             raise ValueError("outputs.hapstore_vcf_plink2_location cannot be empty when provided")
-        if self.hapstore_vcf_n_shards <= 0:
-            raise ValueError("outputs.hapstore_vcf_n_shards must be > 0")
-        if self.hapstore_merge_strategy not in valid_hapstore_merge_strategies:
-            raise ValueError(
-                "outputs.hapstore_merge_strategy must be one of "
-                f"{valid_hapstore_merge_strategies}"
-            )
-        if self.hapstore_merge_batch_size <= 0:
-            raise ValueError("outputs.hapstore_merge_batch_size must be > 0")
-        if self.merge_population_workers <= 0:
-            raise ValueError("outputs.merge_population_workers must be > 0")
-        if self.bcftools_threads <= 0:
-            raise ValueError("outputs.bcftools_threads must be > 0")
-        if not self.plink1_path:
-            raise ValueError("outputs.plink1_path cannot be empty")
+        _check_positive(self.hapstore_vcf_n_shards, "outputs.hapstore_vcf_n_shards")
+        _check_positive(self.hapstore_merge_batch_size, "outputs.hapstore_merge_batch_size")
+        _check_positive(self.merge_population_workers, "outputs.merge_population_workers")
+        _check_non_empty(self.plink2_path, "outputs.plink2_path")
 
 
 @dataclass
@@ -259,7 +244,8 @@ class QcConfig:
     within_split_abs_max: float = 0.002
     backend: str = "python"
     main_pairwise_mode: str = "sampled"
-    rr_pairwise_mode: str = "exact"
+    synthetic_shard_round_robin_enabled: bool = False
+    synthetic_shard_round_robin_pairwise_mode: str = "exact"
     seed: int = 42
     sampled_max_diploids_per_population: int = 4000
     sampled_max_variants: int = 50000
@@ -272,9 +258,8 @@ class QcConfig:
     matrix_workers: int = 8
     numba_threads: int | None = None
     matrix_variant_block_size: int = 2000
-    plink_threads: int = 1
-    synthetic_round_robin_max_pairs_per_population: int | None = None
-    synthetic_rr_min_cpus_per_match: int = 1
+    synthetic_shard_round_robin_max_pairs_per_population: int | None = None
+    synthetic_shard_round_robin_min_cpus_per_match: int = 1
     ld_decay_enabled: bool = False
     ld_decay_backend: str = "python"
     ld_decay_min_maf: float = 0.05
@@ -333,8 +318,6 @@ class QcConfig:
     roh_max_gap_cm: float = 0.25
     roh_hist_n_bins: int = 60
 
-    plink2_parity_enabled: bool = False
-    plink2_parity_max_pairs_per_population: int = 3000
     engine_aware_gating: bool = True
     msprime_source_weight_abs_tolerance: float = 0.05
     admixed_qc_mode: str = "auto"
@@ -351,80 +334,60 @@ class QcConfig:
     admixed_diag_stratified_ld_enabled: bool = False
 
     def validate(self) -> None:
-        if self.fst_tolerance_relative < 0:
-            raise ValueError("qc.fst_tolerance_relative must be >= 0")
-        if self.within_split_abs_max < 0:
-            raise ValueError("qc.within_split_abs_max must be >= 0")
-        if self.backend not in {"python", "plink_counts", "plink_native_fst"}:
-            raise ValueError("qc.backend must be one of {'python', 'plink_counts', 'plink_native_fst'}")
-        if self.main_pairwise_mode not in {"sampled", "exact"}:
-            raise ValueError("qc.main_pairwise_mode must be one of {'sampled', 'exact'}")
-        if self.rr_pairwise_mode not in {"sampled", "exact"}:
-            raise ValueError("qc.rr_pairwise_mode must be one of {'sampled', 'exact'}")
-        if self.seed < 0:
-            raise ValueError("qc.seed must be >= 0")
-        if self.sampled_max_diploids_per_population <= 0:
-            raise ValueError("qc.sampled_max_diploids_per_population must be > 0")
-        if self.sampled_max_variants <= 0:
-            raise ValueError("qc.sampled_max_variants must be > 0")
-        if self.sampled_gate_tolerance_relative < 0:
-            raise ValueError("qc.sampled_gate_tolerance_relative must be >= 0")
-        if self.fst_stochastic_gate_mode not in {"auto", "on", "off"}:
-            raise ValueError("qc.fst_stochastic_gate_mode must be one of {'auto', 'on', 'off'}")
+        _check_non_negative(self.fst_tolerance_relative, "qc.fst_tolerance_relative")
+        _check_non_negative(self.within_split_abs_max, "qc.within_split_abs_max")
+        _check_one_of(self.backend, {"python"}, "qc.backend")
+        _check_one_of(self.main_pairwise_mode, {"sampled", "exact"}, "qc.main_pairwise_mode")
+        _check_one_of(
+            self.synthetic_shard_round_robin_pairwise_mode,
+            {"sampled", "exact"},
+            "qc.synthetic_shard_round_robin_pairwise_mode",
+        )
+        _check_non_negative(self.seed, "qc.seed")
+        _check_positive(self.sampled_max_diploids_per_population, "qc.sampled_max_diploids_per_population")
+        _check_positive(self.sampled_max_variants, "qc.sampled_max_variants")
+        _check_non_negative(self.sampled_gate_tolerance_relative, "qc.sampled_gate_tolerance_relative")
+        _check_one_of(self.fst_stochastic_gate_mode, {"auto", "on", "off"}, "qc.fst_stochastic_gate_mode")
         if (
             self.fst_stochastic_small_pop_fraction_threshold <= 0.0
             or self.fst_stochastic_small_pop_fraction_threshold > 1.0
         ):
             raise ValueError("qc.fst_stochastic_small_pop_fraction_threshold must be in (0.0, 1.0]")
-        if self.fst_stochastic_reps <= 0:
-            raise ValueError("qc.fst_stochastic_reps must be > 0")
-        if self.fst_stochastic_min_p_ge < 0.0 or self.fst_stochastic_min_p_ge > 1.0:
-            raise ValueError("qc.fst_stochastic_min_p_ge must be in [0.0, 1.0]")
-        if self.matrix_workers <= 0:
-            raise ValueError("qc.matrix_workers must be > 0")
-        if self.numba_threads is not None and self.numba_threads <= 0:
-            raise ValueError("qc.numba_threads must be > 0 when provided")
-        if self.matrix_variant_block_size <= 0:
-            raise ValueError("qc.matrix_variant_block_size must be > 0")
-        if self.plink_threads <= 0:
-            raise ValueError("qc.plink_threads must be > 0")
-        if (
-            self.synthetic_round_robin_max_pairs_per_population is not None
-            and self.synthetic_round_robin_max_pairs_per_population <= 0
-        ):
-            raise ValueError("qc.synthetic_round_robin_max_pairs_per_population must be > 0 when provided")
-        if self.synthetic_rr_min_cpus_per_match <= 0:
-            raise ValueError("qc.synthetic_rr_min_cpus_per_match must be > 0")
-        if self.ld_decay_backend not in {"python", "plink"}:
-            raise ValueError("qc.ld_decay_backend must be one of {'python', 'plink'}")
+        _check_positive(self.fst_stochastic_reps, "qc.fst_stochastic_reps")
+        _check_in_range(self.fst_stochastic_min_p_ge, 0.0, 1.0, "qc.fst_stochastic_min_p_ge")
+        _check_positive(self.matrix_workers, "qc.matrix_workers")
+        if self.numba_threads is not None:
+            _check_positive(self.numba_threads, "qc.numba_threads")
+        _check_positive(self.matrix_variant_block_size, "qc.matrix_variant_block_size")
+        if self.synthetic_shard_round_robin_max_pairs_per_population is not None:
+            _check_positive(
+                self.synthetic_shard_round_robin_max_pairs_per_population,
+                "qc.synthetic_shard_round_robin_max_pairs_per_population",
+            )
+        _check_positive(
+            self.synthetic_shard_round_robin_min_cpus_per_match,
+            "qc.synthetic_shard_round_robin_min_cpus_per_match",
+        )
+        _check_one_of(self.ld_decay_backend, {"python"}, "qc.ld_decay_backend")
         if self.ld_decay_min_maf <= 0 or self.ld_decay_min_maf >= 0.5:
             raise ValueError("qc.ld_decay_min_maf must be in (0.0, 0.5)")
-        if self.ld_decay_max_distance_cm <= 0:
-            raise ValueError("qc.ld_decay_max_distance_cm must be > 0")
-        if self.ld_decay_bin_width_cm <= 0:
-            raise ValueError("qc.ld_decay_bin_width_cm must be > 0")
+        _check_positive(self.ld_decay_max_distance_cm, "qc.ld_decay_max_distance_cm")
+        _check_positive(self.ld_decay_bin_width_cm, "qc.ld_decay_bin_width_cm")
         if self.ld_decay_bin_width_cm >= self.ld_decay_max_distance_cm:
             raise ValueError("qc.ld_decay_bin_width_cm must be < qc.ld_decay_max_distance_cm")
-        if self.ld_decay_min_pairs_per_bin <= 0:
-            raise ValueError("qc.ld_decay_min_pairs_per_bin must be > 0")
-        if self.ld_decay_rmse_max < 0:
-            raise ValueError("qc.ld_decay_rmse_max must be >= 0")
-        if self.ld_decay_half_decay_rel_diff_max < 0:
-            raise ValueError("qc.ld_decay_half_decay_rel_diff_max must be >= 0")
+        _check_positive(self.ld_decay_min_pairs_per_bin, "qc.ld_decay_min_pairs_per_bin")
+        _check_non_negative(self.ld_decay_rmse_max, "qc.ld_decay_rmse_max")
+        _check_non_negative(self.ld_decay_half_decay_rel_diff_max, "qc.ld_decay_half_decay_rel_diff_max")
         if self.ld_decay_half_decay_r2_threshold <= 0 or self.ld_decay_half_decay_r2_threshold >= 1:
             raise ValueError("qc.ld_decay_half_decay_r2_threshold must be in (0.0, 1.0)")
         if self.ld_heatmap_n_position_bins < 5:
             raise ValueError("qc.ld_heatmap_n_position_bins must be >= 5")
-        if self.ext_max_diploids_per_population <= 0:
-            raise ValueError("qc.ext_max_diploids_per_population must be > 0")
+        _check_positive(self.ext_max_diploids_per_population, "qc.ext_max_diploids_per_population")
         if self.ext_max_variants <= 1:
             raise ValueError("qc.ext_max_variants must be > 1")
-        if not self.plots_dirname:
-            raise ValueError("qc.plots_dirname cannot be empty")
-        if self.king_max_within_pairs_per_population <= 0:
-            raise ValueError("qc.king_max_within_pairs_per_population must be > 0")
-        if self.king_max_cross_pairs_per_pop_pair <= 0:
-            raise ValueError("qc.king_max_cross_pairs_per_pop_pair must be > 0")
+        _check_non_empty(self.plots_dirname, "qc.plots_dirname")
+        _check_positive(self.king_max_within_pairs_per_population, "qc.king_max_within_pairs_per_population")
+        _check_positive(self.king_max_cross_pairs_per_pop_pair, "qc.king_max_cross_pairs_per_pop_pair")
         if self.king_hist_n_bins < 5:
             raise ValueError("qc.king_hist_n_bins must be >= 5")
         if self.king_hist_max <= self.king_hist_min:
@@ -432,74 +395,48 @@ class QcConfig:
         if self.afs_n_bins < 5:
             raise ValueError("qc.afs_n_bins must be >= 5")
 
-        if self.pca_n_components <= 0:
-            raise ValueError("qc.pca_n_components must be > 0")
-        if self.pca_auc_n_components <= 0:
-            raise ValueError("qc.pca_auc_n_components must be > 0")
+        _check_positive(self.pca_n_components, "qc.pca_n_components")
+        _check_positive(self.pca_auc_n_components, "qc.pca_auc_n_components")
         if self.pca_auc_n_components > self.pca_n_components:
             raise ValueError("qc.pca_auc_n_components must be <= qc.pca_n_components")
         if self.pca_min_maf <= 0 or self.pca_min_maf >= 0.5:
             raise ValueError("qc.pca_min_maf must be in (0.0, 0.5)")
 
-        if self.roh_max_diploids_per_population <= 0:
-            raise ValueError("qc.roh_max_diploids_per_population must be > 0")
-        if self.roh_max_variants <= 0:
-            raise ValueError("qc.roh_max_variants must be > 0")
-        if self.roh_min_segment_cm <= 0:
-            raise ValueError("qc.roh_min_segment_cm must be > 0")
-        if self.roh_max_gap_cm <= 0:
-            raise ValueError("qc.roh_max_gap_cm must be > 0")
+        _check_positive(self.roh_max_diploids_per_population, "qc.roh_max_diploids_per_population")
+        _check_positive(self.roh_max_variants, "qc.roh_max_variants")
+        _check_positive(self.roh_min_segment_cm, "qc.roh_min_segment_cm")
+        _check_positive(self.roh_max_gap_cm, "qc.roh_max_gap_cm")
         if self.roh_hist_n_bins < 5:
             raise ValueError("qc.roh_hist_n_bins must be >= 5")
 
         if self.hwe_min_maf <= 0.0 or self.hwe_min_maf >= 0.5:
             raise ValueError("qc.hwe_min_maf must be in (0.0, 0.5)")
-        if self.hwe_min_n_obs <= 0:
-            raise ValueError("qc.hwe_min_n_obs must be > 0")
-        if self.hwe_logp_max <= 0.0:
-            raise ValueError("qc.hwe_logp_max must be > 0")
-        if self.hwe_logp_n_bins <= 0:
-            raise ValueError("qc.hwe_logp_n_bins must be > 0")
-        if self.hwe_hist_rmse_max is not None and self.hwe_hist_rmse_max < 0.0:
-            raise ValueError("qc.hwe_hist_rmse_max must be >= 0 when provided")
-        if self.hwe_tail_excess_abs_max is not None and self.hwe_tail_excess_abs_max < 0.0:
-            raise ValueError("qc.hwe_tail_excess_abs_max must be >= 0 when provided")
+        _check_positive(self.hwe_min_n_obs, "qc.hwe_min_n_obs")
+        _check_positive(self.hwe_logp_max, "qc.hwe_logp_max")
+        _check_positive(self.hwe_logp_n_bins, "qc.hwe_logp_n_bins")
+        if self.hwe_hist_rmse_max is not None:
+            _check_non_negative(self.hwe_hist_rmse_max, "qc.hwe_hist_rmse_max")
+        if self.hwe_tail_excess_abs_max is not None:
+            _check_non_negative(self.hwe_tail_excess_abs_max, "qc.hwe_tail_excess_abs_max")
 
         if self.inbreeding_f_min_maf <= 0.0 or self.inbreeding_f_min_maf >= 0.5:
             raise ValueError("qc.inbreeding_f_min_maf must be in (0.0, 0.5)")
-        if self.inbreeding_f_min_n_obs <= 0:
-            raise ValueError("qc.inbreeding_f_min_n_obs must be > 0")
+        _check_positive(self.inbreeding_f_min_n_obs, "qc.inbreeding_f_min_n_obs")
         if self.inbreeding_f_hist_max <= self.inbreeding_f_hist_min:
             raise ValueError("qc.inbreeding_f_hist_max must be > qc.inbreeding_f_hist_min")
-        if self.inbreeding_f_n_bins <= 0:
-            raise ValueError("qc.inbreeding_f_n_bins must be > 0")
-        if self.inbreeding_f_hist_rmse_max is not None and self.inbreeding_f_hist_rmse_max < 0.0:
-            raise ValueError("qc.inbreeding_f_hist_rmse_max must be >= 0 when provided")
-        if (
-            self.inbreeding_f_mean_shift_abs_max is not None
-            and self.inbreeding_f_mean_shift_abs_max < 0.0
-        ):
-            raise ValueError("qc.inbreeding_f_mean_shift_abs_max must be >= 0 when provided")
+        _check_positive(self.inbreeding_f_n_bins, "qc.inbreeding_f_n_bins")
+        if self.inbreeding_f_hist_rmse_max is not None:
+            _check_non_negative(self.inbreeding_f_hist_rmse_max, "qc.inbreeding_f_hist_rmse_max")
+        if self.inbreeding_f_mean_shift_abs_max is not None:
+            _check_non_negative(self.inbreeding_f_mean_shift_abs_max, "qc.inbreeding_f_mean_shift_abs_max")
 
-        if self.plink2_parity_max_pairs_per_population <= 0:
-            raise ValueError("qc.plink2_parity_max_pairs_per_population must be > 0")
-        if self.msprime_source_weight_abs_tolerance < 0.0 or self.msprime_source_weight_abs_tolerance > 1.0:
-            raise ValueError("qc.msprime_source_weight_abs_tolerance must be in [0.0, 1.0]")
-        if self.admixed_qc_mode not in {"auto", "off", "strict"}:
-            raise ValueError("qc.admixed_qc_mode must be one of {'auto', 'off', 'strict'}")
-        if self.admixed_tract_length_ks_max < 0.0 or self.admixed_tract_length_ks_max > 1.0:
-            raise ValueError("qc.admixed_tract_length_ks_max must be in [0.0, 1.0]")
-        if self.admixed_tract_length_min_tracts <= 0:
-            raise ValueError("qc.admixed_tract_length_min_tracts must be > 0")
-        if (
-            self.admixed_ancestry_variance_rel_tolerance < 0.0
-            or self.admixed_ancestry_variance_rel_tolerance > 10.0
-        ):
-            raise ValueError("qc.admixed_ancestry_variance_rel_tolerance must be in [0.0, 10.0]")
-        if self.admixed_min_individuals_for_variance_gate <= 0:
-            raise ValueError("qc.admixed_min_individuals_for_variance_gate must be > 0")
-        if self.admixed_hwe_inbreeding_mode not in {"non_gating", "legacy"}:
-            raise ValueError("qc.admixed_hwe_inbreeding_mode must be one of {'non_gating', 'legacy'}")
+        _check_in_range(self.msprime_source_weight_abs_tolerance, 0.0, 1.0, "qc.msprime_source_weight_abs_tolerance")
+        _check_one_of(self.admixed_qc_mode, {"auto", "off", "strict"}, "qc.admixed_qc_mode")
+        _check_in_range(self.admixed_tract_length_ks_max, 0.0, 1.0, "qc.admixed_tract_length_ks_max")
+        _check_positive(self.admixed_tract_length_min_tracts, "qc.admixed_tract_length_min_tracts")
+        _check_in_range(self.admixed_ancestry_variance_rel_tolerance, 0.0, 10.0, "qc.admixed_ancestry_variance_rel_tolerance")
+        _check_positive(self.admixed_min_individuals_for_variance_gate, "qc.admixed_min_individuals_for_variance_gate")
+        _check_one_of(self.admixed_hwe_inbreeding_mode, {"non_gating", "legacy"}, "qc.admixed_hwe_inbreeding_mode")
 
 
 @dataclass
@@ -615,32 +552,6 @@ class RunConfig:
             "input.panel_hapstore_pattern."
         )
 
-    def resolve_panel_vcf_for_population(
-        self,
-        *,
-        chrom: int,
-        population: str,
-        require_exists: bool = False,
-    ) -> Path:
-        if self.input.panel_vcf_pattern is None:
-            raise ValueError(
-                "VCF donor panel access requested but input.panel_vcf_pattern is not configured"
-            )
-        candidates = self._resolve_pattern_candidates(
-            self.input.panel_vcf_pattern,
-            chrom=int(chrom),
-            population=str(population),
-        )
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        if require_exists:
-            raise FileNotFoundError(
-                "Unable to resolve donor panel VCF for "
-                f"population={population!r}, chrom={chrom}; tried={candidates}"
-            )
-        return candidates[0]
-
 
 
 def _optional_section(data: dict[str, Any], key: str) -> dict[str, Any]:
@@ -703,8 +614,35 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
 
     sim_cfg = _construct_dataclass("simulation", SimulationConfig, data["simulation"])
 
-    outputs_cfg = _construct_dataclass("outputs", OutputConfig, data["outputs"])
-    qc_cfg = _construct_dataclass("qc", QcConfig, _optional_section(data, "qc"))
+    outputs_raw = dict(data["outputs"])
+    removed_output_keys = {
+        "pgen_source_preference": "outputs.pgen_source_preference was removed; PGEN export is now HapStore-direct only",
+        "merge_backend": "outputs.merge_backend was removed; VCF merge backends are no longer supported",
+        "bcftools_path": "outputs.bcftools_path was removed with VCF merge support",
+        "bcftools_threads": "outputs.bcftools_threads was removed with VCF merge support",
+        "bcftools_no_index": "outputs.bcftools_no_index was removed with VCF merge support",
+        "plink1_path": "outputs.plink1_path was removed; PLINK1-based VCF/BED bridge paths are no longer supported",
+    }
+    for key, message in removed_output_keys.items():
+        if key in outputs_raw:
+            raise ValueError(message)
+    outputs_cfg = _construct_dataclass("outputs", OutputConfig, outputs_raw)
+    qc_raw = dict(_optional_section(data, "qc"))
+    removed_qc_keys = {
+        "rr_pairwise_mode": "qc.rr_pairwise_mode was removed; use qc.synthetic_shard_round_robin_pairwise_mode",
+        "synthetic_round_robin_max_pairs_per_population": (
+            "qc.synthetic_round_robin_max_pairs_per_population was removed; "
+            "use qc.synthetic_shard_round_robin_max_pairs_per_population"
+        ),
+        "synthetic_rr_min_cpus_per_match": (
+            "qc.synthetic_rr_min_cpus_per_match was removed; "
+            "use qc.synthetic_shard_round_robin_min_cpus_per_match"
+        ),
+    }
+    for key, message in removed_qc_keys.items():
+        if key in qc_raw:
+            raise ValueError(message)
+    qc_cfg = _construct_dataclass("qc", QcConfig, qc_raw)
 
     cfg = RunConfig(
         name=data.get("name", "population_amplifier_run"),

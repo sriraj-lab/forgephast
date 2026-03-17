@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -18,15 +19,27 @@ def test_donor_round_robin_qc_outputs(monkeypatch, tmp_path):
     build_manifest_from_config(cfg)
 
     qc_module = importlib.import_module("forgephast.amplifier.qc.pipeline")
+    call_counter = {"count": 0}
 
-    def _fake_plink_fst_for_groups(**kwargs):
-        pairs = kwargs["pairs"]
-        out = {}
-        for idx, (a, b) in enumerate(pairs):
-            out[qc_module._pair_key(a, b)] = 0.01 + idx * 0.001
-        return out
+    def _fake_resolve_source(*args, **kwargs):
+        return "vcf", tmp_path / "dummy.vcf.gz"
 
-    monkeypatch.setattr(qc_module, "_plink_fst_for_groups", _fake_plink_fst_for_groups)
+    def _fake_load_panel(*, config, source_path, chrom, sample_ids, source_kind):
+        del config, source_path, chrom, source_kind
+        n_samples = len(sample_ids)
+        positions = np.asarray([101, 202, 303], dtype=np.int64)
+        haplotypes = np.zeros((2 * n_samples, positions.size), dtype=np.uint8)
+        return positions, haplotypes
+
+    def _fake_matrix_hudson(ac_a, an_a, ac_b, an_b, *, numba_threads=None):
+        del ac_a, an_a, ac_b, an_b, numba_threads
+        value = 0.01 + (0.001 * call_counter["count"])
+        call_counter["count"] += 1
+        return value
+
+    monkeypatch.setattr(qc_module, "_resolve_donor_panel_source_for_population", _fake_resolve_source)
+    monkeypatch.setattr(qc_module, "_load_sample_haplotypes_from_panel", _fake_load_panel)
+    monkeypatch.setattr(qc_module, "matrix_hudson_fst_from_counts", _fake_matrix_hudson)
 
     report = run_donor_within_pop_round_robin(
         cfg,
@@ -46,6 +59,7 @@ def test_donor_round_robin_qc_outputs(monkeypatch, tmp_path):
     assert set(table["population"].unique()) == {"P1", "P2", "P3"}
     assert set(table["fold_a"].unique()) == {0}
     assert set(table["fold_b"].unique()) == {1}
+    assert set(table["fst"].round(6).tolist()) == {0.01, 0.011, 0.012}
 
     for pop, summary in report.summary_by_population.items():
         assert summary["n_donors"] == 2

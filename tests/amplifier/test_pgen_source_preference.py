@@ -8,7 +8,7 @@ import yaml
 from forgephast.amplifier.config import from_yaml
 from forgephast.amplifier.donors import build_manifest_from_config
 from forgephast.amplifier.merge import merge_chromosome
-from forgephast.amplifier.simulation import simulate_chromosome, simulate_chromosome_population_shard_pool
+from forgephast.amplifier.simulation import simulate_chromosome_population_shard_pool
 
 from .conftest import write_test_config
 
@@ -23,14 +23,13 @@ def _touch_triplet(prefix: Path) -> None:
         Path(f"{prefix}{ext}").write_text("", encoding="utf-8")
 
 
-def test_simulate_chromosome_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
+def test_simulate_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
     cfg_path = write_test_config(tmp_path, name="sim_direct_pgen")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
     payload["outputs"]["write_phased_vcf"] = False
     payload["outputs"]["write_hapstore"] = True
     payload["outputs"]["write_pgen"] = True
-    payload["outputs"]["pgen_source_preference"] = "hapstore_direct"
     with open(cfg_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
@@ -46,13 +45,16 @@ def test_simulate_chromosome_prefers_hapstore_direct_pgen(monkeypatch, tmp_path)
         _touch_triplet(Path(out_prefix))
         return Path(out_prefix)
 
-    def _fail_bridge(*args, **kwargs):
-        raise AssertionError("VCF bridge should not be used in hapstore_direct mode")
-
     monkeypatch.setattr(sim_mod, "convert_hapstore_to_pgen", _fake_direct)
-    monkeypatch.setattr(sim_mod, "convert_vcf_to_pgen", _fail_bridge)
 
-    result = simulate_chromosome(cfg, chrom=21, shard_id=0, n_shards=1)
+    result = simulate_chromosome_population_shard_pool(
+        cfg,
+        chrom=21,
+        n_shards=1,
+        task_workers=1,
+        threads_per_task=1,
+        task_start_method="fork",
+    )
 
     assert result.combined_vcf is None
     assert result.combined_hapstore is not None and result.combined_hapstore.exists()
@@ -60,43 +62,6 @@ def test_simulate_chromosome_prefers_hapstore_direct_pgen(monkeypatch, tmp_path)
     assert len(calls) == 4  # 3 populations + 1 combined output
     for artifact in result.population_outputs:
         assert artifact.vcf_path is None
-        assert artifact.pgen_prefix is not None
-        assert Path(f"{artifact.pgen_prefix}.pgen").exists()
-
-
-def test_simulate_chromosome_auto_falls_back_to_vcf_bridge(monkeypatch, tmp_path):
-    cfg_path = write_test_config(tmp_path, name="sim_auto_pgen")
-    with open(cfg_path, "r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle)
-    payload["outputs"]["write_phased_vcf"] = False
-    payload["outputs"]["write_hapstore"] = True
-    payload["outputs"]["write_pgen"] = True
-    payload["outputs"]["pgen_source_preference"] = "auto"
-    with open(cfg_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
-
-    cfg = from_yaml(cfg_path)
-    build_manifest_from_config(cfg)
-
-    bridge_calls: list[Path] = []
-
-    def _fail_direct(*args, **kwargs):
-        raise RuntimeError("direct path unavailable for test fallback")
-
-    def _fake_bridge(*, vcf_path, out_prefix, plink2_path="plink2", threads=1):
-        assert Path(vcf_path).exists()
-        bridge_calls.append(Path(out_prefix))
-        _touch_triplet(Path(out_prefix))
-        return Path(out_prefix)
-
-    monkeypatch.setattr(sim_mod, "convert_hapstore_to_pgen", _fail_direct)
-    monkeypatch.setattr(sim_mod, "convert_vcf_to_pgen", _fake_bridge)
-
-    result = simulate_chromosome(cfg, chrom=21, shard_id=0, n_shards=1)
-
-    assert result.combined_pgen_prefix is not None
-    assert len(bridge_calls) == 4  # 3 populations + 1 combined output
-    for artifact in result.population_outputs:
         assert artifact.pgen_prefix is not None
         assert Path(f"{artifact.pgen_prefix}.pgen").exists()
 
@@ -109,7 +74,6 @@ def test_simulate_pool_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
     payload["outputs"]["write_hapstore"] = True
     payload["outputs"]["write_pgen"] = True
     payload["outputs"]["write_combined_shard_output"] = True
-    payload["outputs"]["pgen_source_preference"] = "hapstore_direct"
     with open(cfg_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
@@ -124,11 +88,7 @@ def test_simulate_pool_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
         _touch_triplet(Path(out_prefix))
         return Path(out_prefix)
 
-    def _fail_bridge(*args, **kwargs):
-        raise AssertionError("VCF bridge should not be used in hapstore_direct mode")
-
     monkeypatch.setattr(sim_mod, "convert_hapstore_to_pgen", _fake_direct)
-    monkeypatch.setattr(sim_mod, "convert_vcf_to_pgen", _fail_bridge)
 
     result = simulate_chromosome_population_shard_pool(
         cfg,
@@ -152,7 +112,7 @@ def test_simulate_pool_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
         assert not (shard_dir / "combined.chr21.vcf.gz").exists()
 
 
-def test_merge_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
+def test_merge_writes_pgen_from_combined_hapstore(monkeypatch, tmp_path):
     cfg_path = write_test_config(tmp_path, name="merge_direct_pgen")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
@@ -166,11 +126,16 @@ def test_merge_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
 
     cfg = from_yaml(cfg_path)
     build_manifest_from_config(cfg)
-    simulate_chromosome(cfg, chrom=21, shard_id=0, n_shards=2)
-    simulate_chromosome(cfg, chrom=21, shard_id=1, n_shards=2)
+    simulate_chromosome_population_shard_pool(
+        cfg,
+        chrom=21,
+        n_shards=2,
+        task_workers=2,
+        threads_per_task=1,
+        task_start_method="fork",
+    )
 
     cfg.outputs.write_pgen = True
-    cfg.outputs.pgen_source_preference = "hapstore_direct"
 
     direct_calls: list[Path] = []
 
@@ -180,57 +145,11 @@ def test_merge_prefers_hapstore_direct_pgen(monkeypatch, tmp_path):
         _touch_triplet(Path(out_prefix))
         return Path(out_prefix)
 
-    def _fail_bridge(*args, **kwargs):
-        raise AssertionError("VCF bridge should not be used in hapstore_direct mode")
-
     monkeypatch.setattr(merge_mod, "convert_hapstore_to_pgen", _fake_direct)
-    monkeypatch.setattr(merge_mod, "convert_vcf_to_pgen", _fail_bridge)
 
     merge_result = merge_chromosome(cfg, chrom=21, n_shards=2)
 
-    assert merge_result.merged_vcf is None
     assert merge_result.combined_hapstore is not None and merge_result.combined_hapstore.exists()
     assert merge_result.merged_pgen_prefix is not None
     assert direct_calls == [merge_result.merged_pgen_prefix]
-    assert Path(f"{merge_result.merged_pgen_prefix}.pgen").exists()
-
-
-def test_merge_auto_falls_back_to_vcf_bridge(monkeypatch, tmp_path):
-    cfg_path = write_test_config(tmp_path, name="merge_auto_pgen")
-    with open(cfg_path, "r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle)
-    payload["outputs"]["write_phased_vcf"] = True
-    payload["outputs"]["write_hapstore"] = True
-    payload["outputs"]["write_pgen"] = False
-    payload["outputs"]["merge_combined_populations"] = True
-    with open(cfg_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
-
-    cfg = from_yaml(cfg_path)
-    build_manifest_from_config(cfg)
-    simulate_chromosome(cfg, chrom=21, shard_id=0, n_shards=2)
-    simulate_chromosome(cfg, chrom=21, shard_id=1, n_shards=2)
-
-    cfg.outputs.write_pgen = True
-    cfg.outputs.pgen_source_preference = "auto"
-
-    bridge_calls: list[Path] = []
-
-    def _fail_direct(*args, **kwargs):
-        raise RuntimeError("direct path unavailable for test fallback")
-
-    def _fake_bridge(*, vcf_path, out_prefix, plink2_path="plink2", threads=1):
-        assert Path(vcf_path).exists()
-        bridge_calls.append(Path(out_prefix))
-        _touch_triplet(Path(out_prefix))
-        return Path(out_prefix)
-
-    monkeypatch.setattr(merge_mod, "convert_hapstore_to_pgen", _fail_direct)
-    monkeypatch.setattr(merge_mod, "convert_vcf_to_pgen", _fake_bridge)
-
-    merge_result = merge_chromosome(cfg, chrom=21, n_shards=2)
-
-    assert merge_result.merged_vcf is not None and merge_result.merged_vcf.exists()
-    assert merge_result.merged_pgen_prefix is not None
-    assert bridge_calls == [merge_result.merged_pgen_prefix]
     assert Path(f"{merge_result.merged_pgen_prefix}.pgen").exists()

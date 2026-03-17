@@ -15,3 +15,4 @@ def test_api_build_manifest_and_cache(tmp_path):
     cache = build_cache(cfg_path, chroms=[21])
     assert cache.entries
     assert all(entry.cache_path.exists() for entry in cache.entries)
+    assert all(entry.cache_path.name.endswith(".hapstore.zarr") for entry in cache.entries)

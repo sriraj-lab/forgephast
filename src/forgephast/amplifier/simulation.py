@@ -8,15 +8,18 @@ import json
 import logging
 import multiprocessing as mp
 from pathlib import Path
+import shutil
 from time import perf_counter
 from typing import Any
 
+from hapstore import ingest_arrays as _hapstore_ingest_arrays
 import numpy as np
 import pandas as pd
 
 from .config import RunConfig
 from .donors import load_manifest
-from .hapstore_ops import ingest_arrays, merge_chromosomes_sample_axis
+from .donor_panels import load_donor_haplotypes_from_source, subset_panel_donors
+from .merge import merge_chromosomes_sample_axis
 from .maps import load_genetic_map, switch_probs_from_positions
 from .msprime_tracts import simulate_msprime_tract_haplotypes
 from .mp_logging import install_queue_handler, setup_queue_listener_for_logger
@@ -25,124 +28,81 @@ from .utils import derived_seed, ensure_dir, shard_bounds
 from .vcfio import (
     convert_hapstore_to_vcf,
     convert_hapstore_to_pgen,
-    convert_vcf_to_pgen,
-    load_donor_haplotypes,
-    load_donor_haplotypes_hapstore,
-    load_donor_haplotypes_cached,
-    merge_shard_vcfs,
-    subset_panel_donors,
-    write_synthetic_vcf,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_pgen_mode(
-    preference: str,
-    hapstore_path: Path | None,
-) -> str:
-    if preference == "vcf_bridge":
-        return "vcf_bridge"
-    if preference == "hapstore_direct":
-        if hapstore_path is None:
-            raise RuntimeError(
-                "outputs.pgen_source_preference='hapstore_direct' requires HapStore output; "
-                "set outputs.write_hapstore=true or use pgen_source_preference='vcf_bridge'"
-            )
-        return "hapstore_direct"
-    # auto
-    return "hapstore_direct" if hapstore_path is not None else "vcf_bridge"
+def _is_stale_hapstore_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("already exists" in msg) and (
+        ("chromosome" in msg)
+        or ("chrom" in msg)
+        or ("group" in msg)
+        or ("zarr" in msg)
+    )
 
 
-def _write_pgen_with_preference(
+def _ingest_arrays_with_retry(*args, **kwargs):
+    """Ingest arrays with stale-store overwrite retry.
+
+    If a prior failed run left a stale chromosome/group in the destination Zarr
+    store, the hapstore library may raise an "already exists" style error. In
+    that case we remove the destination store and retry once.
+    """
+    output_zarr = kwargs.get("output_zarr", args[0] if args else None)
+    output_path = Path(output_zarr) if output_zarr is not None else None
+
+    try:
+        return _hapstore_ingest_arrays(*args, **kwargs)
+    except Exception as exc:
+        if output_path is None or not output_path.exists() or not _is_stale_hapstore_error(exc):
+            raise
+        logger.warning(
+            "Detected stale HapStore at %s after ingest error; removing and retrying once: %s",
+            output_path,
+            exc,
+        )
+        shutil.rmtree(output_path, ignore_errors=True)
+        return _hapstore_ingest_arrays(*args, **kwargs)
+
+
+def _write_pgen_from_hapstore(
     *,
     out_prefix: Path,
     chrom: int,
-    preference: str,
     hapstore_path: Path | None,
-    vcf_path: Path | None,
-    variants: Any | None = None,
-    sample_ids: list[str] | None = None,
-    haplotypes: np.ndarray | None = None,
-    plink2_path: str,
-) -> tuple[Path, Path | None, str]:
-    mode = _resolve_pgen_mode(preference=preference, hapstore_path=hapstore_path)
-    if mode == "hapstore_direct":
-        try:
-            convert_hapstore_to_pgen(
-                hapstore_path=hapstore_path,
-                out_prefix=out_prefix,
-                chrom=chrom,
-            )
-            return out_prefix, vcf_path, "hapstore_direct"
-        except Exception:
-            if preference != "auto":
-                raise
-            logger.warning(
-                "Direct HapStore->PGEN failed for prefix=%s; falling back to VCF bridge in auto mode",
-                out_prefix,
-            )
-            mode = "vcf_bridge"
-
-    if vcf_path is None:
-        if variants is None or sample_ids is None or haplotypes is None:
-            raise RuntimeError(
-                "VCF bridge selected for PGEN export, but no VCF is available and synthetic VCF "
-                "inputs (variants/sample_ids/haplotypes) were not provided."
-            )
-        vcf_path = out_prefix.parent / f"{out_prefix.name}.vcf.gz"
-        write_synthetic_vcf(
-            output_vcf_gz=vcf_path,
-            variants=variants,
-            sample_ids=sample_ids,
-            haplotypes=haplotypes,
-        )
-
-    convert_vcf_to_pgen(
-        vcf_path=vcf_path,
+) -> Path:
+    if hapstore_path is None:
+        raise RuntimeError("HapStore-backed PGEN export requires HapStore output")
+    convert_hapstore_to_pgen(
+        hapstore_path=hapstore_path,
         out_prefix=out_prefix,
-        plink2_path=plink2_path,
+        chrom=chrom,
     )
-    return out_prefix, vcf_path, "vcf_bridge"
+    return out_prefix
 
 
-def _write_vcf_preferring_hapstore(
+def _write_vcf_from_hapstore(
     *,
     output_vcf: Path,
     chrom: int,
     hapstore_path: Path | None,
-    variants: Any,
-    sample_ids: list[str],
-    haplotypes: np.ndarray,
     plink2_location: str | None,
     keep_intermediate_pgen: bool,
     n_shards: int,
-) -> tuple[Path, str]:
-    if hapstore_path is not None:
-        try:
-            path = convert_hapstore_to_vcf(
-                hapstore_path=hapstore_path,
-                output_vcf=output_vcf,
-                chrom=int(chrom),
-                variant_block_size=1024,
-                plink2_location=plink2_location,
-                keep_intermediate_files=bool(keep_intermediate_pgen),
-                n_shards=int(n_shards),
-            )
-            return path, "hapstore_direct"
-        except Exception:
-            logger.warning(
-                "Direct HapStore->VCF failed for output=%s; falling back to synthetic VCF writer",
-                output_vcf,
-            )
-
-    write_synthetic_vcf(
-        output_vcf_gz=output_vcf,
-        variants=variants,
-        sample_ids=sample_ids,
-        haplotypes=haplotypes,
+) -> Path:
+    if hapstore_path is None:
+        raise RuntimeError("HapStore-backed phased VCF export requires HapStore output")
+    return convert_hapstore_to_vcf(
+        hapstore_path=hapstore_path,
+        output_vcf=output_vcf,
+        chrom=int(chrom),
+        variant_block_size=1024,
+        plink2_location=plink2_location,
+        keep_intermediate_files=bool(keep_intermediate_pgen),
+        n_shards=int(n_shards),
     )
-    return output_vcf, "synthetic_bridge"
 
 try:
     from numba import njit, prange, set_num_threads
@@ -318,9 +278,46 @@ class SimulationBatchResult:
     chrom: int
     n_shards: int
     sample_manifest_paths: list[Path]
+    shard_results: list[SimulationResult]
     elapsed_seconds: float
     stage_timings: dict[str, float]
     task_count: int
+
+    @property
+    def sample_manifest_path(self) -> Path:
+        if len(self.shard_results) != 1:
+            raise AttributeError("sample_manifest_path is only available for n_shards=1")
+        return self.shard_results[0].sample_manifest_path
+
+    @property
+    def combined_vcf(self) -> Path | None:
+        if len(self.shard_results) != 1:
+            raise AttributeError("combined_vcf is only available for n_shards=1")
+        return self.shard_results[0].combined_vcf
+
+    @property
+    def combined_hapstore(self) -> Path | None:
+        if len(self.shard_results) != 1:
+            raise AttributeError("combined_hapstore is only available for n_shards=1")
+        return self.shard_results[0].combined_hapstore
+
+    @property
+    def combined_pgen_prefix(self) -> Path | None:
+        if len(self.shard_results) != 1:
+            raise AttributeError("combined_pgen_prefix is only available for n_shards=1")
+        return self.shard_results[0].combined_pgen_prefix
+
+    @property
+    def population_outputs(self) -> list[PopulationSimulationArtifacts]:
+        if len(self.shard_results) != 1:
+            raise AttributeError("population_outputs is only available for n_shards=1")
+        return self.shard_results[0].population_outputs
+
+    @property
+    def population_stage_timings(self) -> dict[str, dict[str, float]]:
+        if len(self.shard_results) != 1:
+            raise AttributeError("population_stage_timings is only available for n_shards=1")
+        return self.shard_results[0].population_stage_timings
 
 
 @dataclass
@@ -399,8 +396,6 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
         hapstore_compression_level,
         hapstore_store_genotypes,
         write_pgen,
-        plink2_path,
-        pgen_source_preference,
         hapstore_vcf_plink2_location,
         hapstore_vcf_keep_intermediate_pgen,
         hapstore_vcf_n_shards,
@@ -431,13 +426,6 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
             )
             timings["simulate_haplotypes_sec"] = perf_counter() - t_sim
 
-        need_vcf_for_pgen_bridge = bool(
-            write_pgen
-            and (
-                str(pgen_source_preference) == "vcf_bridge"
-                or (str(pgen_source_preference) == "auto" and not bool(write_hapstore))
-            )
-        )
         pop_vcf: Path | None = None
 
         pop_hapstore = None
@@ -445,7 +433,7 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
             with telemetry_span(logger, "write_pop_hapstore", chrom=int(chrom), pop=str(pop_name), shard=int(shard_id)):
                 t_hapstore = perf_counter()
                 pop_hapstore = chrom_dir / f"{pop_name}.chr{chrom}.hapstore.zarr"
-                ingest_arrays(
+                _ingest_arrays_with_retry(
                     output_zarr=pop_hapstore,
                     chrom=f"chr{chrom}",
                     haplotypes=synthetic_haps,
@@ -469,13 +457,10 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
             pop_vcf = chrom_dir / f"{pop_name}.chr{chrom}.vcf.gz"
             with telemetry_span(logger, "write_pop_vcf", chrom=int(chrom), pop=str(pop_name), shard=int(shard_id)):
                 t_write = perf_counter()
-                pop_vcf, _ = _write_vcf_preferring_hapstore(
+                pop_vcf = _write_vcf_from_hapstore(
                     output_vcf=pop_vcf,
                     chrom=int(chrom),
                     hapstore_path=pop_hapstore,
-                    variants=panel.variants,
-                    sample_ids=sample_ids,
-                    haplotypes=synthetic_haps,
                     plink2_location=str(hapstore_vcf_plink2_location)
                     if hapstore_vcf_plink2_location is not None
                     else None,
@@ -484,40 +469,12 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
                 )
                 timings["write_pop_vcf_sec"] = perf_counter() - t_write
 
-        if need_vcf_for_pgen_bridge and pop_vcf is None:
-            pop_vcf = chrom_dir / f"{pop_name}.chr{chrom}.vcf.gz"
-            with telemetry_span(
-                logger,
-                "write_pop_vcf_for_pgen_bridge",
-                chrom=int(chrom),
-                pop=str(pop_name),
-                shard=int(shard_id),
-            ):
-                t_write = perf_counter()
-                write_synthetic_vcf(
-                    output_vcf_gz=pop_vcf,
-                    variants=panel.variants,
-                    sample_ids=sample_ids,
-                    haplotypes=synthetic_haps,
-                )
-                timings["write_pop_vcf_for_pgen_bridge_sec"] = perf_counter() - t_write
-
         pop_pgen_prefix = None
         if write_pgen:
             with telemetry_span(logger, "write_pop_pgen", chrom=int(chrom), pop=str(pop_name), shard=int(shard_id)):
                 t_pgen = perf_counter()
                 pop_pgen_prefix = chrom_dir / f"{pop_name}.chr{chrom}"
-                pop_pgen_prefix, pop_vcf, _ = _write_pgen_with_preference(
-                    out_prefix=pop_pgen_prefix,
-                    chrom=int(chrom),
-                    preference=str(pgen_source_preference),
-                    hapstore_path=pop_hapstore,
-                    vcf_path=pop_vcf,
-                    variants=panel.variants,
-                    sample_ids=sample_ids,
-                    haplotypes=synthetic_haps,
-                    plink2_path=plink2_path,
-                )
+                pop_pgen_prefix = _write_pgen_from_hapstore(out_prefix=pop_pgen_prefix, chrom=int(chrom), hapstore_path=pop_hapstore)
                 timings["write_pop_pgen_sec"] = perf_counter() - t_pgen
 
     return {
@@ -536,7 +493,7 @@ def _preload_panel_unions(
     chrom: int,
     union_donors_by_source: dict[tuple[str, Path], set[str]],
     donor_io_workers: int,
-    cache_dir: Path | None,
+    cache_dir: Path,
 ) -> tuple[dict[tuple[str, Path], Any], int, int]:
     panel_union_cache: dict[tuple[str, Path], Any] = {}
     cache_hits = 0
@@ -550,28 +507,15 @@ def _preload_panel_unions(
     ]
 
     def _load_one(source_kind: str, source_path: Path, donor_ids: list[str]) -> tuple[Any, bool]:
-        if cache_dir is not None:
-            panel, _, cache_hit = load_donor_haplotypes_cached(
-                source_path=source_path,
-                source_kind=source_kind,
-                chrom=chrom,
-                donor_ids=donor_ids,
-                cache_dir=cache_dir,
-            )
-            return panel, cache_hit
-        if source_kind == "vcf":
-            panel = load_donor_haplotypes(
-                vcf_path=source_path,
-                chrom=chrom,
-                donor_ids=donor_ids,
-            )
-        else:
-            panel = load_donor_haplotypes_hapstore(
-                hapstore_path=source_path,
-                chrom=chrom,
-                donor_ids=donor_ids,
-            )
-        return panel, False
+        panel, _, cache_hit = load_donor_haplotypes_from_source(
+            source_path=source_path,
+            source_kind=source_kind,
+            chrom=chrom,
+            donor_ids=donor_ids,
+            cache_dir=cache_dir,
+            ingest_workers=max(1, int(donor_io_workers)),
+        )
+        return panel, cache_hit
 
     max_workers = min(max(1, donor_io_workers), len(jobs))
     if max_workers > 1 and len(jobs) > 1:
@@ -599,8 +543,106 @@ def _preload_panel_unions(
     return panel_union_cache, cache_hits, cache_misses
 
 
+def _build_shard_result(
+    *,
+    config: RunConfig,
+    chrom: int,
+    shard_id: int,
+    n_shards: int,
+    sample_manifest_path: Path,
+    population_outputs: list[PopulationSimulationArtifacts],
+    stage_timings: dict[str, float],
+    population_stage_timings: dict[str, dict[str, float]],
+    elapsed_seconds: float,
+) -> SimulationResult:
+    shard_dir = config.run_root / "synthetic" / f"chr{chrom}" / f"shard_{shard_id}_of_{n_shards}"
+    combined_hapstore = shard_dir / f"combined.chr{chrom}.hapstore.zarr"
+    combined_vcf = shard_dir / f"combined.chr{chrom}.vcf.gz"
+    combined_pgen_prefix = shard_dir / f"combined.chr{chrom}"
+    return SimulationResult(
+        chrom=int(chrom),
+        shard_id=int(shard_id),
+        n_shards=int(n_shards),
+        combined_vcf=combined_vcf if combined_vcf.exists() else None,
+        combined_hapstore=combined_hapstore if combined_hapstore.exists() else None,
+        combined_pgen_prefix=combined_pgen_prefix if Path(f"{combined_pgen_prefix}.pgen").exists() else None,
+        sample_manifest_path=sample_manifest_path,
+        population_outputs=population_outputs,
+        elapsed_seconds=float(elapsed_seconds),
+        stage_timings=stage_timings,
+        population_stage_timings=population_stage_timings,
+    )
 
-def simulate_chromosome(
+
+def _build_batch_shard_results(
+    *,
+    config: RunConfig,
+    chrom: int,
+    n_shards: int,
+    sample_manifest_by_shard: dict[int, Path],
+    task_results: list[dict[str, Any]],
+    batch_stage_timings: dict[str, float],
+    batch_elapsed_seconds: float,
+) -> list[SimulationResult]:
+    grouped_results: dict[int, list[dict[str, Any]]] = {}
+    for result in task_results:
+        grouped_results.setdefault(int(result["shard_id"]), []).append(result)
+
+    shard_results: list[SimulationResult] = []
+    for shard_id in range(int(n_shards)):
+        manifest_path = sample_manifest_by_shard.get(int(shard_id))
+        shard_task_results = grouped_results.get(int(shard_id), [])
+        if manifest_path is None and not shard_task_results:
+            continue
+
+        population_outputs = [
+            PopulationSimulationArtifacts(
+                population=str(result["population"]),
+                sample_ids=list(result["sample_ids"]),
+                vcf_path=None if result.get("vcf_path") is None else Path(str(result["vcf_path"])),
+                hapstore_path=None
+                if result.get("hapstore_path") is None
+                else Path(str(result["hapstore_path"])),
+                pgen_prefix=None
+                if result.get("pgen_prefix") is None
+                else Path(str(result["pgen_prefix"])),
+            )
+            for result in sorted(shard_task_results, key=lambda x: str(x["population"]))
+        ]
+        population_stage_timings = {
+            str(result["population"]): {str(k): float(v) for k, v in dict(result.get("timings", {})).items()}
+            for result in shard_task_results
+        }
+        shard_stage_timings: dict[str, float] = {}
+        for result in shard_task_results:
+            for key, elapsed in dict(result.get("timings", {})).items():
+                shard_stage_timings[str(key)] = shard_stage_timings.get(str(key), 0.0) + float(elapsed)
+        if int(n_shards) == 1:
+            for key, value in batch_stage_timings.items():
+                shard_stage_timings.setdefault(str(key), float(value))
+
+        shard_elapsed = float(batch_elapsed_seconds if int(n_shards) == 1 else sum(shard_stage_timings.values()))
+        if manifest_path is None:
+            raise RuntimeError(f"missing sample manifest for shard {shard_id} on chrom {chrom}")
+        shard_results.append(
+            _build_shard_result(
+                config=config,
+                chrom=int(chrom),
+                shard_id=int(shard_id),
+                n_shards=int(n_shards),
+                sample_manifest_path=manifest_path,
+                population_outputs=population_outputs,
+                stage_timings=shard_stage_timings,
+                population_stage_timings=population_stage_timings,
+                elapsed_seconds=shard_elapsed,
+            )
+        )
+
+    return shard_results
+
+
+
+def _simulate_chromosome_shard(
     config: RunConfig,
     chrom: int,
     shard_id: int = 0,
@@ -965,20 +1007,13 @@ def simulate_chromosome(
                 f"Population {item.pop_name} has marker mismatch on chr{chrom}; variants must align"
             )
 
-        need_vcf_for_pgen_bridge = bool(
-            config.outputs.write_pgen
-            and (
-                str(config.outputs.pgen_source_preference) == "vcf_bridge"
-                or (str(config.outputs.pgen_source_preference) == "auto" and not write_hapstore)
-            )
-        )
         pop_vcf: Path | None = None
 
         pop_hapstore: Path | None = None
         if write_hapstore:
             t_pop_hapstore = perf_counter()
             pop_hapstore = chrom_dir / f"{item.pop_name}.chr{chrom}.hapstore.zarr"
-            ingest_arrays(
+            _ingest_arrays_with_retry(
                 output_zarr=pop_hapstore,
                 chrom=f"chr{chrom}",
                 haplotypes=synthetic_haps,
@@ -1009,13 +1044,10 @@ def simulate_chromosome(
         if config.outputs.write_phased_vcf:
             pop_vcf = chrom_dir / f"{item.pop_name}.chr{chrom}.vcf.gz"
             t_write_pop_vcf = perf_counter()
-            pop_vcf, _ = _write_vcf_preferring_hapstore(
+            pop_vcf = _write_vcf_from_hapstore(
                 output_vcf=pop_vcf,
                 chrom=int(chrom),
                 hapstore_path=pop_hapstore,
-                variants=variants,
-                sample_ids=item.sample_ids,
-                haplotypes=synthetic_haps,
                 plink2_location=config.outputs.hapstore_vcf_plink2_location,
                 keep_intermediate_pgen=bool(config.outputs.hapstore_vcf_keep_intermediate_pgen),
                 n_shards=int(config.outputs.hapstore_vcf_n_shards),
@@ -1024,33 +1056,14 @@ def simulate_chromosome(
             pop_stage["write_pop_vcf_sec"] = elapsed_write_pop_vcf
             _add_timing("write_pop_vcf_sec", elapsed_write_pop_vcf)
 
-        if need_vcf_for_pgen_bridge and pop_vcf is None:
-            pop_vcf = chrom_dir / f"{item.pop_name}.chr{chrom}.vcf.gz"
-            t_write_pop_vcf_bridge = perf_counter()
-            write_synthetic_vcf(
-                output_vcf_gz=pop_vcf,
-                variants=variants,
-                sample_ids=item.sample_ids,
-                haplotypes=synthetic_haps,
-            )
-            elapsed_write_pop_vcf_bridge = perf_counter() - t_write_pop_vcf_bridge
-            pop_stage["write_pop_vcf_for_pgen_bridge_sec"] = elapsed_write_pop_vcf_bridge
-            _add_timing("write_pop_vcf_for_pgen_bridge_sec", elapsed_write_pop_vcf_bridge)
-
         pop_pgen_prefix = None
         if config.outputs.write_pgen:
             t_pop_pgen = perf_counter()
             pop_pgen_prefix = chrom_dir / f"{item.pop_name}.chr{chrom}"
-            pop_pgen_prefix, pop_vcf, _ = _write_pgen_with_preference(
+            pop_pgen_prefix = _write_pgen_from_hapstore(
                 out_prefix=pop_pgen_prefix,
                 chrom=int(chrom),
-                preference=str(config.outputs.pgen_source_preference),
                 hapstore_path=pop_hapstore,
-                vcf_path=pop_vcf,
-                variants=variants,
-                sample_ids=item.sample_ids,
-                haplotypes=synthetic_haps,
-                plink2_path=config.outputs.plink2_path,
             )
             elapsed_pop_pgen = perf_counter() - t_pop_pgen
             pop_stage["write_pop_pgen_sec"] = elapsed_pop_pgen
@@ -1121,20 +1134,12 @@ def simulate_chromosome(
         t_concat = perf_counter()
         combined_haps = np.concatenate(combined_haps_blocks, axis=0)
         _add_timing("concatenate_combined_haps_sec", perf_counter() - t_concat)
-
-        need_combined_vcf_for_pgen_bridge = bool(
-            config.outputs.write_pgen
-            and (
-                str(config.outputs.pgen_source_preference) == "vcf_bridge"
-                or (str(config.outputs.pgen_source_preference) == "auto" and not write_hapstore)
-            )
-        )
         combined_vcf: Path | None = None
 
         if write_hapstore:
             t_write_combined_hapstore = perf_counter()
             combined_hapstore = chrom_dir / f"combined.chr{chrom}.hapstore.zarr"
-            ingest_arrays(
+            _ingest_arrays_with_retry(
                 output_zarr=combined_hapstore,
                 chrom=f"chr{chrom}",
                 haplotypes=combined_haps,
@@ -1164,13 +1169,10 @@ def simulate_chromosome(
         if config.outputs.write_phased_vcf:
             combined_vcf = chrom_dir / f"combined.chr{chrom}.vcf.gz"
             t_write_combined = perf_counter()
-            combined_vcf, _ = _write_vcf_preferring_hapstore(
+            combined_vcf = _write_vcf_from_hapstore(
                 output_vcf=combined_vcf,
                 chrom=int(chrom),
                 hapstore_path=combined_hapstore_out,
-                variants=variant_table,
-                sample_ids=combined_sample_ids,
-                haplotypes=combined_haps,
                 plink2_location=config.outputs.hapstore_vcf_plink2_location,
                 keep_intermediate_pgen=bool(config.outputs.hapstore_vcf_keep_intermediate_pgen),
                 n_shards=int(config.outputs.hapstore_vcf_n_shards),
@@ -1178,30 +1180,13 @@ def simulate_chromosome(
             _add_timing("write_combined_vcf_sec", perf_counter() - t_write_combined)
             combined_vcf_out = combined_vcf
 
-        if need_combined_vcf_for_pgen_bridge and combined_vcf is None:
-            combined_vcf = chrom_dir / f"combined.chr{chrom}.vcf.gz"
-            t_write_combined_bridge = perf_counter()
-            write_synthetic_vcf(
-                output_vcf_gz=combined_vcf,
-                variants=variant_table,
-                sample_ids=combined_sample_ids,
-                haplotypes=combined_haps,
-            )
-            _add_timing("write_combined_vcf_for_pgen_bridge_sec", perf_counter() - t_write_combined_bridge)
-
         if config.outputs.write_pgen:
             t_combined_pgen = perf_counter()
             combined_pgen_prefix = chrom_dir / f"combined.chr{chrom}"
-            combined_pgen_prefix, combined_vcf, _ = _write_pgen_with_preference(
+            combined_pgen_prefix = _write_pgen_from_hapstore(
                 out_prefix=combined_pgen_prefix,
                 chrom=int(chrom),
-                preference=str(config.outputs.pgen_source_preference),
                 hapstore_path=combined_hapstore_out,
-                vcf_path=combined_vcf,
-                variants=variant_table,
-                sample_ids=combined_sample_ids,
-                haplotypes=combined_haps,
-                plink2_path=config.outputs.plink2_path,
             )
             _add_timing("write_combined_pgen_sec", perf_counter() - t_combined_pgen)
 
@@ -1284,6 +1269,7 @@ def simulate_chromosome_population_shard_pool(
             chrom,
         )
         sample_manifest_paths: list[Path] = []
+        shard_results: list[SimulationResult] = []
         task_count = 0
         for pop in config.populations:
             for shard_id in range(n_shards):
@@ -1306,7 +1292,7 @@ def simulate_chromosome_population_shard_pool(
                 shard_id,
                 n_shards,
             )
-            shard_result = simulate_chromosome(
+            shard_result = _simulate_chromosome_shard(
                 config=config,
                 chrom=int(chrom),
                 shard_id=int(shard_id),
@@ -1314,6 +1300,7 @@ def simulate_chromosome_population_shard_pool(
             )
             fallback_done += 1
             sample_manifest_paths.append(shard_result.sample_manifest_path)
+            shard_results.append(shard_result)
             for key, elapsed in shard_result.stage_timings.items():
                 if key == "total_sec":
                     continue
@@ -1336,6 +1323,7 @@ def simulate_chromosome_population_shard_pool(
             chrom=int(chrom),
             n_shards=int(n_shards),
             sample_manifest_paths=sample_manifest_paths,
+            shard_results=shard_results,
             elapsed_seconds=elapsed,
             stage_timings=stage_timings,
             task_count=int(task_count),
@@ -1480,8 +1468,6 @@ def simulate_chromosome_population_shard_pool(
                     config.outputs.hapstore_compression_level,
                     config.outputs.hapstore_store_genotypes,
                     config.outputs.write_pgen,
-                    config.outputs.plink2_path,
-                    config.outputs.pgen_source_preference,
                     config.outputs.hapstore_vcf_plink2_location,
                     config.outputs.hapstore_vcf_keep_intermediate_pgen,
                     config.outputs.hapstore_vcf_n_shards,
@@ -1600,6 +1586,7 @@ def simulate_chromosome_population_shard_pool(
     # Write shard manifests in canonical order expected by merge.
     manifest_dir = ensure_dir(config.run_root / "manifests")
     sample_manifest_paths: list[Path] = []
+    sample_manifest_by_shard: dict[int, Path] = {}
     with telemetry_span(logger, "simulate-pool.write_sample_manifests", chrom=int(chrom), n_shards=int(n_shards)):
         t_manifest_write = perf_counter()
         by_shard_pop: dict[tuple[int, str], _PopulationWorkItem] = {
@@ -1629,37 +1616,8 @@ def simulate_chromosome_population_shard_pool(
             manifest_path = manifest_dir / f"synthetic_samples_chr{chrom}_shard_{shard_id}_of_{n_shards}.tsv"
             pd.DataFrame(rows).to_csv(manifest_path, sep="\t", index=False)
             sample_manifest_paths.append(manifest_path)
+            sample_manifest_by_shard[int(shard_id)] = manifest_path
         _add_timing("write_sample_manifests_sec", perf_counter() - t_manifest_write)
-
-    if config.outputs.write_combined_shard_output:
-        with telemetry_span(logger, "simulate-pool.write_combined_shard_outputs", chrom=int(chrom)):
-            t_combined = perf_counter()
-            need_vcf_for_pgen_bridge = bool(
-                config.outputs.write_pgen
-                and (
-                    str(config.outputs.pgen_source_preference) == "vcf_bridge"
-                    or (str(config.outputs.pgen_source_preference) == "auto" and not config.outputs.write_hapstore)
-                )
-            )
-            prefer_hapstore_for_phased_vcf = bool(config.outputs.write_hapstore and config.outputs.write_phased_vcf)
-            for shard_id in range(n_shards):
-                shard_dir = config.run_root / "synthetic" / f"chr{chrom}" / f"shard_{shard_id}_of_{n_shards}"
-                write_combined_vcf = bool(
-                    (config.outputs.write_phased_vcf and not prefer_hapstore_for_phased_vcf)
-                    or need_vcf_for_pgen_bridge
-                )
-                if not write_combined_vcf:
-                    continue
-                pop_vcfs = [
-                    shard_dir / f"{pop.name}.chr{chrom}.vcf.gz"
-                    for pop in config.populations
-                    if (shard_dir / f"{pop.name}.chr{chrom}.vcf.gz").exists()
-                ]
-                if not pop_vcfs:
-                    continue
-                combined_vcf = shard_dir / f"combined.chr{chrom}.vcf.gz"
-                merge_shard_vcfs(pop_vcfs, combined_vcf)
-            _add_timing("write_combined_shard_outputs_sec", perf_counter() - t_combined)
 
     if config.outputs.write_combined_shard_output and config.outputs.write_hapstore:
         with telemetry_span(logger, "simulate-pool.write_combined_shard_hapstores", chrom=int(chrom)):
@@ -1694,7 +1652,6 @@ def simulate_chromosome_population_shard_pool(
                     compression_level=int(config.outputs.hapstore_compression_level),
                     store_genotypes=bool(config.outputs.hapstore_store_genotypes),
                     attrs={"source": "population_amplifier"},
-                    merge_strategy=str(config.outputs.hapstore_merge_strategy),
                     n_workers=hapstore_concat_workers,
                 )
             _add_timing("write_combined_shard_hapstores_sec", perf_counter() - t_combined_hapstore)
@@ -1712,30 +1669,15 @@ def simulate_chromosome_population_shard_pool(
                 if not combined_hapstore.exists():
                     continue
                 combined_vcf = shard_dir / f"combined.chr{chrom}.vcf.gz"
-                try:
-                    convert_hapstore_to_vcf(
-                        hapstore_path=combined_hapstore,
-                        output_vcf=combined_vcf,
-                        chrom=int(chrom),
-                        variant_block_size=1024,
-                        plink2_location=config.outputs.hapstore_vcf_plink2_location,
-                        keep_intermediate_files=bool(config.outputs.hapstore_vcf_keep_intermediate_pgen),
-                        n_shards=int(config.outputs.hapstore_vcf_n_shards),
-                    )
-                except Exception:
-                    logger.warning(
-                        "Direct combined HapStore->VCF failed for shard=%s chr=%s; "
-                        "falling back to merged population VCFs",
-                        shard_id,
-                        chrom,
-                    )
-                    pop_vcfs = [
-                        shard_dir / f"{pop.name}.chr{chrom}.vcf.gz"
-                        for pop in config.populations
-                        if (shard_dir / f"{pop.name}.chr{chrom}.vcf.gz").exists()
-                    ]
-                    if pop_vcfs:
-                        merge_shard_vcfs(pop_vcfs, combined_vcf)
+                convert_hapstore_to_vcf(
+                    hapstore_path=combined_hapstore,
+                    output_vcf=combined_vcf,
+                    chrom=int(chrom),
+                    variant_block_size=1024,
+                    plink2_location=config.outputs.hapstore_vcf_plink2_location,
+                    keep_intermediate_files=bool(config.outputs.hapstore_vcf_keep_intermediate_pgen),
+                    n_shards=int(config.outputs.hapstore_vcf_n_shards),
+                )
             _add_timing(
                 "write_combined_shard_vcf_from_hapstore_sec",
                 perf_counter() - t_combined_vcf_from_hapstore,
@@ -1747,72 +1689,25 @@ def simulate_chromosome_population_shard_pool(
             for shard_id in range(n_shards):
                 shard_dir = config.run_root / "synthetic" / f"chr{chrom}" / f"shard_{shard_id}_of_{n_shards}"
                 combined_prefix = shard_dir / f"combined.chr{chrom}"
-                combined_vcf = shard_dir / f"combined.chr{chrom}.vcf.gz"
                 combined_hapstore = shard_dir / f"combined.chr{chrom}.hapstore.zarr"
-                vcf_path: Path | None = combined_vcf if combined_vcf.exists() else None
-                hapstore_path: Path | None = combined_hapstore if combined_hapstore.exists() else None
-
-                if vcf_path is None and (
-                    str(config.outputs.pgen_source_preference) == "vcf_bridge"
-                    or (
-                        str(config.outputs.pgen_source_preference) == "auto"
-                        and hapstore_path is None
-                    )
-                ):
-                    pop_vcfs = [
-                        shard_dir / f"{pop.name}.chr{chrom}.vcf.gz"
-                        for pop in config.populations
-                        if (shard_dir / f"{pop.name}.chr{chrom}.vcf.gz").exists()
-                    ]
-                    if not pop_vcfs:
-                        raise FileNotFoundError(
-                            "write_pgen=true with VCF bridge requires population shard VCFs "
-                            f"for chr{chrom} shard {shard_id}, but none were found"
-                        )
-                    vcf_path = combined_vcf
-                    merge_shard_vcfs(pop_vcfs, combined_vcf)
-
-                try:
-                    _write_pgen_with_preference(
-                        out_prefix=combined_prefix,
-                        chrom=int(chrom),
-                        preference=str(config.outputs.pgen_source_preference),
-                        hapstore_path=hapstore_path,
-                        vcf_path=vcf_path,
-                        plink2_path=config.outputs.plink2_path,
-                    )
-                except RuntimeError as exc:
-                    fallback_missing_vcf = (
-                        str(config.outputs.pgen_source_preference) == "auto"
-                        and vcf_path is None
-                        and "VCF bridge selected for PGEN export" in str(exc)
-                    )
-                    if not fallback_missing_vcf:
-                        raise
-                    pop_vcfs = [
-                        shard_dir / f"{pop.name}.chr{chrom}.vcf.gz"
-                        for pop in config.populations
-                        if (shard_dir / f"{pop.name}.chr{chrom}.vcf.gz").exists()
-                    ]
-                    if not pop_vcfs:
-                        raise FileNotFoundError(
-                            "Direct combined shard HapStore->PGEN failed, and VCF fallback "
-                            f"inputs are missing for chr{chrom} shard {shard_id}"
-                        ) from exc
-                    vcf_path = combined_vcf
-                    merge_shard_vcfs(pop_vcfs, combined_vcf)
-                    _write_pgen_with_preference(
-                        out_prefix=combined_prefix,
-                        chrom=int(chrom),
-                        preference="vcf_bridge",
-                        hapstore_path=hapstore_path,
-                        vcf_path=vcf_path,
-                        plink2_path=config.outputs.plink2_path,
-                    )
+                _write_pgen_from_hapstore(
+                    out_prefix=combined_prefix,
+                    chrom=int(chrom),
+                    hapstore_path=combined_hapstore if combined_hapstore.exists() else None,
+                )
             _add_timing("write_combined_shard_pgen_sec", perf_counter() - t_combined_pgen)
 
     elapsed = perf_counter() - t0
     stage_timings["total_sec"] = elapsed
+    shard_results = _build_batch_shard_results(
+        config=config,
+        chrom=int(chrom),
+        n_shards=int(n_shards),
+        sample_manifest_by_shard=sample_manifest_by_shard,
+        task_results=task_results,
+        batch_stage_timings=stage_timings,
+        batch_elapsed_seconds=elapsed,
+    )
     logger.info(
         "simulate_chromosome_population_shard_pool complete chrom=%s n_shards=%s task_count=%s task_workers=%s threads_per_task=%s timings=%s",
         chrom,
@@ -1826,6 +1721,7 @@ def simulate_chromosome_population_shard_pool(
         chrom=chrom,
         n_shards=n_shards,
         sample_manifest_paths=sample_manifest_paths,
+        shard_results=shard_results,
         elapsed_seconds=elapsed,
         stage_timings=stage_timings,
         task_count=len(task_items),

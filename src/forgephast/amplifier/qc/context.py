@@ -35,7 +35,7 @@ class ExtAlignedData:
     per_pop: dict[str, ExtPopData]
 
 
-def _align_by_position(
+def align_haplotype_axes_by_position(
     donor_pos: np.ndarray,
     donor_haps: np.ndarray,
     synth_pos: np.ndarray,
@@ -138,7 +138,7 @@ def build_ext_aligned_data(
             donor_ids,
         )
         synth_pos, synth_haps = load_synthetic_population_haplotypes(inputs, int(chrom), str(pop), synth_ids)
-        aligned_pos, donor_haps_aligned, synth_haps_aligned = _align_by_position(
+        aligned_pos, donor_haps_aligned, synth_haps_aligned = align_haplotype_axes_by_position(
             donor_pos=donor_pos,
             donor_haps=donor_haps,
             synth_pos=synth_pos,

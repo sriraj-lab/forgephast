@@ -29,8 +29,21 @@ def _payload(tmp_path: Path) -> dict:
     )
     return {
         "name": "pcs_cache",
-        "genotype_input": {"format": "pgen", "path_prefix": "/tmp/dummy"},
-        "cohorts": [{"name": "c1", "sample_ids_file": str(sample_ids)}],
+        "genotype_input": {
+            "format": "hapstore",
+            "hapstore": {
+                "root_dir": "/tmp/fake",
+                "layout": "per_pop_per_chr",
+                "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
+            },
+        },
+        "cohorts": [
+            {
+                "name": "c1",
+                "sample_ids_file": str(sample_ids),
+                "population_map_file": "/tmp/pop_map.tsv",
+            },
+        ],
         "architectures": [{"name": "a1", "params": {"sigma_beta": 1.0, "h2": 0.2}}],
         "causal_selection": {
             "source_pairs_file": str(pairs),

@@ -104,11 +104,10 @@ def write_test_config(tmp_path: Path, name: str = "test_run", n_shards_workers: 
         },
         "outputs": {
             "root": str(tmp_path / "outputs"),
-            "write_phased_vcf": True,
+            "write_phased_vcf": False,
             "write_pgen": False,
             "write_combined_shard_output": True,
             "plink2_path": "plink2",
-            "merge_backend": "python",
         },
         "qc": {
             "within_split_abs_max": 0.5,

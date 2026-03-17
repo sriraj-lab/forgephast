@@ -22,12 +22,12 @@ def test_setup_logging_writes_dedicated_file(tmp_path):
 
 def test_resolve_log_file_path_uses_run_root_from_config(tmp_path):
     cfg_path = write_test_config(tmp_path)
-    resolved = resolve_log_file_path(command="simulate-pool", config_path=cfg_path)
+    resolved = resolve_log_file_path(command="simulate", config_path=cfg_path)
 
     expected_prefix = tmp_path / "outputs" / "test_run" / "logs" / "runs"
     assert resolved is not None
     assert str(resolved).startswith(str(expected_prefix))
-    assert resolved.name.startswith("popamp_simulate-pool_")
+    assert resolved.name.startswith("popamp_simulate_")
 
 
 def test_resolve_log_file_path_can_disable_file_logging(tmp_path):

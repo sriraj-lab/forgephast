@@ -4,8 +4,8 @@ import numpy as np
 
 from forgephast.amplifier.config import from_yaml
 from forgephast.amplifier.qc.pipeline import _resolve_python_qc_numba_threads
-from forgephast.amplifier.qc.ld_decay import ld_curve_from_genotypes
-from forgephast.amplifier.qc.fst import hudson_fst_from_counts
+from forgephast.amplifier.qc.metrics.ld_decay import ld_curve_from_genotypes
+from forgephast.amplifier.qc.metrics.fst import hudson_fst_from_counts
 
 from .conftest import write_test_config
 
@@ -14,12 +14,8 @@ def test_resolve_python_qc_numba_threads_precedence(tmp_path):
     cfg_path = write_test_config(tmp_path, name="qc_numba_threads")
     cfg = from_yaml(cfg_path)
     cfg.qc.matrix_workers = 9
-    cfg.qc.synthetic_rr_min_cpus_per_match = None
     cfg.qc.numba_threads = None
     assert _resolve_python_qc_numba_threads(cfg) == 9
-
-    cfg.qc.synthetic_rr_min_cpus_per_match = 4
-    assert _resolve_python_qc_numba_threads(cfg) == 4
 
     cfg.qc.numba_threads = 7
     assert _resolve_python_qc_numba_threads(cfg) == 7

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pysam
 
-from forgephast.amplifier.vcfio import load_donor_haplotypes
+from forgephast.amplifier.donor_panels import load_donor_haplotypes_from_source
 
 
 def _write_chr_prefixed_vcf(path: Path) -> None:
@@ -36,7 +36,13 @@ def test_load_donor_haplotypes_handles_chr_prefix_alias(tmp_path: Path) -> None:
     vcf_path = tmp_path / "panel.chr21.vcf.gz"
     _write_chr_prefixed_vcf(vcf_path)
 
-    panel = load_donor_haplotypes(vcf_path, chrom=21, donor_ids=["S1", "S2"])
+    panel, _, cache_hit = load_donor_haplotypes_from_source(
+        source_path=vcf_path,
+        source_kind="vcf",
+        chrom=21,
+        donor_ids=["S1", "S2"],
+        cache_dir=tmp_path / "cache",
+    )
+    assert not cache_hit
     assert panel.variants.chrom == "chr21"
     assert panel.donor_haps.shape == (4, 2)
-

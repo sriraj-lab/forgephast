@@ -7,9 +7,9 @@ from typing import Any, List
 
 import numpy as np
 import pandas as pd
+from hapstore.ids import align_by_ids, read_sample_ids
 
 from ..config import CovariateConfig
-from ..utils.ids import align_by_ids, read_sample_ids
 
 
 @dataclass

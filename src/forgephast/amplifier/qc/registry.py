@@ -11,10 +11,9 @@ from .metrics.afs import compute_afs_metrics
 from .metrics.hwe import compute_hwe_metrics
 from .metrics.inbreeding_f import compute_inbreeding_f_metrics
 from .metrics.king import compute_king_kinship_metrics
-from .metrics.ld_decay import compute_ld_decay_qc
 from .metrics.pca import compute_pca_auc_metrics
-from .metrics.plink2_parity import run_plink2_parity_smoke
 from .metrics.roh import compute_roh_metrics
+from .metrics.synthetic_shard_round_robin import compute_synthetic_shard_round_robin_metrics
 
 
 @dataclass(frozen=True)
@@ -28,6 +27,55 @@ class MetricSpec:
 
 def _run_king(**kwargs: Any) -> dict[str, Any]:
     payload, _ = compute_king_kinship_metrics(**kwargs)
+    return payload
+
+
+def _run_synthetic_shard_round_robin(
+    *,
+    config: RunConfig,
+    chrom: int,
+    inputs: Any,
+    groups: dict[str, list[str]],
+    donors_by_population: dict[str, list[str]],
+    diagnostics_dir: Path,
+    numba_threads: int,
+    ext_data: Any | None,
+    ext_data_error: str | None,
+) -> dict[str, Any]:
+    del donors_by_population, ext_data, ext_data_error
+    return compute_synthetic_shard_round_robin_metrics(
+        config=config,
+        chrom=chrom,
+        inputs=inputs,
+        groups=groups,
+        diagnostics_dir=diagnostics_dir,
+        numba_threads=numba_threads,
+    )
+
+
+def _run_ld_decay(
+    *,
+    config: RunConfig,
+    chrom: int,
+    inputs: Any,
+    groups: dict[str, list[str]],
+    donors_by_population: dict[str, list[str]],
+    diagnostics_dir: Path,
+    numba_threads: int,
+    ext_data: Any | None,
+    ext_data_error: str | None,
+) -> dict[str, Any]:
+    del donors_by_population, ext_data, ext_data_error
+    from . import pipeline as qc_pipeline
+
+    payload, _ = qc_pipeline._compute_ld_decay_qc(
+        config=config,
+        chrom=int(chrom),
+        inputs=inputs,
+        groups=groups,
+        diagnostics_dir=diagnostics_dir,
+        numba_threads=int(numba_threads),
+    )
     return payload
 
 
@@ -161,34 +209,19 @@ def _run_roh(
     return payload
 
 
-def _run_plink2_parity(
-    *,
-    config: RunConfig,
-    chrom: int,
-    inputs: Any,
-    groups: dict[str, list[str]],
-    donors_by_population: dict[str, list[str]],
-    diagnostics_dir: Path,
-    numba_threads: int,
-    ext_data: Any | None,
-    ext_data_error: str | None,
-) -> dict[str, Any]:
-    del diagnostics_dir, numba_threads, ext_data, ext_data_error
-    return run_plink2_parity_smoke(
-        config=config,
-        chrom=chrom,
-        inputs=inputs,
-        groups=groups,
-        donors_by_population=donors_by_population,
-    )
-
-
 METRIC_REGISTRY: tuple[MetricSpec, ...] = (
+    MetricSpec(
+        name="synthetic_shard_round_robin",
+        payload_key="synthetic_shard_round_robin",
+        enabled=lambda cfg: bool(cfg.qc.synthetic_shard_round_robin_enabled),
+        runner=_run_synthetic_shard_round_robin,
+        contributes_gate=False,
+    ),
     MetricSpec(
         name="ld_decay",
         payload_key="ld_decay",
         enabled=lambda cfg: bool(cfg.qc.ld_decay_enabled),
-        runner=compute_ld_decay_qc,
+        runner=_run_ld_decay,
         contributes_gate=True,
     ),
     MetricSpec(
@@ -231,13 +264,6 @@ METRIC_REGISTRY: tuple[MetricSpec, ...] = (
         payload_key="roh",
         enabled=lambda cfg: bool(cfg.qc.roh_enabled),
         runner=_run_roh,
-        contributes_gate=False,
-    ),
-    MetricSpec(
-        name="plink2_parity",
-        payload_key="plink2_parity",
-        enabled=lambda cfg: bool(cfg.qc.plink2_parity_enabled),
-        runner=_run_plink2_parity,
         contributes_gate=False,
     ),
 )

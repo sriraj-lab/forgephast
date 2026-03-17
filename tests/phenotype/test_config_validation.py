@@ -13,12 +13,19 @@ def _base_payload() -> dict:
     return {
         "name": "unit_test",
         "genotype_input": {
-            "format": "pgen",
-            "path_prefix": "/tmp/dummy",
-            "conversion_enabled": False,
+            "format": "hapstore",
+            "hapstore": {
+                "root_dir": "/tmp/fake",
+                "layout": "per_pop_per_chr",
+                "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
+            },
         },
         "cohorts": [
-            {"name": "c1", "sample_ids_file": "/tmp/samples.txt"},
+            {
+                "name": "c1",
+                "sample_ids_file": "/tmp/samples.txt",
+                "population_map_file": "/tmp/pop_map.tsv",
+            },
         ],
         "architectures": [
             {
@@ -141,58 +148,37 @@ def test_covariate_target_variance_override_is_optional() -> None:
 
 def test_hapstore_config_accepts_required_fields() -> None:
     payload = _base_payload()
-    payload["genotype_input"] = {
-        "format": "hapstore",
-        "hapstore": {
-            "root_dir": "/tmp/hapstores",
-            "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
-        },
-    }
-    payload["cohorts"][0]["population_map_file"] = "/tmp/pop_map.tsv"
     cfg = RunConfig.from_dict(payload)
     assert cfg.genotype_input.format == "hapstore"
+    assert cfg.genotype_input.hapstore.root_dir == "/tmp/fake"
 
 
 def test_hapstore_rejects_missing_population_map() -> None:
     payload = _base_payload()
-    payload["genotype_input"] = {
-        "format": "hapstore",
-        "hapstore": {
-            "root_dir": "/tmp/hapstores",
-            "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
-        },
-    }
+    payload["cohorts"][0].pop("population_map_file", None)
     with pytest.raises(ValueError, match="population_map_file"):
         RunConfig.from_dict(payload)
 
 
 def test_hapstore_rejects_invalid_file_pattern() -> None:
     payload = _base_payload()
-    payload["genotype_input"] = {
-        "format": "hapstore",
-        "hapstore": {
-            "root_dir": "/tmp/hapstores",
-            "file_pattern": "chr{chrom}.hapstore.zarr",
-        },
-    }
-    payload["cohorts"][0]["population_map_file"] = "/tmp/pop_map.tsv"
+    payload["genotype_input"]["hapstore"]["file_pattern"] = "chr{chrom}.hapstore.zarr"
     with pytest.raises(ValueError, match="file_pattern"):
         RunConfig.from_dict(payload)
 
 
 def test_hapstore_rejects_plink_pca_when_export_disabled() -> None:
     payload = _base_payload()
-    payload["genotype_input"] = {
-        "format": "hapstore",
-        "hapstore": {
-            "root_dir": "/tmp/hapstores",
-            "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
-        },
-    }
-    payload["cohorts"][0]["population_map_file"] = "/tmp/pop_map.tsv"
     payload["gwas"]["global_pcs"]["mode"] = "plink2_pca"
     payload["pgen_export"] = {"enabled": False}
     with pytest.raises(ValueError, match="pgen_export.enabled"):
+        RunConfig.from_dict(payload)
+
+
+def test_rejects_pgen_format() -> None:
+    payload = _base_payload()
+    payload["genotype_input"] = {"format": "pgen"}
+    with pytest.raises(ValueError, match="must be 'hapstore'"):
         RunConfig.from_dict(payload)
 
 
@@ -203,15 +189,14 @@ def test_rejects_invalid_variance_budget_sum_when_strict() -> None:
         RunConfig.from_dict(payload)
 
 
-def test_legacy_global_pcs_compute_mode_is_rewritten() -> None:
+def test_removed_global_pcs_compute_mode_raises() -> None:
     payload = _base_payload()
     payload["gwas"]["global_pcs"]["mode"] = "compute"
-    with pytest.warns(UserWarning, match="deprecated"):
-        cfg = RunConfig.from_dict(payload)
-    assert cfg.gwas.global_pcs.mode == "plink2_pca"
+    with pytest.raises(ValueError, match="mode=compute was removed"):
+        RunConfig.from_dict(payload)
 
 
-def test_legacy_removed_knobs_are_ignored_with_warning() -> None:
+def test_removed_legacy_knobs_raise() -> None:
     payload = _base_payload()
     payload["genotype_input"]["temp_dir"] = "/tmp/old"
     payload["pgen_export"] = {
@@ -220,16 +205,14 @@ def test_legacy_removed_knobs_are_ignored_with_warning() -> None:
         "ld_window_kb": 250,
         "ld_r2": 0.8,
     }
-    with pytest.warns(UserWarning, match="deprecated"):
-        cfg = RunConfig.from_dict(payload)
-    assert cfg.genotype_input.format == "pgen"
-    assert cfg.pgen_export.enabled is True
+    with pytest.raises(ValueError, match="genotype_input.temp_dir"):
+        RunConfig.from_dict(payload)
 
 
-def test_rejects_invalid_pgen_dosage_backend() -> None:
+def test_rejects_removed_pgen_dosage_backend() -> None:
     payload = _base_payload()
-    payload["genotype_input"]["pgen_dosage_backend"] = "invalid_backend"
-    with pytest.raises(ValueError, match="pgen_dosage_backend"):
+    payload["genotype_input"]["pgen_dosage_backend"] = "plink2_export"
+    with pytest.raises(ValueError, match="genotype_input.pgen_dosage_backend"):
         RunConfig.from_dict(payload)
 
 

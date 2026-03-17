@@ -14,12 +14,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
-import hashlib
 import json
 import logging
 import math
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
@@ -27,8 +25,8 @@ from typing import Any, Dict, List, Sequence
 import pandas as pd
 import yaml
 
+from .._internal.cache import bump_counter, canonical_hash, counter_delta, snapshot_counters
 from .config import RunConfig
-from .data.convert import ensure_pgen_input
 from .data.genotypes import build_genotype_adapter
 from .data.global_pcs import refresh_manifest_global_pcs
 from .data.pgen_export import export_manifest_pgens
@@ -39,8 +37,8 @@ from .grid import (
     load_grid_spec,
     write_grid_manifest,
 )
-from .gwas import Plink2Engine, RegenieEngine
-from .gwas.base import GwasTask
+from .gwas import GwasTask
+from .gwas.registry import available_engine_names, build_engines
 from .io.write_outputs import write_simulation_outputs
 from .phenotypes.simulate import run_simulation
 from .utils.logging import setup_logging
@@ -58,21 +56,6 @@ def _load_config(config_path: str) -> RunConfig:
     config = RunConfig.from_yaml(config_path)
     config.paths.create_directories()
     return config
-
-
-def _canonical_hash(payload: dict[str, Any]) -> str:
-    """Deterministic hash for cache keys."""
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
-
-
-def _bump(runtime_state: dict[str, Any] | None, *, hit: bool, name: str) -> None:
-    """Track in-memory cache hit/miss counters."""
-    if runtime_state is None:
-        return
-    bucket = "cache_hits" if hit else "cache_misses"
-    counters = runtime_state.setdefault(bucket, {})
-    counters[name] = int(counters.get(name, 0)) + 1
 
 
 def _write_stage_timing(
@@ -101,93 +84,37 @@ def _write_stage_timing(
     return out_path
 
 
-def _snapshot_counters(runtime_state: dict[str, Any] | None) -> tuple[dict[str, int], dict[str, int]]:
-    if runtime_state is None:
-        return {}, {}
-    hits = {str(k): int(v) for k, v in runtime_state.get("cache_hits", {}).items()}
-    misses = {str(k): int(v) for k, v in runtime_state.get("cache_misses", {}).items()}
-    return hits, misses
-
-
-def _counter_delta(current: dict[str, int], baseline: dict[str, int]) -> dict[str, int]:
-    keys = set(current) | set(baseline)
-    return {key: int(current.get(key, 0) - baseline.get(key, 0)) for key in sorted(keys)}
-
-
-def _resolve_pgen_prefix(config: RunConfig, runtime_state: dict[str, Any] | None) -> str | None:
-    """Resolve canonical PGEN prefix with optional in-memory conversion reuse."""
-    if runtime_state is None:
-        return ensure_pgen_input(config.genotype_input, Path(config.paths.tmp_dir))
-
-    key = _canonical_hash(
-        {
-            "format": config.genotype_input.format,
-            "path_prefix": config.genotype_input.path_prefix,
-            "conversion_enabled": bool(config.genotype_input.conversion_enabled),
-            "plink2_path": config.genotype_input.plink2_path,
-            "tmp_dir": config.paths.tmp_dir,
-        }
-    )
-    cache = runtime_state.setdefault("converted_pgen_cache", {})
-    if key in cache:
-        _bump(runtime_state, hit=True, name="converted_pgen")
-        return cache[key]
-    _bump(runtime_state, hit=False, name="converted_pgen")
-    prefix = ensure_pgen_input(config.genotype_input, Path(config.paths.tmp_dir))
-    cache[key] = prefix
-    return prefix
-
 
 def _get_adapter(
     config: RunConfig,
     *,
-    pgen_prefix: str | None,
     runtime_state: dict[str, Any] | None,
 ) -> object:
     """Return an adapter, reusing one in-memory for compatible configs."""
     if runtime_state is None:
         adapter = build_genotype_adapter(
-            genotype_format=config.genotype_input.format,
-            pgen_prefix=pgen_prefix,
-            plink2_path=config.genotype_input.plink2_path,
             hapstore_cfg=config.genotype_input.hapstore,
-            pgen_dosage_backend=config.genotype_input.pgen_dosage_backend,
         )
         adapter.validate_files()
         return adapter
 
-    key = _canonical_hash(
+    hap = config.genotype_input.hapstore
+    key = canonical_hash(
         {
-            "genotype_format": config.genotype_input.format,
-            "pgen_prefix": pgen_prefix,
-            "plink2_path": config.genotype_input.plink2_path,
-            "pgen_dosage_backend": config.genotype_input.pgen_dosage_backend,
-            "hapstore_layout": None
-            if config.genotype_input.hapstore is None
-            else config.genotype_input.hapstore.layout,
-            "hapstore_root": None
-            if config.genotype_input.hapstore is None
-            else config.genotype_input.hapstore.root_dir,
-            "hapstore_file_pattern": None
-            if config.genotype_input.hapstore is None
-            else config.genotype_input.hapstore.file_pattern,
-            "hapstore_store_path": None
-            if config.genotype_input.hapstore is None
-            else config.genotype_input.hapstore.store_path,
+            "hapstore_layout": hap.layout,
+            "hapstore_root": hap.root_dir,
+            "hapstore_file_pattern": hap.file_pattern,
+            "hapstore_store_path": hap.store_path,
         }
     )
     cache = runtime_state.setdefault("adapter_cache", {})
     if key in cache:
-        _bump(runtime_state, hit=True, name="adapter")
+        bump_counter(runtime_state, hit=True, name="adapter")
         return cache[key]
 
-    _bump(runtime_state, hit=False, name="adapter")
+    bump_counter(runtime_state, hit=False, name="adapter")
     adapter = build_genotype_adapter(
-        genotype_format=config.genotype_input.format,
-        pgen_prefix=pgen_prefix,
-        plink2_path=config.genotype_input.plink2_path,
         hapstore_cfg=config.genotype_input.hapstore,
-        pgen_dosage_backend=config.genotype_input.pgen_dosage_backend,
     )
     adapter.validate_files()
     cache[key] = adapter
@@ -208,20 +135,12 @@ def _run_simulate(
     stage_rows: list[dict[str, Any]] = []
     logger.info("SIMULATE_START run=%s run_dir=%s", config.name, run_dir)
 
-    t0 = time.perf_counter()
-    pgen_prefix = _resolve_pgen_prefix(config, runtime_state=runtime_state)
-    stage_rows.append(
-        {"stage": "resolve_pgen_input", "elapsed_seconds": float(time.perf_counter() - t0)}
-    )
-    logger.info("SIMULATE_STAGE_DONE run=%s stage=resolve_pgen_input", config.name)
-
-    adapter = _get_adapter(config, pgen_prefix=pgen_prefix, runtime_state=runtime_state)
+    adapter = _get_adapter(config, runtime_state=runtime_state)
 
     logger.info("[simulate] Starting simulation for run=%s", config.name)
     t1 = time.perf_counter()
     records = run_simulation(
         run_cfg=config,
-        pgen_prefix=pgen_prefix,
         run_dir=run_dir,
         adapter=adapter,
         runtime_cache=runtime_state,
@@ -268,12 +187,7 @@ def _run_simulate(
 
 def _make_engines(config: RunConfig) -> Dict[str, object]:
     """Create configured GWAS engine objects."""
-    engines: Dict[str, object] = {}
-    if "plink2" in config.gwas.engines:
-        engines["plink2"] = Plink2Engine(config.gwas.plink2)
-    if "regenie" in config.gwas.engines:
-        engines["regenie"] = RegenieEngine(config.gwas.regenie)
-    return engines
+    return dict(build_engines(config))
 
 
 def _manifest_to_tasks(manifest_df: pd.DataFrame, chromosomes: List[int]) -> List[GwasTask]:
@@ -335,6 +249,21 @@ def _run_gwas(
         if not engines:
             raise ValueError(f"No engines remain after filter={engines_filter}")
 
+    prepare_t0 = time.perf_counter()
+    engine_prepared_state: dict[str, Any] = {}
+    for engine_name, engine in engines.items():
+        batch_dir = run_dir / "_gwas_engine_state" / engine_name
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        engine_prepared_state[engine_name] = engine.prepare_batch(tasks, batch_dir)
+    stage_rows.append(
+        {
+            "stage": "prepare_gwas_engines",
+            "elapsed_seconds": float(time.perf_counter() - prepare_t0),
+            "n_engines": int(len(engines)),
+        }
+    )
+    logger.info("GWAS_STAGE_DONE run=%s stage=prepare_gwas_engines n_engines=%d", config.name, len(engines))
+
     jobs: list[tuple[int, GwasTask, str, object]] = []
     idx = 0
     for task in tasks:
@@ -355,7 +284,11 @@ def _run_gwas(
             engine_name,
         )
         try:
-            result = engine.run(task=task, run_dir=task_out_dir)
+            result = engine.run(
+                task=task,
+                run_dir=task_out_dir,
+                prepared_state=engine_prepared_state.get(engine_name),
+            )
             row = {
                 "run_name": task.run_name,
                 "replicate": task.replicate,
@@ -363,9 +296,10 @@ def _run_gwas(
                 "cohort": task.cohort,
                 "engine": engine_name,
                 "status": "success",
-                "output_dir": result.get("output_dir", ""),
-                "primary_output": result.get("primary_output", ""),
+                "output_dir": str(result.output_dir),
+                "primary_output": str(result.primary_output),
             }
+            row.update(dict(result.metadata))
         except Exception as exc:  # noqa: BLE001
             logger.exception("[gwas] failure for engine=%s task=%s", engine_name, task)
             row = {
@@ -426,17 +360,16 @@ def _prepare_manifest_for_gwas(
     """Prepare manifest for GWAS (HapStore export + global PCA refresh)."""
     stage_rows: list[dict[str, Any]] = []
     current = manifest_path
-    if config.genotype_input.format == "hapstore":
-        t0 = time.perf_counter()
-        logger.info("[prep] exporting HapStore cohorts to PGEN")
-        current = export_manifest_pgens(config, current, runtime_cache=runtime_state)
-        stage_rows.append(
-            {
-                "stage": "hapstore_export",
-                "elapsed_seconds": float(time.perf_counter() - t0),
-            }
-        )
-        logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
+    t0 = time.perf_counter()
+    logger.info("[prep] exporting HapStore cohorts to PGEN")
+    current = export_manifest_pgens(config, current, runtime_cache=runtime_state)
+    stage_rows.append(
+        {
+            "stage": "hapstore_export",
+            "elapsed_seconds": float(time.perf_counter() - t0),
+        }
+    )
+    logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
     if config.gwas.global_pcs.canonical_mode() in {"plink2_pca", "precomputed"}:
         t1 = time.perf_counter()
         logger.info("[prep] refreshing global PCs from manifest PGENs")
@@ -463,6 +396,76 @@ def _run_roundtrip_validation(config: RunConfig, gwas_manifest_path: Path) -> Pa
     )
 
 
+# ---------------------------------------------------------------------------
+# Unified pipeline runner
+# ---------------------------------------------------------------------------
+
+def _run_pipeline(
+    config: RunConfig,
+    stages: list[str],
+    *,
+    engines_filter: list[str] | None = None,
+    runtime_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run one or more pipeline stages in sequence.
+
+    Parameters
+    ----------
+    config:
+        Validated run configuration.
+    stages:
+        Ordered list of stages to execute (``"simulate"``, ``"gwas"``).
+    engines_filter:
+        Optional GWAS engine name filter.
+    runtime_state:
+        Mutable dict for adapter/cache reuse across grid cases.
+
+    Returns
+    -------
+    dict with keys: ``manifest_path``, ``prepared_manifest``, ``gwas_manifest``,
+    ``validation_report``, ``timing_rows``, ``timing_path``.
+    """
+    run_dir = Path(config.paths.output_root) / config.name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    timing_rows: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+
+    if "simulate" in stages:
+        manifest_path, sim_rows = _run_simulate(config, runtime_state=runtime_state)
+        timing_rows.extend(sim_rows)
+        result["manifest_path"] = manifest_path
+
+    if "gwas" in stages:
+        manifest_path = result.get("manifest_path") or (
+            Path(config.paths.output_root) / config.name / "run_manifest.tsv"
+        )
+        prepared_path, prep_rows = _prepare_manifest_for_gwas(
+            config, manifest_path, runtime_state=runtime_state
+        )
+        timing_rows.extend(prep_rows)
+        result["prepared_manifest"] = prepared_path
+
+        gwas_path, gwas_rows = _run_gwas(config, prepared_path, engines_filter=engines_filter)
+        timing_rows.extend(gwas_rows)
+        result["gwas_manifest"] = gwas_path
+
+        t0 = time.perf_counter()
+        validation = _run_roundtrip_validation(config, gwas_path)
+        timing_rows.append({
+            "stage": "roundtrip_validation",
+            "elapsed_seconds": float(time.perf_counter() - t0),
+            "enabled": bool(config.roundtrip_validation.enabled),
+        })
+        if validation is not None:
+            result["validation_report"] = validation
+
+    result["timing_rows"] = timing_rows
+    stage_label = "+".join(stages)
+    timing_path = _write_stage_timing(run_dir, stage_label, timing_rows)
+    result["timing_path"] = timing_path
+    return result
+
+
 def _run_case(
     payload: dict[str, Any],
     stage: str,
@@ -475,69 +478,40 @@ def _run_case(
     config.paths.create_directories()
     run_dir = Path(config.paths.output_root) / config.name
     run_dir.mkdir(parents=True, exist_ok=True)
-    before_hits, before_misses = _snapshot_counters(runtime_state)
+    before_hits, before_misses = snapshot_counters(runtime_state)
     logger.info("GRID_CASE_START run=%s case_index=%d stage=%s", config.name, int(case_index), stage)
 
-    stage_rows: list[dict[str, Any]] = []
-    out_manifest = ""
-    prepared_manifest = ""
-    gwas_manifest = ""
-    validation_report = ""
-
-    if stage == "simulate":
-        manifest_path, sim_rows = _run_simulate(config, runtime_state=runtime_state)
-        out_manifest = str(manifest_path)
-        stage_rows.extend(sim_rows)
-    elif stage == "full":
-        manifest_path, sim_rows = _run_simulate(config, runtime_state=runtime_state)
-        stage_rows.extend(sim_rows)
-        out_manifest = str(manifest_path)
-
-        prepared_path, prep_rows = _prepare_manifest_for_gwas(
-            config, manifest_path, runtime_state=runtime_state
-        )
-        stage_rows.extend(prep_rows)
-        prepared_manifest = str(prepared_path)
-
-        gwas_path, gwas_rows = _run_gwas(config, prepared_path, engines_filter=engines_filter)
-        stage_rows.extend(gwas_rows)
-        gwas_manifest = str(gwas_path)
-
-        t0 = time.perf_counter()
-        validation = _run_roundtrip_validation(config, gwas_path)
-        stage_rows.append(
-            {
-                "stage": "roundtrip_validation",
-                "elapsed_seconds": float(time.perf_counter() - t0),
-                "enabled": bool(config.roundtrip_validation.enabled),
-            }
-        )
-        if validation is not None:
-            validation_report = str(validation)
-    else:
+    stage_map = {"simulate": ["simulate"], "full": ["simulate", "gwas"]}
+    if stage not in stage_map:
         raise ValueError(f"Unsupported grid stage: {stage}")
 
-    timing_path = _write_stage_timing(run_dir, f"{stage}_grid_case", stage_rows)
-    after_hits, after_misses = _snapshot_counters(runtime_state)
-    delta_hits = _counter_delta(after_hits, before_hits)
-    delta_misses = _counter_delta(after_misses, before_misses)
+    result = _run_pipeline(
+        config,
+        stage_map[stage],
+        engines_filter=engines_filter,
+        runtime_state=runtime_state,
+    )
+
+    after_hits, after_misses = snapshot_counters(runtime_state)
+    delta_hits = counter_delta(after_hits, before_hits)
+    delta_misses = counter_delta(after_misses, before_misses)
     logger.info(
         "GRID_CASE_DONE run=%s case_index=%d stage=%s timing=%s cache_hits_delta=%s cache_misses_delta=%s",
         config.name,
         int(case_index),
         stage,
-        timing_path,
+        result.get("timing_path", ""),
         json.dumps(delta_hits, sort_keys=True),
         json.dumps(delta_misses, sort_keys=True),
     )
     return {
         "run_name": config.name,
         "run_dir": str(run_dir),
-        "manifest_path": out_manifest,
-        "prepared_manifest_path": prepared_manifest,
-        "gwas_manifest_path": gwas_manifest,
-        "validation_report": validation_report,
-        "timing_file": str(timing_path),
+        "manifest_path": str(result.get("manifest_path", "")),
+        "prepared_manifest_path": str(result.get("prepared_manifest", "")),
+        "gwas_manifest_path": str(result.get("gwas_manifest", "")),
+        "validation_report": str(result.get("validation_report", "")),
+        "timing_file": str(result.get("timing_path", "")),
         "cache_hits": json.dumps(runtime_state.get("cache_hits", {}), sort_keys=True),
         "cache_misses": json.dumps(runtime_state.get("cache_misses", {}), sort_keys=True),
     }
@@ -677,6 +651,7 @@ def _run_grid(grid_path: str, engines_filter: List[str] | None) -> Path:
 
 def _parse_args() -> argparse.Namespace:
     """Build CLI parser and parse arguments."""
+    engine_choices = available_engine_names()
     parser = argparse.ArgumentParser(
         prog="forgephast-phenotype",
         description="Polygenic phenotype simulation pipeline (forgephast)",
@@ -695,7 +670,7 @@ def _parse_args() -> argparse.Namespace:
     )
     gwas.add_argument(
         "--engine",
-        choices=["plink2", "regenie"],
+        choices=engine_choices,
         action="append",
         help="Optional engine filter; can be passed multiple times",
     )
@@ -704,7 +679,7 @@ def _parse_args() -> argparse.Namespace:
     full.add_argument("--config", required=True, help="Path to run config YAML")
     full.add_argument(
         "--engine",
-        choices=["plink2", "regenie"],
+        choices=engine_choices,
         action="append",
         help="Optional GWAS engine filter",
     )
@@ -713,7 +688,7 @@ def _parse_args() -> argparse.Namespace:
     grid.add_argument("--grid", required=True, help="Path to grid spec YAML")
     grid.add_argument(
         "--engine",
-        choices=["plink2", "regenie"],
+        choices=engine_choices,
         action="append",
         help="Optional GWAS engine filter (only for stage=full grids)",
     )
@@ -745,72 +720,43 @@ def main() -> None:
     logger.info("pipeline command=%s", args.command)
     logger.info("config=%s", args.config)
 
-    run_dir = Path(config.paths.output_root) / config.name
-    timing_rows: list[dict[str, Any]] = []
-
     if args.command == "simulate":
-        manifest_path, sim_rows = _run_simulate(config, runtime_state=None)
-        timing_rows.extend(sim_rows)
-        timing_path = _write_stage_timing(run_dir, "simulate", timing_rows)
-        logger.info("SIMULATE_TIMINGS %s", timing_path)
-        logger.info("SIMULATE_COMPLETED manifest=%s", manifest_path)
+        result = _run_pipeline(config, ["simulate"])
+        logger.info("SIMULATE_TIMINGS %s", result["timing_path"])
+        logger.info("SIMULATE_COMPLETED manifest=%s", result["manifest_path"])
         return
 
     if args.command == "gwas":
-        manifest_path = (
-            Path(args.manifest)
-            if args.manifest
-            else Path(config.paths.output_root) / config.name / "run_manifest.tsv"
-        )
-        prepared_manifest, prep_rows = _prepare_manifest_for_gwas(
-            config, manifest_path, runtime_state=None
-        )
-        timing_rows.extend(prep_rows)
-        out, gwas_rows = _run_gwas(config, prepared_manifest, engines_filter=args.engine)
-        timing_rows.extend(gwas_rows)
-        t0 = time.perf_counter()
-        validation = _run_roundtrip_validation(config, out)
-        timing_rows.append(
-            {
-                "stage": "roundtrip_validation",
-                "elapsed_seconds": float(time.perf_counter() - t0),
-                "enabled": bool(config.roundtrip_validation.enabled),
-            }
-        )
-        timing_path = _write_stage_timing(run_dir, "gwas", timing_rows)
-        logger.info("GWAS_TIMINGS %s", timing_path)
-        if validation is not None:
-            logger.info("GWAS_VALIDATION_COMPLETED report=%s", validation)
-        logger.info("GWAS_COMPLETED summary=%s", out)
+        # For gwas-only, an explicit --manifest overrides the default path.
+        if args.manifest:
+            # Seed the manifest_path so _run_pipeline picks it up for the gwas stage.
+            run_dir = Path(config.paths.output_root) / config.name
+            run_dir.mkdir(parents=True, exist_ok=True)
+            # Copy the explicit manifest into the default location so the gwas
+            # stage finds it without simulate having run.
+            import shutil
+
+            default_manifest = run_dir / "run_manifest.tsv"
+            src = Path(args.manifest)
+            if src.resolve() != default_manifest.resolve():
+                shutil.copy2(src, default_manifest)
+        result = _run_pipeline(config, ["gwas"], engines_filter=args.engine)
+        logger.info("GWAS_TIMINGS %s", result["timing_path"])
+        if result.get("validation_report") is not None:
+            logger.info("GWAS_VALIDATION_COMPLETED report=%s", result["validation_report"])
+        logger.info("GWAS_COMPLETED summary=%s", result["gwas_manifest"])
         return
 
     if args.command == "full":
-        manifest_path, sim_rows = _run_simulate(config, runtime_state=None)
-        timing_rows.extend(sim_rows)
-        prepared_manifest, prep_rows = _prepare_manifest_for_gwas(
-            config, manifest_path, runtime_state=None
-        )
-        timing_rows.extend(prep_rows)
-        out, gwas_rows = _run_gwas(config, prepared_manifest, engines_filter=args.engine)
-        timing_rows.extend(gwas_rows)
-        t0 = time.perf_counter()
-        validation = _run_roundtrip_validation(config, out)
-        timing_rows.append(
-            {
-                "stage": "roundtrip_validation",
-                "elapsed_seconds": float(time.perf_counter() - t0),
-                "enabled": bool(config.roundtrip_validation.enabled),
-            }
-        )
-        timing_path = _write_stage_timing(run_dir, "full", timing_rows)
-        logger.info("FULL_TIMINGS %s", timing_path)
-        if validation is not None:
-            logger.info("FULL_VALIDATION_COMPLETED report=%s", validation)
+        result = _run_pipeline(config, ["simulate", "gwas"], engines_filter=args.engine)
+        logger.info("FULL_TIMINGS %s", result["timing_path"])
+        if result.get("validation_report") is not None:
+            logger.info("FULL_VALIDATION_COMPLETED report=%s", result["validation_report"])
         logger.info(
             "FULL_COMPLETED manifest=%s prepared_manifest=%s gwas_summary=%s",
-            manifest_path,
-            prepared_manifest,
-            out,
+            result["manifest_path"],
+            result["prepared_manifest"],
+            result["gwas_manifest"],
         )
         return
 

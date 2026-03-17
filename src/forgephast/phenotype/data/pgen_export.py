@@ -13,9 +13,10 @@ from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
+from hapstore.ids import align_by_ids, read_sample_ids
 
+from ..._internal.cache import bump_counter, canonical_hash
 from ..config import CohortConfig, RunConfig
-from ..utils.ids import align_by_ids, read_sample_ids
 from .genotypes import build_genotype_adapter
 
 logger = logging.getLogger(__name__)
@@ -32,11 +33,6 @@ class ExportTask:
     variant_ids: List[str] | None
     out_prefix: Path
     cache_key: str
-
-
-def _canonical_hash(payload: dict[str, Any]) -> str:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(data).hexdigest()
 
 
 def _pgen_triplet_exists(prefix: str | Path) -> bool:
@@ -236,7 +232,7 @@ def _build_export_cache_key(
     variant_ids: list[str] | None,
 ) -> str:
     hap_cfg = run_cfg.genotype_input.hapstore
-    return _canonical_hash(
+    return canonical_hash(
         {
             "layout": None if hap_cfg is None else str(hap_cfg.layout),
             "root_dir": None if hap_cfg is None else str(hap_cfg.root_dir),
@@ -254,21 +250,9 @@ def _build_export_cache_key(
     )
 
 
-def _bump(runtime_cache: dict[str, Any] | None, *, hit: bool) -> None:
-    if runtime_cache is None:
-        return
-    key = "cache_hits" if hit else "cache_misses"
-    counters = runtime_cache.setdefault(key, {})
-    counters["pgen_export"] = int(counters.get("pgen_export", 0)) + 1
-
-
 def _export_one_task(task: ExportTask, run_cfg: RunConfig, merge_cfg: SimpleNamespace) -> str:
     adapter = build_genotype_adapter(
-        genotype_format=run_cfg.genotype_input.format,
-        pgen_prefix=None,
-        plink2_path=run_cfg.genotype_input.plink2_path,
         hapstore_cfg=run_cfg.genotype_input.hapstore,
-        pgen_dosage_backend=run_cfg.genotype_input.pgen_dosage_backend,
     )
     adapter.validate_files()
     return adapter.export_to_pgen(
@@ -287,8 +271,6 @@ def export_manifest_pgens(
     runtime_cache: dict[str, Any] | None = None,
 ) -> Path:
     """Export HapStore cohorts to PGEN and emit updated manifest path."""
-    if run_cfg.genotype_input.format != "hapstore":
-        return manifest_path
     if not run_cfg.pgen_export.enabled:
         raise ValueError("pgen_export.enabled must be true for genotype_input.format=hapstore")
 
@@ -386,10 +368,10 @@ def export_manifest_pgens(
         if export_cache is not None and task.cache_key in export_cache:
             cached_prefix = export_cache[task.cache_key]
             if _pgen_triplet_exists(cached_prefix):
-                _bump(runtime_cache, hit=True)
+                bump_counter(runtime_cache, hit=True, name="pgen_export")
                 resolved_prefix_by_key[task.cache_key] = cached_prefix
                 continue
-        _bump(runtime_cache, hit=False)
+        bump_counter(runtime_cache, hit=False, name="pgen_export")
         if task.cache_key not in pending_unique:
             pending_unique[task.cache_key] = task
 

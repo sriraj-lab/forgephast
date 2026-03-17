@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from forgephast.phenotype.data.global_pcs_svd import compute_global_pcs_svd
+from forgephast.phenotype.data.global_pcs import compute_global_pcs_svd
 
 
 def test_compute_global_pcs_svd_is_deterministic() -> None:

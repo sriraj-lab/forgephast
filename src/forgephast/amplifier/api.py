@@ -11,12 +11,10 @@ from .merge import MergeResult, merge_chromosome
 from .qc import (
     DonorWithinPopRoundRobinReport,
     QcReport,
-    SyntheticPremergeWithinPopRoundRobinReport,
     run_donor_within_pop_round_robin,
     run_qc,
-    run_synthetic_premerge_within_pop_round_robin,
 )
-from .simulation import SimulationBatchResult, SimulationResult, simulate_chromosome, simulate_chromosome_population_shard_pool
+from .simulation import SimulationBatchResult, simulate_chromosome_population_shard_pool
 
 
 def build_manifest(config_path: str | Path) -> Manifest:
@@ -36,16 +34,6 @@ def build_cache(
 def simulate(
     config_path: str | Path,
     chrom: int,
-    shard_id: int = 0,
-    n_shards: int = 1,
-) -> SimulationResult:
-    cfg = from_yaml(config_path)
-    return simulate_chromosome(cfg, chrom=chrom, shard_id=shard_id, n_shards=n_shards)
-
-
-def simulate_pool(
-    config_path: str | Path,
-    chrom: int,
     n_shards: int | None = None,
     workers: int | None = None,
     threads_per_task: int | None = None,
@@ -56,11 +44,11 @@ def simulate_pool(
     resolved_task_workers = workers if workers is not None else cfg.simulation.task_workers
     if resolved_n_shards is None:
         raise ValueError(
-            "simulate_pool requires n_shards via CLI/API or simulation.n_shards in config"
+            "simulate requires n_shards via CLI/API or simulation.n_shards in config"
         )
     if resolved_task_workers is None:
         raise ValueError(
-            "simulate_pool requires workers via CLI/API or simulation.task_workers in config"
+            "simulate requires workers via CLI/API or simulation.task_workers in config"
         )
     resolved_task_start_method = (
         task_start_method
@@ -115,27 +103,6 @@ def qc_donor_round_robin(
         cfg,
         chrom=chrom,
         fold_fraction=fold_fraction,
-        seed=seed,
-        workers=workers,
-        populations=populations,
-    )
-
-
-def qc_synthetic_premerge_round_robin(
-    config_path: str | Path,
-    chrom: int,
-    n_shards: int,
-    n_folds: int | None = None,
-    seed: int = 42,
-    workers: int = 1,
-    populations: list[str] | None = None,
-) -> SyntheticPremergeWithinPopRoundRobinReport:
-    cfg = from_yaml(config_path)
-    return run_synthetic_premerge_within_pop_round_robin(
-        cfg,
-        chrom=chrom,
-        n_shards=n_shards,
-        n_folds=n_folds,
         seed=seed,
         workers=workers,
         populations=populations,

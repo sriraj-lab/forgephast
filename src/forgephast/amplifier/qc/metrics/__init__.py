@@ -9,6 +9,5 @@ __all__ = [
     "inbreeding_f",
     "king",
     "pca",
-    "plink2_parity",
     "roh",
 ]

@@ -1,4 +1,4 @@
-"""Stage-0 donor panel cache builder."""
+"""Stage-0 donor HapStore cache builder."""
 
 from __future__ import annotations
 
@@ -9,10 +9,10 @@ from pathlib import Path
 from time import perf_counter
 
 from .config import RunConfig
+from .donor_panels import ensure_donor_panel_hapstore
 from .donors import Manifest, load_manifest
 from .telemetry import telemetry_span
 from .utils import ensure_dir
-from .vcfio import load_donor_haplotypes_cached
 
 logger = logging.getLogger(__name__)
 
@@ -85,19 +85,20 @@ def build_donor_cache(
                 with ThreadPoolExecutor(max_workers=max_workers) as pool:
                     future_to_job = {
                         pool.submit(
-                            load_donor_haplotypes_cached,
+                            ensure_donor_panel_hapstore,
                             source_path=source_path,
                             source_kind=source_kind,
                             chrom=chrom,
                             donor_ids=donor_ids,
                             cache_dir=cache_root,
                             force_refresh=force,
+                            ingest_workers=max(1, int(donor_io_workers)),
                         ): (source_kind, source_path, donor_ids)
                         for source_kind, source_path, donor_ids in jobs
                     }
                     for future in as_completed(future_to_job):
                         source_kind, source_path, donor_ids = future_to_job[future]
-                        _, cache_path, cache_hit = future.result()
+                        cache_path, cache_hit = future.result()
                         entries.append(
                             DonorCacheEntry(
                                 chrom=chrom,
@@ -110,13 +111,14 @@ def build_donor_cache(
                         )
             else:
                 for source_kind, source_path, donor_ids in jobs:
-                    _, cache_path, cache_hit = load_donor_haplotypes_cached(
+                    cache_path, cache_hit = ensure_donor_panel_hapstore(
                         source_path=source_path,
                         source_kind=source_kind,
                         chrom=chrom,
                         donor_ids=donor_ids,
                         cache_dir=cache_root,
                         force_refresh=force,
+                        ingest_workers=max(1, int(donor_io_workers)),
                     )
                     entries.append(
                         DonorCacheEntry(

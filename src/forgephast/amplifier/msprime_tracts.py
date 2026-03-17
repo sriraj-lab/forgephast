@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from .vcfio import PanelChromData
+from .donor_panels import PanelChromData
 
 logger = logging.getLogger(__name__)
 

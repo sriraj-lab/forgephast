@@ -12,7 +12,7 @@ except Exception:  # pragma: no cover
     njit = None
     _HAS_NUMBA = False
 
-from .base import ArchitectureInput, ArchitecturePlugin, register_plugin
+from .base import ArchitectureInput, ArchitecturePlugin
 
 
 if _HAS_NUMBA:
@@ -157,9 +157,3 @@ class PolygenicNoPleiotropyPlugin(ArchitecturePlugin):
             effects_detail = effects_detail.rename(columns={variant_col: "variant_id"})
 
         return genetic, effects_detail
-
-
-register_plugin("polygenic_no_pleiotropy", PolygenicNoPleiotropyPlugin)
-# Backwards/alias key: local-ancestry behavior is controlled by presence of
-# (haplotypes, local_ancestry_codes) in ArchitectureInput, not by plugin name.
-register_plugin("polygenic_local_ancestry_no_pleiotropy", PolygenicNoPleiotropyPlugin)

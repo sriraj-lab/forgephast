@@ -60,7 +60,7 @@ def test_config_rejects_invalid_synthetic_rr_max_pairs(tmp_path):
     with open(broken, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle)
 
-    with pytest.raises(ValueError, match="synthetic_round_robin_max_pairs_per_population"):
+    with pytest.raises(ValueError, match="synthetic_round_robin_max_pairs_per_population was removed"):
         _ = from_yaml(broken)
 
 
@@ -74,7 +74,63 @@ def test_config_rejects_invalid_synthetic_rr_min_cpus_per_match(tmp_path):
     with open(broken, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle)
 
-    with pytest.raises(ValueError, match="synthetic_rr_min_cpus_per_match"):
+    with pytest.raises(ValueError, match="synthetic_rr_min_cpus_per_match was removed"):
+        _ = from_yaml(broken)
+
+
+def test_config_rejects_removed_rr_pairwise_mode_key(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload.setdefault("qc", {})["rr_pairwise_mode"] = "sampled"
+
+    broken = tmp_path / "broken_rr_pairwise_mode.yaml"
+    with open(broken, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle)
+
+    with pytest.raises(ValueError, match="qc.rr_pairwise_mode was removed"):
+        _ = from_yaml(broken)
+
+
+def test_config_rejects_invalid_synthetic_shard_round_robin_pairwise_mode(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload.setdefault("qc", {})["synthetic_shard_round_robin_pairwise_mode"] = "bad_mode"
+
+    broken = tmp_path / "broken_synthetic_shard_round_robin_pairwise_mode.yaml"
+    with open(broken, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle)
+
+    with pytest.raises(ValueError, match="synthetic_shard_round_robin_pairwise_mode"):
+        _ = from_yaml(broken)
+
+
+def test_config_rejects_invalid_synthetic_shard_round_robin_max_pairs(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload.setdefault("qc", {})["synthetic_shard_round_robin_max_pairs_per_population"] = 0
+
+    broken = tmp_path / "broken_synthetic_shard_round_robin_max_pairs.yaml"
+    with open(broken, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle)
+
+    with pytest.raises(ValueError, match="synthetic_shard_round_robin_max_pairs_per_population"):
+        _ = from_yaml(broken)
+
+
+def test_config_rejects_invalid_synthetic_shard_round_robin_min_cpus_per_match(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload.setdefault("qc", {})["synthetic_shard_round_robin_min_cpus_per_match"] = 0
+
+    broken = tmp_path / "broken_synthetic_shard_round_robin_min_cpus_per_match.yaml"
+    with open(broken, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle)
+
+    with pytest.raises(ValueError, match="synthetic_shard_round_robin_min_cpus_per_match"):
         _ = from_yaml(broken)
 
 
@@ -85,6 +141,9 @@ def test_config_rejects_invalid_synthetic_rr_min_cpus_per_match(tmp_path):
         "ld_decay_max_variants",
         "plink2_parity_max_variants",
         "plink2_parity_pca_components",
+        "plink_threads",
+        "plink2_parity_enabled",
+        "plink2_parity_max_pairs_per_population",
     ],
 )
 def test_config_rejects_removed_qc_keys(tmp_path, removed_key: str):
@@ -112,6 +171,35 @@ def test_config_rejects_invalid_ld_decay_backend(tmp_path):
         yaml.safe_dump(payload, handle)
 
     with pytest.raises(ValueError, match="ld_decay_backend"):
+        _ = from_yaml(broken)
+
+
+@pytest.mark.parametrize("backend", ["plink_counts", "plink_native_fst"])
+def test_config_rejects_removed_qc_backends(tmp_path, backend: str):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload.setdefault("qc", {})["backend"] = backend
+
+    broken = tmp_path / f"broken_backend_{backend}.yaml"
+    with open(broken, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle)
+
+    with pytest.raises(ValueError, match="qc.backend must be one of"):
+        _ = from_yaml(broken)
+
+
+def test_config_rejects_removed_plink_ld_decay_backend(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload.setdefault("qc", {})["ld_decay_backend"] = "plink"
+
+    broken = tmp_path / "broken_ld_decay_backend_plink.yaml"
+    with open(broken, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle)
+
+    with pytest.raises(ValueError, match="qc.ld_decay_backend must be one of"):
         _ = from_yaml(broken)
 
 
@@ -212,20 +300,20 @@ def test_config_accepts_hapstore_2d_chunking_keys(tmp_path):
     assert cfg.outputs.hapstore_chunk_sample_size == 7500
 
 
-def test_config_accepts_hapstore_merge_strategy_key(tmp_path):
-    cfg_path = write_test_config(tmp_path, name="hap_merge_strategy_ok")
+def test_config_rejects_removed_hapstore_merge_strategy_key(tmp_path):
+    cfg_path = write_test_config(tmp_path, name="hap_merge_strategy_removed")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
     payload.setdefault("outputs", {})["hapstore_merge_strategy"] = "legacy_materialize"
     with open(cfg_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
-    cfg = from_yaml(cfg_path)
-    assert cfg.outputs.hapstore_merge_strategy == "legacy_materialize"
+    with pytest.raises(ValueError, match="Invalid outputs config keys"):
+        _ = from_yaml(cfg_path)
 
 
 def test_config_accepts_hapstore_only_donor_input(tmp_path):
-    cfg_path = write_test_config(tmp_path, name="hapstore_only_input")
+    cfg_path = write_test_config(tmp_path, name="hapstore_only_donor_input")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
     payload["input"].pop("panel_vcf_pattern", None)
@@ -235,7 +323,7 @@ def test_config_accepts_hapstore_only_donor_input(tmp_path):
 
     cfg = from_yaml(cfg_path)
     assert cfg.input.panel_vcf_pattern is None
-    assert cfg.input.panel_hapstore_pattern is not None
+    assert cfg.input.panel_hapstore_pattern == str(tmp_path / "panel" / "chr{chrom}.hapstore.zarr")
 
 
 def test_config_rejects_missing_all_donor_panel_patterns(tmp_path):
@@ -284,39 +372,26 @@ def test_config_rejects_invalid_hapstore_2d_chunking_values(tmp_path, field_name
         _ = from_yaml(cfg_path)
 
 
-def test_config_rejects_invalid_hapstore_merge_strategy(tmp_path):
-    cfg_path = write_test_config(tmp_path, name="hap_merge_strategy_bad")
+@pytest.mark.parametrize(
+    "removed_key",
+    [
+        "pgen_source_preference",
+        "merge_backend",
+        "bcftools_path",
+        "bcftools_threads",
+        "bcftools_no_index",
+        "plink1_path",
+    ],
+)
+def test_config_rejects_removed_output_keys(tmp_path, removed_key: str):
+    cfg_path = write_test_config(tmp_path, name=f"{removed_key}_removed")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
-    payload.setdefault("outputs", {})["hapstore_merge_strategy"] = "invalid_strategy"
+    payload.setdefault("outputs", {})[removed_key] = "removed"
     with open(cfg_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
-    with pytest.raises(ValueError, match="hapstore_merge_strategy"):
-        _ = from_yaml(cfg_path)
-
-
-def test_config_accepts_pgen_source_preference(tmp_path):
-    cfg_path = write_test_config(tmp_path, name="pgen_source_preference_ok")
-    with open(cfg_path, "r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle)
-    payload.setdefault("outputs", {})["pgen_source_preference"] = "hapstore_direct"
-    with open(cfg_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
-
-    cfg = from_yaml(cfg_path)
-    assert cfg.outputs.pgen_source_preference == "hapstore_direct"
-
-
-def test_config_rejects_invalid_pgen_source_preference(tmp_path):
-    cfg_path = write_test_config(tmp_path, name="pgen_source_preference_bad")
-    with open(cfg_path, "r", encoding="utf-8") as handle:
-        payload = yaml.safe_load(handle)
-    payload.setdefault("outputs", {})["pgen_source_preference"] = "not_a_mode"
-    with open(cfg_path, "w", encoding="utf-8") as handle:
-        yaml.safe_dump(payload, handle, sort_keys=False)
-
-    with pytest.raises(ValueError, match="pgen_source_preference"):
+    with pytest.raises(ValueError, match=removed_key):
         _ = from_yaml(cfg_path)
 
 

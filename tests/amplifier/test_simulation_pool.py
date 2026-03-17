@@ -4,7 +4,7 @@ import logging
 
 import yaml
 
-from forgephast.amplifier.api import simulate_pool as simulate_pool_api
+from forgephast.amplifier.api import simulate as simulate_api
 from forgephast.amplifier.config import from_yaml
 from forgephast.amplifier.donors import build_manifest_from_config
 from forgephast.amplifier.merge import merge_chromosome
@@ -33,9 +33,6 @@ def test_simulate_pool_population_shard_outputs(tmp_path):
 
     for shard_id in range(2):
         shard_dir = cfg.run_root / "synthetic" / "chr21" / f"shard_{shard_id}_of_2"
-        assert (shard_dir / "P1.chr21.vcf.gz").exists()
-        assert (shard_dir / "P2.chr21.vcf.gz").exists()
-        assert (shard_dir / "P3.chr21.vcf.gz").exists()
         assert (shard_dir / "P1.chr21.hapstore.zarr").exists()
         assert (shard_dir / "P2.chr21.hapstore.zarr").exists()
         assert (shard_dir / "P3.chr21.hapstore.zarr").exists()
@@ -104,13 +101,12 @@ def test_simulate_pool_can_skip_vcf_outputs(tmp_path):
         assert (shard_dir / "P3.chr21.hapstore.zarr").exists()
 
     merge_result = merge_chromosome(cfg, chrom=21, n_shards=2)
-    assert merge_result.population_merged_vcfs == {}
     assert set(merge_result.population_merged_hapstores.keys()) == {"P1", "P2", "P3"}
     qc = run_qc(cfg, chrom=21, n_shards=2)
     assert qc.mode == "population_merged_hapstore"
 
 
-def test_simulate_pool_api_uses_yaml_pool_defaults(tmp_path):
+def test_simulate_api_uses_yaml_defaults(tmp_path):
     cfg_path = write_test_config(tmp_path, name="sim_pool_yaml_defaults")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
@@ -121,7 +117,7 @@ def test_simulate_pool_api_uses_yaml_pool_defaults(tmp_path):
     with open(cfg_path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
-    _ = simulate_pool_api(
+    _ = simulate_api(
         config_path=cfg_path,
         chrom=21,
         n_shards=None,

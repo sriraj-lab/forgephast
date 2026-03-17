@@ -8,9 +8,9 @@ from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
+from hapstore.ids import align_by_ids, read_sample_ids
 
 from ..config import CohortConfig, RunConfig
-from ..utils.ids import align_by_ids, read_sample_ids
 
 logger = logging.getLogger(__name__)
 
@@ -292,4 +292,3 @@ def build_roundtrip_report(
             "Round-trip validation failed:\n" + "\n".join(failures)
         )
     return report_path
-

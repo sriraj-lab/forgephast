@@ -8,11 +8,11 @@ import pytest
 import yaml
 
 from forgephast.amplifier.config import from_yaml
+from forgephast.amplifier.donor_panels import load_donor_haplotypes_from_source
 from forgephast.amplifier.donors import build_manifest_from_config
 from forgephast.amplifier.merge import merge_chromosome
 from forgephast.amplifier.qc import run_qc
-from forgephast.amplifier.simulation import simulate_chromosome, simulate_chromosome_population_shard_pool
-from forgephast.amplifier.vcfio import load_donor_haplotypes
+from forgephast.amplifier.simulation import simulate_chromosome_population_shard_pool
 
 from .conftest import write_test_config
 
@@ -77,12 +77,26 @@ def test_msprime_deterministic_output_fixed_seed(tmp_path):
     cfg_a_path = _write_msprime_config(tmp_path, name="msprime_det_a", admixed=True, n_shards=1)
     cfg_a = from_yaml(cfg_a_path)
     build_manifest_from_config(cfg_a)
-    res_a = simulate_chromosome(cfg_a, chrom=21, shard_id=0, n_shards=1)
+    res_a = simulate_chromosome_population_shard_pool(
+        cfg_a,
+        chrom=21,
+        n_shards=1,
+        task_workers=1,
+        threads_per_task=1,
+        task_start_method="fork",
+    )
 
     cfg_b_path = _write_msprime_config(tmp_path, name="msprime_det_b", admixed=True, n_shards=1)
     cfg_b = from_yaml(cfg_b_path)
     build_manifest_from_config(cfg_b)
-    res_b = simulate_chromosome(cfg_b, chrom=21, shard_id=0, n_shards=1)
+    res_b = simulate_chromosome_population_shard_pool(
+        cfg_b,
+        chrom=21,
+        n_shards=1,
+        task_workers=1,
+        threads_per_task=1,
+        task_start_method="fork",
+    )
 
     pop_a = next(item for item in res_a.population_outputs if item.population == "P3")
     pop_b = next(item for item in res_b.population_outputs if item.population == "P3")
@@ -100,17 +114,21 @@ def test_msprime_deterministic_output_fixed_seed(tmp_path):
     assert summary_a["observed_source_proportions"] == summary_b["observed_source_proportions"]
     assert summary_a["tract_count"] == summary_b["tract_count"]
 
-    haps_a = load_donor_haplotypes(
-        vcf_path=pop_a.vcf_path,
+    haps_a, _, _ = load_donor_haplotypes_from_source(
+        source_path=pop_a.vcf_path,
+        source_kind="vcf",
         chrom=21,
         donor_ids=pop_a.sample_ids,
-    ).donor_haps
-    haps_b = load_donor_haplotypes(
-        vcf_path=pop_b.vcf_path,
+        cache_dir=cfg_a.donor_cache_root,
+    )
+    haps_b, _, _ = load_donor_haplotypes_from_source(
+        source_path=pop_b.vcf_path,
+        source_kind="vcf",
         chrom=21,
         donor_ids=pop_b.sample_ids,
-    ).donor_haps
-    assert np.array_equal(haps_a, haps_b)
+        cache_dir=cfg_b.donor_cache_root,
+    )
+    assert np.array_equal(haps_a.donor_haps, haps_b.donor_haps)
 
 
 def test_msprime_mixed_simulate_pool_merge_qc_integration(tmp_path):
@@ -168,7 +186,14 @@ def test_single_source_msprime_remains_hard_gated(tmp_path):
     cfg_path = _write_msprime_config(tmp_path, name="msprime_single_source", admixed=False, n_shards=1)
     cfg = from_yaml(cfg_path)
     build_manifest_from_config(cfg)
-    simulate_chromosome(cfg, chrom=21, shard_id=0, n_shards=1)
+    simulate_chromosome_population_shard_pool(
+        cfg,
+        chrom=21,
+        n_shards=1,
+        task_workers=1,
+        threads_per_task=1,
+        task_start_method="fork",
+    )
     merge_chromosome(cfg, chrom=21, n_shards=1)
     qc = run_qc(cfg, chrom=21, n_shards=1)
 

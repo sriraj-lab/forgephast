@@ -10,6 +10,7 @@ import pytest
 
 from forgephast.phenotype.cli import _run_gwas
 from forgephast.phenotype.config import RunConfig
+from forgephast.phenotype.gwas import GwasResult
 
 
 def _payload(tmp_path: Path, task_workers: int) -> dict:
@@ -23,8 +24,21 @@ def _payload(tmp_path: Path, task_workers: int) -> dict:
     pairs.write_text("causal_id\tmaf_eur\tmaf_afr\nchr1:10\t0.02\t0.02\n", encoding="utf-8")
     return {
         "name": "gwas_parallel_unit",
-        "genotype_input": {"format": "pgen", "path_prefix": "/tmp/dummy"},
-        "cohorts": [{"name": "c1", "sample_ids_file": str(sample_ids)}],
+        "genotype_input": {
+            "format": "hapstore",
+            "hapstore": {
+                "root_dir": "/tmp/fake",
+                "layout": "per_pop_per_chr",
+                "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
+            },
+        },
+        "cohorts": [
+            {
+                "name": "c1",
+                "sample_ids_file": str(sample_ids),
+                "population_map_file": "/tmp/pop_map.tsv",
+            },
+        ],
         "architectures": [{"name": "a1", "params": {"sigma_beta": 1.0, "h2": 0.2}}],
         "causal_selection": {
             "source_pairs_file": str(pairs),
@@ -103,21 +117,35 @@ def _write_manifest(cfg: RunConfig) -> Path:
 class _SlowEngine:
     def __init__(self, engine_name: str):
         self.engine_name = engine_name
+        self.prepared = None
 
-    def run(self, task, run_dir):  # noqa: ANN001
+    def prepare_batch(self, tasks, batch_dir):  # noqa: ANN001
+        self.prepared = {
+            "n_tasks": len(tasks),
+            "batch_dir": str(batch_dir),
+            "engine": self.engine_name,
+        }
+        return self.prepared
+
+    def run(self, task, run_dir, prepared_state=None):  # noqa: ANN001
         delay = 0.03 if (self.engine_name == "plink2" and task.replicate == 1) else 0.0
         time.sleep(delay)
         run_dir.mkdir(parents=True, exist_ok=True)
         primary = run_dir / f"{self.engine_name}_rep{task.replicate}.txt"
         primary.write_text("ok\n", encoding="utf-8")
-        return {"output_dir": str(run_dir), "primary_output": str(primary)}
+        return GwasResult(
+            engine=self.engine_name,
+            output_dir=str(run_dir),
+            primary_output=str(primary),
+            metadata={"prepared_engine": str((prepared_state or {}).get("engine", ""))},
+        )
 
 
 class _FlakyEngine(_SlowEngine):
-    def run(self, task, run_dir):  # noqa: ANN001
+    def run(self, task, run_dir, prepared_state=None):  # noqa: ANN001
         if self.engine_name == "regenie" and task.replicate == 2:
             raise RuntimeError("intentional failure")
-        return super().run(task, run_dir)
+        return super().run(task, run_dir, prepared_state=prepared_state)
 
 
 def test_run_gwas_parallel_preserves_manifest_order(monkeypatch, tmp_path: Path) -> None:
@@ -137,6 +165,7 @@ def test_run_gwas_parallel_preserves_manifest_order(monkeypatch, tmp_path: Path)
         (2, "plink2"),
         (2, "regenie"),
     ]
+    assert set(out["prepared_engine"].tolist()) == {"plink2", "regenie"}
 
 
 def test_run_gwas_parallel_records_failures(monkeypatch, tmp_path: Path) -> None:

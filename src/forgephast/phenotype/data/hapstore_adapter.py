@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import HapStoreInputConfig
-from .global_pcs_svd import compute_global_pcs_svd
+from .global_pcs import compute_global_pcs_svd
 
 logger = logging.getLogger(__name__)
 

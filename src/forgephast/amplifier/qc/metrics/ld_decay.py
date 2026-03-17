@@ -1,15 +1,20 @@
-"""Local fallback LD/QC math used when utilities module is unavailable."""
+"""LD-decay math and QC helpers."""
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
 from ...config import RunConfig
+from ...donors import load_manifest
+from ...maps import load_genetic_map
+from ...utils import derived_seed, write_json
+from ..context import align_haplotype_axes_by_position
+from .fst import sample_variant_indices
 
 try:
     from numba import njit, prange, set_num_threads
@@ -351,33 +356,329 @@ def _empty_ld_curve() -> pd.DataFrame:
     )
 
 
-def compute_ld_decay_qc(
+def _haplotypes_to_genotypes(haplotypes: np.ndarray) -> np.ndarray:
+    h = np.asarray(haplotypes, dtype=np.float64)
+    if h.ndim != 2:
+        raise ValueError(f"haplotypes must be 2D, got shape={h.shape}")
+    if h.shape[0] % 2 != 0:
+        raise ValueError(f"haplotype row count must be even, got shape={h.shape}")
+    return h[0::2, :] + h[1::2, :]
+
+
+def compute_ld_decay_qc_impl(
     *,
     config: RunConfig,
     chrom: int,
     inputs: Any,
     groups: dict[str, list[str]],
-    donors_by_population: dict[str, list[str]],
     diagnostics_dir: Path,
-    numba_threads: int,
-    ext_data: Any | None,
-    ext_data_error: str | None,
-) -> dict[str, Any]:
-    """Run LD-decay QC via the canonical pipeline implementation.
+    numba_threads: int | None = None,
+    resolve_donor_panel_source_for_population_fn: Callable[[int, str], tuple[str, Path]],
+    resolve_map_path_for_population_fn: Callable[[int, str], Path],
+    load_sample_haplotypes_from_panel_fn: Callable[..., tuple[np.ndarray, np.ndarray]],
+    load_synthetic_population_haplotypes_fn: Callable[..., tuple[np.ndarray, np.ndarray]],
+) -> tuple[dict[str, Any], Path]:
+    from .ld_heatmap import ld_heatmap_binned_from_genotypes
+    from ..plots import save_ld_heatmap_pair_png
 
-    This is registered as a QC metric so `run_qc` can dispatch it consistently
-    alongside other metrics, while preserving the existing implementation and
-    its output contract.
-    """
-    del donors_by_population, ext_data, ext_data_error
-    from ..pipeline import _compute_ld_decay_qc
+    manifest = load_manifest(config)
+    donors_by_population = manifest.donors_by_population
+    pop_names = sorted(groups.keys())
+    if not pop_names:
+        payload = {
+            "enabled": True,
+            "chrom": int(chrom),
+            "status": "no_populations",
+            "gate_pass": None,
+            "population_summary": {},
+        }
+        out_path = diagnostics_dir / f"ld_decay_chr{chrom}.json"
+        write_json(out_path, payload)
+        return payload, out_path
 
-    payload, _ = _compute_ld_decay_qc(
-        config=config,
-        chrom=int(chrom),
-        inputs=inputs,
-        groups=groups,
-        diagnostics_dir=diagnostics_dir,
-        numba_threads=int(numba_threads),
-    )
-    return payload
+    table_rows: list[dict[str, Any]] = []
+    pop_summary: dict[str, dict[str, Any]] = {}
+    n_fail = 0
+    n_eval = 0
+    max_variant_ids_sampled = 0
+    ld_sample_size = int(config.qc.ext_max_diploids_per_population)
+    ld_max_variants = int(config.qc.ext_max_variants)
+
+    for pop in pop_names:
+        if pop not in donors_by_population:
+            pop_summary[pop] = {"status": "missing_donor_population", "pass": None}
+            continue
+
+        donor_ids_all = donors_by_population[pop]
+        synth_ids_all = groups[pop]
+        donor_n = min(len(donor_ids_all), int(ld_sample_size))
+        synth_n = min(len(synth_ids_all), int(ld_sample_size))
+        donor_ids = sorted(donor_ids_all) if len(donor_ids_all) <= donor_n else sorted(donor_ids_all)
+        synth_ids = sorted(synth_ids_all) if len(synth_ids_all) <= synth_n else sorted(synth_ids_all)
+        if len(donor_ids) > donor_n:
+            rng = np.random.default_rng(int(derived_seed(int(config.qc.seed), "ld_donor", pop, chrom)))
+            idx = np.sort(rng.choice(len(donor_ids), size=int(donor_n), replace=False))
+            donor_ids = [donor_ids[int(i)] for i in idx.tolist()]
+        if len(synth_ids) > synth_n:
+            rng = np.random.default_rng(int(derived_seed(int(config.qc.seed), "ld_synth", pop, chrom)))
+            idx = np.sort(rng.choice(len(synth_ids), size=int(synth_n), replace=False))
+            synth_ids = [synth_ids[int(i)] for i in idx.tolist()]
+
+        donor_source_kind, donor_source_path = resolve_donor_panel_source_for_population_fn(int(chrom), str(pop))
+        map_path = resolve_map_path_for_population_fn(int(chrom), str(pop))
+        map_bp, map_cm = load_genetic_map(map_path)
+
+        donor_pos, donor_haps = load_sample_haplotypes_from_panel_fn(
+            source_path=donor_source_path,
+            chrom=int(chrom),
+            sample_ids=donor_ids,
+            source_kind=donor_source_kind,
+        )
+        synth_pos, synth_haps = load_synthetic_population_haplotypes_fn(
+            inputs=inputs,
+            chrom=int(chrom),
+            pop=str(pop),
+            sample_ids=synth_ids,
+        )
+        aligned_pos, donor_haps_aligned, synth_haps_aligned = align_haplotype_axes_by_position(
+            donor_pos=donor_pos,
+            donor_haps=donor_haps,
+            synth_pos=synth_pos,
+            synth_haps=synth_haps,
+        )
+
+        variant_indices = sample_variant_indices(
+            n_variants=int(aligned_pos.shape[0]),
+            max_variants=int(ld_max_variants),
+            seed=int(derived_seed(int(config.qc.seed), "ld_variants", pop, chrom)),
+        )
+        if variant_indices is None:
+            sampled_pos = aligned_pos
+            donor_haps_sampled = donor_haps_aligned
+            synth_haps_sampled = synth_haps_aligned
+        else:
+            sampled_pos = aligned_pos[variant_indices]
+            donor_haps_sampled = donor_haps_aligned[:, variant_indices]
+            synth_haps_sampled = synth_haps_aligned[:, variant_indices]
+
+        max_variant_ids_sampled = max(max_variant_ids_sampled, int(sampled_pos.shape[0]))
+        donor_genotypes = _haplotypes_to_genotypes(donor_haps_sampled)
+        synth_genotypes = _haplotypes_to_genotypes(synth_haps_sampled)
+
+        max_pairs_per_bin = max(int(config.qc.ld_decay_min_pairs_per_bin) * 10, 2000)
+        donor_curve = ld_curve_from_genotypes(
+            genotypes=donor_genotypes,
+            variant_positions_bp=sampled_pos,
+            map_bp=map_bp,
+            map_cm=map_cm,
+            max_distance_cm=float(config.qc.ld_decay_max_distance_cm),
+            bin_width_cm=float(config.qc.ld_decay_bin_width_cm),
+            min_maf=float(config.qc.ld_decay_min_maf),
+            seed=int(derived_seed(int(config.qc.seed), "ld_curve", "donor", pop, chrom)),
+            max_pairs_per_bin=max_pairs_per_bin,
+            max_neighbors_per_anchor=128,
+            numba_threads=numba_threads,
+        )
+        synth_curve = ld_curve_from_genotypes(
+            genotypes=synth_genotypes,
+            variant_positions_bp=sampled_pos,
+            map_bp=map_bp,
+            map_cm=map_cm,
+            max_distance_cm=float(config.qc.ld_decay_max_distance_cm),
+            bin_width_cm=float(config.qc.ld_decay_bin_width_cm),
+            min_maf=float(config.qc.ld_decay_min_maf),
+            seed=int(derived_seed(int(config.qc.seed), "ld_curve", "synthetic", pop, chrom)),
+            max_pairs_per_bin=max_pairs_per_bin,
+            max_neighbors_per_anchor=128,
+            numba_threads=numba_threads,
+        )
+
+        for source, curve in (("donor", donor_curve), ("synthetic", synth_curve)):
+            if curve.empty:
+                continue
+            for row in curve.to_dict(orient="records"):
+                table_rows.append(
+                    {
+                        "population": pop,
+                        "source": source,
+                        "chrom": int(chrom),
+                        **row,
+                    }
+                )
+
+        metrics = ld_decay_metrics_from_curves(
+            donor_curve=donor_curve,
+            synthetic_curve=synth_curve,
+            min_pairs_per_bin=int(config.qc.ld_decay_min_pairs_per_bin),
+            half_decay_r2_threshold=float(config.qc.ld_decay_half_decay_r2_threshold),
+        )
+        pop_pass: bool | None = None
+        if str(metrics.get("status")) == "ok":
+            rmse_ok = float(metrics["rmse_median_r2"]) <= float(config.qc.ld_decay_rmse_max)
+            half_rel = float(metrics["half_decay_rel_diff"])
+            half_d = float(metrics["half_decay_cm_donor"])
+            half_s = float(metrics["half_decay_cm_synthetic"])
+            if np.isfinite(half_rel):
+                half_ok = half_rel <= float(config.qc.ld_decay_half_decay_rel_diff_max)
+            elif (not np.isfinite(half_d)) and (not np.isfinite(half_s)):
+                half_ok = True
+            else:
+                half_ok = False
+            pop_pass = bool(rmse_ok and half_ok)
+            n_eval += 1
+            if not pop_pass:
+                n_fail += 1
+
+        metrics_no_auc = {str(k): v for k, v in metrics.items() if not str(k).startswith("auc_")}
+        pop_summary[pop] = {
+            "status": str(metrics.get("status")),
+            "pass": pop_pass,
+            "n_donor_samples": int(len(donor_ids)),
+            "n_synthetic_samples": int(len(synth_ids)),
+            "n_variants_aligned": int(aligned_pos.shape[0]),
+            "n_variants_sampled": int(sampled_pos.shape[0]),
+            **metrics_no_auc,
+        }
+
+        if bool(config.qc.plots_enabled):
+            heatmap_plot: Path | None = None
+            try:
+                plot_dir = diagnostics_dir / str(config.qc.plots_dirname)
+                plot_dir.mkdir(parents=True, exist_ok=True)
+                heatmap_plot = plot_dir / f"ld_heatmap_{pop}_chr{chrom}.png"
+
+                n_bins = int(config.qc.ld_heatmap_n_position_bins)
+                max_vars = min(int(ld_max_variants), int(config.qc.ext_max_variants))
+                max_vars = max(2, int(max_vars))
+                stride = (int(aligned_pos.shape[0]) + max_vars - 1) // max_vars
+                stride = max(1, int(stride))
+                thin_idx = np.arange(0, int(aligned_pos.shape[0]), int(stride), dtype=np.int64)
+
+                pos_thin = aligned_pos[thin_idx]
+                donor_haps_thin = donor_haps_aligned[:, thin_idx]
+                synth_haps_thin = synth_haps_aligned[:, thin_idx]
+                donor_g_thin = _haplotypes_to_genotypes(donor_haps_thin)
+                synth_g_thin = _haplotypes_to_genotypes(synth_haps_thin)
+
+                edges_cm = np.linspace(
+                    float(np.min(map_cm)),
+                    float(np.max(map_cm)),
+                    n_bins + 1,
+                    dtype=np.float64,
+                )
+
+                donor_mean, _, donor_meta = ld_heatmap_binned_from_genotypes(
+                    genotypes=donor_g_thin,
+                    variant_positions_bp=pos_thin,
+                    map_bp=map_bp,
+                    map_cm=map_cm,
+                    n_position_bins=n_bins,
+                    max_variants=int(pos_thin.shape[0]),
+                    min_maf=float(config.qc.ld_decay_min_maf),
+                    max_distance_cm=float(config.qc.ld_decay_max_distance_cm),
+                    max_pairs_total=300000,
+                    max_neighbors_per_anchor=256,
+                    seed=int(derived_seed(int(config.qc.seed), "ld_heatmap_donor", pop, chrom)),
+                    bin_edges_cm=edges_cm,
+                )
+                synth_mean, _, synth_meta = ld_heatmap_binned_from_genotypes(
+                    genotypes=synth_g_thin,
+                    variant_positions_bp=pos_thin,
+                    map_bp=map_bp,
+                    map_cm=map_cm,
+                    n_position_bins=n_bins,
+                    max_variants=int(pos_thin.shape[0]),
+                    min_maf=float(config.qc.ld_decay_min_maf),
+                    max_distance_cm=float(config.qc.ld_decay_max_distance_cm),
+                    max_pairs_total=300000,
+                    max_neighbors_per_anchor=256,
+                    seed=int(derived_seed(int(config.qc.seed), "ld_heatmap_synth", pop, chrom)),
+                    bin_edges_cm=edges_cm,
+                )
+
+                save_ld_heatmap_pair_png(
+                    heatmap_plot,
+                    donor_mean_r2=donor_mean,
+                    synthetic_mean_r2=synth_mean,
+                    edges_cm=edges_cm,
+                    title=f"LD heatmap chr{chrom} {pop} (mean r²)",
+                )
+                pop_summary[pop]["heatmap"] = {
+                    "status": "ok",
+                    "plot_path": str(heatmap_plot),
+                    "donor_meta": donor_meta,
+                    "synthetic_meta": synth_meta,
+                }
+            except Exception as exc:
+                pop_summary[pop]["heatmap"] = {
+                    "status": "error",
+                    "error": str(exc),
+                    "plot_path": str(heatmap_plot) if heatmap_plot is not None else None,
+                }
+
+    table_path = diagnostics_dir / f"ld_decay_chr{chrom}.tsv"
+    table_df = pd.DataFrame.from_records(table_rows)
+    if table_df.empty:
+        table_df = pd.DataFrame(
+            columns=[
+                "population",
+                "source",
+                "chrom",
+                "bin_idx",
+                "bin_start_cm",
+                "bin_end_cm",
+                "bin_mid_cm",
+                "n_pairs",
+                "mean_r2",
+                "median_r2",
+            ]
+        )
+    table_df.to_csv(table_path, sep="\t", index=False)
+
+    if n_eval == 0:
+        gate_pass = None
+        status = "no_evaluable_populations"
+    else:
+        gate_pass = bool(n_fail == 0)
+        status = "ok"
+
+    payload = {
+        "enabled": True,
+        "chrom": int(chrom),
+        "status": status,
+        "gate_pass": gate_pass,
+        "n_populations_total": int(len(pop_names)),
+        "n_populations_evaluable": int(n_eval),
+        "n_populations_failed": int(n_fail),
+        "variant_sampling": {
+            "source": "python_matrix",
+            "n_variant_ids": int(max_variant_ids_sampled),
+            "max_variants": int(ld_max_variants),
+            "min_maf": float(config.qc.ld_decay_min_maf),
+            "max_distance_cm": float(config.qc.ld_decay_max_distance_cm),
+            "bin_width_cm": float(config.qc.ld_decay_bin_width_cm),
+            "min_pairs_per_bin": int(config.qc.ld_decay_min_pairs_per_bin),
+            "seed": int(config.qc.seed),
+        },
+        "heatmap": {
+            "enabled": bool(config.qc.plots_enabled),
+            "n_position_bins": int(config.qc.ld_heatmap_n_position_bins),
+            "max_variants": int(config.qc.ext_max_variants),
+            "min_maf": float(config.qc.ld_decay_min_maf),
+            "max_distance_cm": float(config.qc.ld_decay_max_distance_cm),
+            "max_pairs_total": 300000,
+            "max_neighbors_per_anchor": 256,
+            "seed_base": int(config.qc.seed),
+        },
+        "thresholds": {
+            "rmse_max": float(config.qc.ld_decay_rmse_max),
+            "half_decay_rel_diff_max": float(config.qc.ld_decay_half_decay_rel_diff_max),
+            "half_decay_r2_threshold": float(config.qc.ld_decay_half_decay_r2_threshold),
+        },
+        "table_path": str(table_path),
+        "population_summary": pop_summary,
+    }
+
+    out_path = diagnostics_dir / f"ld_decay_chr{chrom}.json"
+    write_json(out_path, payload)
+    return payload, out_path

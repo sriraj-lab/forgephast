@@ -8,9 +8,13 @@ from types import SimpleNamespace
 import pandas as pd
 
 from forgephast.phenotype.config import Plink2EngineConfig, RegenieEngineConfig
-from forgephast.phenotype.gwas.base import GwasTask, merge_covariates_for_gwas
-from forgephast.phenotype.gwas.plink2 import Plink2Engine
-from forgephast.phenotype.gwas.regenie import RegenieEngine
+from forgephast.phenotype.gwas import (
+    GwasResult,
+    GwasTask,
+    Plink2Engine,
+    RegenieEngine,
+    merge_covariates_for_gwas,
+)
 
 
 def _make_task(tmp_path: Path) -> GwasTask:
@@ -60,8 +64,8 @@ def test_plink2_engine_outputs(monkeypatch, tmp_path: Path) -> None:
 
     engine = Plink2Engine(Plink2EngineConfig(path="plink2", threads=1))
     result = engine.run(task, tmp_path / "run")
-    assert result["engine"] == "plink2"
-    assert Path(result["primary_output"]).exists()
+    assert result.engine == "plink2"
+    assert Path(result.primary_output).exists()
     assert "--chr" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--chr") + 1] == "1,3"
 
@@ -88,8 +92,8 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
 
     engine = RegenieEngine(RegenieEngineConfig(path="regenie", threads=1))
     result = engine.run(task, tmp_path / "run")
-    assert result["engine"] == "regenie"
-    assert Path(result["primary_output"]).exists()
+    assert result.engine == "regenie"
+    assert Path(result.primary_output).exists()
     assert calls["n"] == 2
     assert all("--chrList" in cmd for cmd in commands)
     assert all(cmd[cmd.index("--chrList") + 1] == "1,3" for cmd in commands)

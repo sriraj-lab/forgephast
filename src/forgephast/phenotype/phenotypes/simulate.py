@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
+from hapstore.ids import align_by_ids, read_sample_ids
 
 from ..architectures.base import ArchitectureInput, create_plugin
 from ..causal.hybrid_sampler import sample_membership_for_replicate
@@ -22,7 +23,6 @@ from ..data.genotypes import (
 )
 from ..effects.betas import build_variant_scale_by_maf, sample_population_specific_betas
 from ..local_ancestry.tracts import load_tracts_tsv_gz, rasterize_tracts_to_variant_ancestry
-from ..utils.ids import align_by_ids, read_sample_ids
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +252,6 @@ def _build_global_pcs(
 
 def run_simulation(
     run_cfg: RunConfig,
-    pgen_prefix: str | None,
     run_dir: Path,
     adapter: GenotypeAdapter | None = None,
     runtime_cache: dict[str, Any] | None = None,
@@ -282,10 +281,6 @@ def run_simulation(
     if adapter is None:
         t0 = time.perf_counter()
         adapter = build_genotype_adapter(
-            genotype_format=run_cfg.genotype_input.format,
-            pgen_prefix=pgen_prefix,
-            plink2_path=run_cfg.genotype_input.plink2_path,
-            pgen_dosage_backend=run_cfg.genotype_input.pgen_dosage_backend,
             hapstore_cfg=run_cfg.genotype_input.hapstore,
         )
         adapter.validate_files()
@@ -573,12 +568,9 @@ def run_simulation(
                 n_samples=int(len(sample_ids)),
             )
 
-            # In HapStore + plink2_pca mode, PCs are refreshed from exported PGEN in
+            # In plink2_pca mode, PCs are refreshed from exported PGEN in
             # the GWAS prep stage; avoid expensive in-simulation SVD here.
-            if (
-                run_cfg.genotype_input.format == "hapstore"
-                and run_cfg.gwas.global_pcs.canonical_mode() == "plink2_pca"
-            ):
+            if run_cfg.gwas.global_pcs.canonical_mode() == "plink2_pca":
                 pcs_df = dosage_df[["FID", "IID"]].copy()
             else:
                 pcs_df = _build_global_pcs(
@@ -812,7 +804,7 @@ def run_simulation(
                         "cohort": cohort.name,
                         "architecture": architecture.name,
                         "plugin": architecture.plugin,
-                        "pgen_prefix": cohort.genotype_prefix_override or (pgen_prefix or ""),
+                        "pgen_prefix": cohort.genotype_prefix_override or "",
                         "sample_ids_file": cohort.sample_ids_file,
                         "phenotype_df": phenotype_df,
                         "covariate_df": cov_out.covariate_table,

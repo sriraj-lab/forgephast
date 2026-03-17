@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,16 +40,14 @@ class ArchitecturePlugin(ABC):
         """Compute per-sample genetic component and return detailed per-variant effect table."""
 
 
-PLUGIN_REGISTRY: Dict[str, type[ArchitecturePlugin]] = {}
-
-
-def register_plugin(key: str, plugin_cls: type[ArchitecturePlugin]) -> None:
-    """Register architecture plugin class."""
-    PLUGIN_REGISTRY[key] = plugin_cls
-
-
 def create_plugin(key: str) -> ArchitecturePlugin:
-    """Instantiate plugin by key."""
-    if key not in PLUGIN_REGISTRY:
-        raise ValueError(f"Unknown architecture plugin: {key}")
-    return PLUGIN_REGISTRY[key]()
+    """Instantiate architecture plugin by key."""
+    from .polygenic_no_pleiotropy import PolygenicNoPleiotropyPlugin
+
+    _KNOWN = {
+        "polygenic_no_pleiotropy": PolygenicNoPleiotropyPlugin,
+        "polygenic_local_ancestry_no_pleiotropy": PolygenicNoPleiotropyPlugin,
+    }
+    if key not in _KNOWN:
+        raise ValueError(f"Unknown architecture plugin: {key!r}")
+    return _KNOWN[key]()

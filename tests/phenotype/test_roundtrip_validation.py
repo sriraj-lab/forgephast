@@ -24,9 +24,12 @@ def _base_payload(tmp_path: Path) -> dict:
     return {
         "name": "rt_unit",
         "genotype_input": {
-            "format": "pgen",
-            "path_prefix": "/tmp/fake",
-            "conversion_enabled": False,
+            "format": "hapstore",
+            "hapstore": {
+                "root_dir": "/tmp/fake",
+                "layout": "per_pop_per_chr",
+                "file_pattern": "{population}/chr{chrom}.hapstore.zarr",
+            },
         },
         "cohorts": [
             {
