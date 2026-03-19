@@ -221,15 +221,35 @@ def simulate_haplotypes(
     n_haps: int,
     seed: int,
     threads: int,
+    donor_hap_sampling_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     n_donor_haps = donor_haps.shape[0]
     n_markers = donor_haps.shape[1]
+    donor_choice_probs = None
+    if donor_hap_sampling_weights is not None:
+        donor_choice_probs = np.asarray(donor_hap_sampling_weights, dtype=np.float64)
+        if donor_choice_probs.shape != (n_donor_haps,):
+            raise ValueError(
+                "donor_hap_sampling_weights must have one value per donor haplotype; "
+                f"got {donor_choice_probs.shape} expected ({n_donor_haps},)"
+            )
+        if np.any(donor_choice_probs < 0.0):
+            raise ValueError("donor_hap_sampling_weights must be non-negative")
+        total_weight = float(donor_choice_probs.sum())
+        if total_weight <= 0.0:
+            raise ValueError("donor_hap_sampling_weights must sum to a positive value")
+        donor_choice_probs = donor_choice_probs / total_weight
 
-    init_donors = rng.integers(0, n_donor_haps, size=n_haps, dtype=np.int32)
+    init_donors = rng.choice(n_donor_haps, size=n_haps, replace=True, p=donor_choice_probs).astype(np.int32)
     if n_markers > 1:
         u = rng.random((n_haps, n_markers - 1), dtype=np.float32)
-        replacement = rng.integers(0, n_donor_haps, size=(n_haps, n_markers - 1), dtype=np.int32)
+        replacement = rng.choice(
+            n_donor_haps,
+            size=(n_haps, n_markers - 1),
+            replace=True,
+            p=donor_choice_probs,
+        ).astype(np.int32)
     else:
         u = np.zeros((n_haps, 0), dtype=np.float32)
         replacement = np.zeros((n_haps, 0), dtype=np.int32)
@@ -393,7 +413,7 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
         hapstore_chunk_variant_size,
         hapstore_chunk_haplotype_size,
         hapstore_chunk_sample_size,
-        hapstore_compression_level,
+        shard_hapstore_compression_level,
         hapstore_store_genotypes,
         write_pgen,
         hapstore_vcf_plink2_location,
@@ -423,6 +443,7 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
                 n_haps=2 * pop_n,
                 seed=seed,
                 threads=_TASK_THREADS_PER_TASK,
+                donor_hap_sampling_weights=panel.donor_hap_sampling_weights,
             )
             timings["simulate_haplotypes_sec"] = perf_counter() - t_sim
 
@@ -448,7 +469,7 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
                         None if hapstore_chunk_haplotype_size is None else int(hapstore_chunk_haplotype_size)
                     ),
                     chunk_sample_size=(None if hapstore_chunk_sample_size is None else int(hapstore_chunk_sample_size)),
-                    compression_level=int(hapstore_compression_level),
+                    compression_level=int(shard_hapstore_compression_level),
                     attrs={"source": "population_amplifier"},
                 )
                 timings["write_pop_hapstore_sec"] = perf_counter() - t_hapstore
@@ -845,9 +866,11 @@ def _simulate_chromosome_shard(
                     population=str(source_name),
                 )
                 source_donors = manifest.donors_by_population[source_name]
+                source_weights = manifest.donor_weights_by_population.get(source_name, {})
                 source_panels[source_name] = subset_panel_donors(
                     panel_union_cache[(source_kind, source_path)],
                     source_donors,
+                    donor_weights=[float(source_weights.get(sid, 0.0)) for sid in source_donors],
                 )
                 msprime_panel_cache[source_name] = source_panels[source_name]
             elapsed_source = perf_counter() - t_source
@@ -956,6 +979,10 @@ def _simulate_chromosome_shard(
             panel = subset_panel_donors(
                 panel_union_cache[(item.panel_source_kind, item.panel_source_path)],
                 item.donors,
+                donor_weights=[
+                    float(manifest.donor_weights_by_population.get(item.pop_name, {}).get(sid, 0.0))
+                    for sid in item.donors
+                ],
             )
             elapsed_subset = perf_counter() - t_subset
             pop_stage["load_donor_haps_sec"] = elapsed_subset
@@ -993,6 +1020,7 @@ def _simulate_chromosome_shard(
                 n_haps=2 * item.pop_n,
                 seed=item.seed,
                 threads=threads,
+                donor_hap_sampling_weights=panel.donor_hap_sampling_weights,
             )
             elapsed_simulate = perf_counter() - t_simulate
             pop_stage["simulate_haplotypes_sec"] = elapsed_simulate
@@ -1034,7 +1062,11 @@ def _simulate_chromosome_shard(
                     if config.outputs.hapstore_chunk_sample_size is None
                     else int(config.outputs.hapstore_chunk_sample_size)
                 ),
-                compression_level=int(config.outputs.hapstore_compression_level),
+                compression_level=int(
+                    config.outputs.shard_hapstore_compression_level
+                    if config.outputs.shard_hapstore_compression_level is not None
+                    else config.outputs.hapstore_compression_level
+                ),
                 attrs={"source": "population_amplifier"},
             )
             elapsed_pop_hapstore = perf_counter() - t_pop_hapstore
@@ -1160,7 +1192,11 @@ def _simulate_chromosome_shard(
                     if config.outputs.hapstore_chunk_sample_size is None
                     else int(config.outputs.hapstore_chunk_sample_size)
                 ),
-                compression_level=int(config.outputs.hapstore_compression_level),
+                compression_level=int(
+                    config.outputs.shard_hapstore_compression_level
+                    if config.outputs.shard_hapstore_compression_level is not None
+                    else config.outputs.hapstore_compression_level
+                ),
                 attrs={"source": "population_amplifier"},
             )
             _add_timing("write_combined_hapstore_sec", perf_counter() - t_write_combined_hapstore)
@@ -1400,9 +1436,11 @@ def simulate_chromosome_population_shard_pool(
                 exemplars_by_pop[pop.name] = exemplar
 
         def _prepare_pop(pop_name: str, exemplar: _PopulationWorkItem) -> tuple[str, Any, np.ndarray]:
+            donor_weights = manifest.donor_weights_by_population.get(pop_name, {})
             panel = subset_panel_donors(
                 panel_union_cache[(exemplar.panel_source_kind, exemplar.panel_source_path)],
                 exemplar.donors,
+                donor_weights=[float(donor_weights.get(sid, 0.0)) for sid in exemplar.donors],
             )
             map_bp, map_cm = load_genetic_map(exemplar.map_path)
             switch_probs = switch_probs_from_positions(
@@ -1465,7 +1503,11 @@ def simulate_chromosome_population_shard_pool(
                     config.outputs.hapstore_chunk_variant_size,
                     config.outputs.hapstore_chunk_haplotype_size,
                     config.outputs.hapstore_chunk_sample_size,
-                    config.outputs.hapstore_compression_level,
+                    (
+                        config.outputs.shard_hapstore_compression_level
+                        if config.outputs.shard_hapstore_compression_level is not None
+                        else config.outputs.hapstore_compression_level
+                    ),
                     config.outputs.hapstore_store_genotypes,
                     config.outputs.write_pgen,
                     config.outputs.hapstore_vcf_plink2_location,
@@ -1649,7 +1691,11 @@ def simulate_chromosome_population_shard_pool(
                         if config.outputs.hapstore_chunk_sample_size is None
                         else int(config.outputs.hapstore_chunk_sample_size)
                     ),
-                    compression_level=int(config.outputs.hapstore_compression_level),
+                    compression_level=int(
+                        config.outputs.shard_hapstore_compression_level
+                        if config.outputs.shard_hapstore_compression_level is not None
+                        else config.outputs.hapstore_compression_level
+                    ),
                     store_genotypes=bool(config.outputs.hapstore_store_genotypes),
                     attrs={"source": "population_amplifier"},
                     n_workers=hapstore_concat_workers,

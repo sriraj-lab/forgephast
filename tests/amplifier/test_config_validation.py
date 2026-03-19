@@ -472,6 +472,19 @@ def test_config_rejects_mosaic_population_without_selector(tmp_path):
         _ = from_yaml(cfg_path)
 
 
+def test_config_rejects_selector_weights_that_do_not_sum_to_one(tmp_path):
+    cfg_path = write_test_config(tmp_path, name="selector_weights_bad_sum")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["populations"][0]["selector_weights"] = {"POP_A": 0.7, "POP_B": 0.1}
+    payload["populations"][0]["selector"] = {"values": ["POP_A", "POP_B"]}
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    with pytest.raises(ValueError, match="selector_weights must sum to 1.0"):
+        _ = from_yaml(cfg_path)
+
+
 def test_config_rejects_msprime_population_without_msprime_block(tmp_path):
     cfg_path = write_test_config(tmp_path, name="msprime_missing_block")
     with open(cfg_path, "r", encoding="utf-8") as handle:

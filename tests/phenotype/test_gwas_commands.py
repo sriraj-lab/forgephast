@@ -134,3 +134,81 @@ def test_merge_covariates_for_gwas_falls_back_to_iid_when_fid_differs(tmp_path: 
     assert covars == ["age", "PC1"]
     assert out_df["FID"].tolist() == [0, 0] or out_df["FID"].tolist() == ["0", "0"]
     assert out_df.shape[0] == 2
+
+
+def test_merge_covariates_for_gwas_allows_ids_only(tmp_path: Path) -> None:
+    cov_path = tmp_path / "cov.tsv"
+    pcs_path = tmp_path / "pcs.tsv"
+    out_path = tmp_path / "merged.tsv"
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
+        cov_path, sep="\t", index=False
+    )
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
+        pcs_path, sep="\t", index=False
+    )
+
+    covars = merge_covariates_for_gwas(str(cov_path), str(pcs_path), out_path)
+    out_df = pd.read_csv(out_path, sep="\t")
+
+    assert covars == []
+    assert list(out_df.columns) == ["FID", "IID"]
+
+
+def test_plink2_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
+        task.covariates_file, sep="\t", index=False
+    )
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
+        task.global_pcs_file, sep="\t", index=False
+    )
+    captured = {}
+
+    def fake_run(cmd, capture_output, text):
+        captured["cmd"] = list(cmd)
+        out_idx = cmd.index("--out") + 1
+        out_prefix = Path(cmd[out_idx])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        (out_prefix.parent / "assoc.PHENO1.glm.linear").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    engine = Plink2Engine(Plink2EngineConfig(path="plink2", threads=1))
+    result = engine.run(task, tmp_path / "run")
+
+    assert result.engine == "plink2"
+    assert "--covar" not in captured["cmd"]
+    assert "--covar-name" not in captured["cmd"]
+
+
+def test_regenie_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
+        task.covariates_file, sep="\t", index=False
+    )
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
+        task.global_pcs_file, sep="\t", index=False
+    )
+
+    commands = []
+
+    def fake_run(cmd, capture_output, text):
+        commands.append(list(cmd))
+        out_idx = cmd.index("--out") + 1
+        out_prefix = Path(cmd[out_idx])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
+            Path(f"{out_prefix}_pred.list").write_text("pred\n")
+        else:
+            Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    engine = RegenieEngine(RegenieEngineConfig(path="regenie", threads=1))
+    result = engine.run(task, tmp_path / "run")
+
+    assert result.engine == "regenie"
+    assert all("--covarFile" not in cmd for cmd in commands)
+    assert all("--covarColList" not in cmd for cmd in commands)

@@ -20,6 +20,7 @@ class PanelChromData:
     variants: VariantTable
     donor_haps: np.ndarray  # shape: (2 * n_donors, n_variants)
     donor_ids: list[str]
+    donor_hap_sampling_weights: np.ndarray | None = None
 
 
 def load_donor_haplotypes_hapstore(
@@ -90,7 +91,12 @@ def load_donor_haplotypes_hapstore(
         ref=ref_kept,
         alt=alt_kept,
     )
-    return PanelChromData(variants=variants, donor_haps=donor_haps_kept, donor_ids=donor_ids)
+    return PanelChromData(
+        variants=variants,
+        donor_haps=donor_haps_kept,
+        donor_ids=donor_ids,
+        donor_hap_sampling_weights=None,
+    )
 
 
 def donor_panel_cache_path(
@@ -252,7 +258,11 @@ def load_donor_haplotypes_from_source(
     return panel, hapstore_path, cache_hit
 
 
-def subset_panel_donors(panel: PanelChromData, donor_ids: list[str]) -> PanelChromData:
+def subset_panel_donors(
+    panel: PanelChromData,
+    donor_ids: list[str],
+    donor_weights: list[float] | None = None,
+) -> PanelChromData:
     donor_ids = list(donor_ids)
     index_by_donor = {sid: i for i, sid in enumerate(panel.donor_ids)}
     missing = [sid for sid in donor_ids if sid not in index_by_donor]
@@ -267,8 +277,25 @@ def subset_panel_donors(panel: PanelChromData, donor_ids: list[str]) -> PanelChr
         row_idx[2 * i] = 2 * donor_idx
         row_idx[2 * i + 1] = 2 * donor_idx + 1
 
+    hap_weights = None
+    if donor_weights is not None:
+        if len(donor_weights) != len(donor_ids):
+            raise ValueError(
+                "donor_weights length must match donor_ids length; "
+                f"got {len(donor_weights)} vs {len(donor_ids)}"
+            )
+        donor_weight_arr = np.asarray(donor_weights, dtype=np.float64)
+        if np.any(donor_weight_arr < 0.0):
+            raise ValueError("donor_weights must be non-negative")
+        total_weight = float(donor_weight_arr.sum())
+        if total_weight <= 0.0:
+            raise ValueError("donor_weights must sum to a positive value")
+        donor_weight_arr = donor_weight_arr / total_weight
+        hap_weights = np.repeat(donor_weight_arr / 2.0, 2)
+
     return PanelChromData(
         variants=panel.variants,
         donor_haps=panel.donor_haps[row_idx, :],
         donor_ids=donor_ids,
+        donor_hap_sampling_weights=hap_weights,
     )

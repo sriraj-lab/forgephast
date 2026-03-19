@@ -142,6 +142,7 @@ class PopulationSpec:
     name: str
     n_diploids: int
     selector: Any | None = None
+    selector_weights: dict[str, float] | None = None
     engine: str = "mosaic"
     msprime: MsprimePopulationConfig | None = None
 
@@ -157,9 +158,31 @@ class PopulationSpec:
         if self.engine == "mosaic":
             if self.selector is None:
                 raise ValueError(f"population {self.name}: selector is required for engine='mosaic'")
+            if self.selector_weights is not None:
+                if not self.selector_weights:
+                    raise ValueError(f"population {self.name}: selector_weights cannot be empty when provided")
+                total_weight = 0.0
+                for label, weight in self.selector_weights.items():
+                    if not str(label).strip():
+                        raise ValueError(
+                            f"population {self.name}: selector_weights keys cannot be empty"
+                        )
+                    if float(weight) <= 0.0:
+                        raise ValueError(
+                            f"population {self.name}: selector_weights values must be > 0"
+                        )
+                    total_weight += float(weight)
+                if abs(total_weight - 1.0) > 1e-6:
+                    raise ValueError(
+                        f"population {self.name}: selector_weights must sum to 1.0 (got {total_weight})"
+                    )
             if self.msprime is not None:
                 raise ValueError(f"population {self.name}: msprime config is only allowed for engine='msprime_tracts'")
         else:
+            if self.selector_weights is not None:
+                raise ValueError(
+                    f"population {self.name}: selector_weights is only allowed for engine='mosaic'"
+                )
             if self.msprime is None:
                 raise ValueError(f"population {self.name}: msprime config is required for engine='msprime_tracts'")
             self.msprime.validate(population_name=self.name)
@@ -208,9 +231,11 @@ class OutputConfig:
     hapstore_chunk_haplotype_size: int | None = None
     hapstore_chunk_sample_size: int | None = None
     hapstore_compression_level: int = 9
+    shard_hapstore_compression_level: int | None = None
     hapstore_store_genotypes: bool = False
     write_combined_shard_output: bool = True
     merge_combined_populations: bool = True
+    cleanup_shard_hapstores_after_merge: bool = False
     plink2_path: str = "plink2"
     hapstore_vcf_plink2_location: str | None = "system"
     hapstore_vcf_keep_intermediate_pgen: bool = False
@@ -228,6 +253,11 @@ class OutputConfig:
         if self.hapstore_chunk_sample_size is not None:
             _check_positive(self.hapstore_chunk_sample_size, "outputs.hapstore_chunk_sample_size")
         _check_non_negative(self.hapstore_compression_level, "outputs.hapstore_compression_level")
+        if self.shard_hapstore_compression_level is not None:
+            _check_non_negative(
+                self.shard_hapstore_compression_level,
+                "outputs.shard_hapstore_compression_level",
+            )
         if self.hapstore_vcf_plink2_location is not None and not str(self.hapstore_vcf_plink2_location).strip():
             raise ValueError("outputs.hapstore_vcf_plink2_location cannot be empty when provided")
         _check_positive(self.hapstore_vcf_n_shards, "outputs.hapstore_vcf_n_shards")

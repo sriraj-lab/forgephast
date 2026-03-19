@@ -50,14 +50,18 @@ class Plink2Engine(GwasEngine):
         ]
         if task.chromosomes:
             cmd.extend(["--chr", ",".join(str(chrom) for chrom in task.chromosomes)])
+        cmd.extend(["--glm", "hide-covar"])
+        if covar_cols:
+            cmd.extend(
+                [
+                    "--covar",
+                    str(covar_path),
+                    "--covar-name",
+                    ",".join(covar_cols),
+                ]
+            )
         cmd.extend(
             [
-                "--glm",
-                "hide-covar",
-                "--covar",
-                str(covar_path),
-                "--covar-name",
-                ",".join(covar_cols),
                 "--threads",
                 str(self.cfg.threads),
                 "--out",
@@ -117,12 +121,17 @@ class RegenieEngine(GwasEngine):
             task.phenotype_file,
             "--phenoCol",
             "PHENO",
-            "--covarFile",
-            str(covar_path),
-            "--covarColList",
-            covar_col_list,
             "--qt",
         ]
+        if covar_cols:
+            cmd1.extend(
+                [
+                    "--covarFile",
+                    str(covar_path),
+                    "--covarColList",
+                    covar_col_list,
+                ]
+            )
         if chr_list:
             cmd1.extend(["--chrList", chr_list])
         cmd1.extend(
@@ -155,14 +164,19 @@ class RegenieEngine(GwasEngine):
             task.phenotype_file,
             "--phenoCol",
             "PHENO",
-            "--covarFile",
-            str(covar_path),
-            "--covarColList",
-            covar_col_list,
             "--pred",
             str(pred_list),
             "--qt",
         ]
+        if covar_cols:
+            cmd2.extend(
+                [
+                    "--covarFile",
+                    str(covar_path),
+                    "--covarColList",
+                    covar_col_list,
+                ]
+            )
         if chr_list:
             cmd2.extend(["--chrList", chr_list])
         cmd2.extend(

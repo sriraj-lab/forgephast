@@ -96,6 +96,25 @@ def test_valid_config_builds() -> None:
     assert cfg.name == "unit_test"
 
 
+def test_effect_model_accepts_metapopulation_jitter_placeholder() -> None:
+    payload = _base_payload()
+    payload["effect_model"]["metapopulation_jitter"] = [
+        {
+            "coarse_label": "AFR",
+            "subpopulation_column": "source_population",
+            "subpopulations": ["AFR_WEST", "AFR_GULF", "AFR_EAST"],
+            "within_label_subpopulation_deviation_variance": 0.0,
+            "subpopulation_corr_matrix": [
+                [1.0, 0.95, 0.80],
+                [0.95, 1.0, 0.90],
+                [0.80, 0.90, 1.0],
+            ],
+        }
+    ]
+    cfg = RunConfig.from_dict(payload)
+    assert cfg.effect_model.metapopulation_jitter[0].coarse_label == "AFR"
+
+
 def test_requires_cohort() -> None:
     payload = _base_payload()
     payload["cohorts"] = []

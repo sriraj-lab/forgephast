@@ -31,6 +31,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _cleanup_hapstore_dirs(paths: Sequence[Path], *, chrom: int, pop: str) -> None:
+    removed = 0
+    for path in paths:
+        if not path.exists():
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    logger.info(
+        "merge shard cleanup chrom=%s pop=%s removed_hapstores=%s",
+        chrom,
+        pop,
+        removed,
+    )
+
+
 def _merge_chromosomes_sample_axis_flat(
     input_stores: Sequence[str | Path],
     output_store: str | Path,
@@ -326,6 +341,12 @@ def merge_chromosome(
                     batch_size=int(config.outputs.hapstore_merge_batch_size),
                 )
                 elapsed_hapstore = perf_counter() - t_pop_hapstore
+                if bool(config.outputs.cleanup_shard_hapstores_after_merge):
+                    _cleanup_hapstore_dirs(
+                        list(shard_hapstores_by_population.get(pop, [])),
+                        chrom=int(chrom),
+                        pop=str(pop),
+                    )
 
             logger.info(
                 "merge population done chrom=%s pop=%s hapstore_elapsed=%.2fs outputs=%s",

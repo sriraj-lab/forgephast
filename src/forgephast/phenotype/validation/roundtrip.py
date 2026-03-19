@@ -11,6 +11,7 @@ import pandas as pd
 from hapstore.ids import align_by_ids, read_sample_ids
 
 from ..config import CohortConfig, RunConfig
+from ..local_ancestry.tracts import load_tracts_tsv_gz
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,39 @@ def _read_assoc_table(path: Path) -> pd.DataFrame:
     return df[["variant_id", "beta_hat", "p_value", "gwas_effect_allele"]].copy()
 
 
-def _population_weights(cohort: CohortConfig, sample_ids: list[str]) -> Dict[str, float]:
+def _admix_population_mass(
+    *,
+    cohort: CohortConfig,
+    admix_sample_ids: list[str],
+    run_cfg: RunConfig,
+) -> Dict[str, float]:
+    if not admix_sample_ids:
+        return {}
+    if not cohort.local_ancestry_tracts_pattern:
+        return {}
+
+    ancestry_bp: Dict[str, float] = {}
+    for chrom in run_cfg.chromosomes:
+        pattern = str(cohort.local_ancestry_tracts_pattern)
+        tracts_path = Path(pattern.format(chrom=int(chrom))) if "{chrom}" in pattern else Path(pattern)
+        tracts = load_tracts_tsv_gz(
+            tracts_path,
+            sample_ids=admix_sample_ids,
+            label_map=dict(run_cfg.local_ancestry.label_map),
+        )
+        for tract_list in tracts.values():
+            for tract in tract_list:
+                span = max(0, int(tract.right_bp) - int(tract.left_bp))
+                ancestry_bp[str(tract.ancestry)] = ancestry_bp.get(str(tract.ancestry), 0.0) + float(span)
+
+    total_bp = float(sum(ancestry_bp.values()))
+    if total_bp <= 0.0:
+        return {}
+    admix_mass = float(len(admix_sample_ids))
+    return {pop: admix_mass * (bp / total_bp) for pop, bp in ancestry_bp.items()}
+
+
+def _population_weights(cohort: CohortConfig, sample_ids: list[str], run_cfg: RunConfig) -> Dict[str, float]:
     if not cohort.population_map_file:
         return {}
     pop_df = pd.read_csv(cohort.population_map_file, sep="\t")
@@ -81,8 +114,23 @@ def _population_weights(cohort: CohortConfig, sample_ids: list[str]) -> Dict[str
         ids=sample_ids,
         context=f"cohort {cohort.name} population map alignment",
     )
-    counts = aligned[pop_col].astype(str).value_counts(dropna=False)
-    total = float(counts.sum())
+    pop_series = aligned[pop_col].astype(str)
+    counts = pop_series.value_counts(dropna=False).astype(float).to_dict()
+    total = float(sum(counts.values()))
+    if total <= 0.0:
+        return {}
+
+    admix_ids = aligned.loc[pop_series.str.upper() == "ADMIX", "IID"].astype(str).tolist()
+    if run_cfg.local_ancestry.enabled and admix_ids:
+        counts.pop("ADMIX", None)
+        counts.pop("admix", None)
+        for pop, mass in _admix_population_mass(
+            cohort=cohort,
+            admix_sample_ids=admix_ids,
+            run_cfg=run_cfg,
+        ).items():
+            counts[str(pop)] = float(counts.get(str(pop), 0.0) + float(mass))
+
     return {str(pop): float(count / total) for pop, count in counts.items()}
 
 
@@ -188,7 +236,7 @@ def build_roundtrip_report(
             raise ValueError(f"Cohort {cohort_name!r} not found in config")
         if cohort_name not in pop_weights_cache:
             sample_ids = read_sample_ids(cohort.sample_ids_file)
-            pop_weights_cache[cohort_name] = _population_weights(cohort, sample_ids)
+            pop_weights_cache[cohort_name] = _population_weights(cohort, sample_ids, run_cfg)
 
         assoc = _read_assoc_table(assoc_path)
         truth_weighted = _weighted_truth_effects(

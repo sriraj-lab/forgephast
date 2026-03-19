@@ -68,6 +68,38 @@ def _validate_correlation_matrix(
 
 
 @dataclass
+class MetapopulationJitterConfig:
+    coarse_label: str
+    subpopulation_column: str
+    subpopulations: List[str]
+    within_label_subpopulation_deviation_variance: float = 0.0
+    subpopulation_corr_matrix: List[List[float]] = field(default_factory=list)
+
+    def validate(self) -> None:
+        _check_non_empty(self.coarse_label, "effect_model.metapopulation_jitter[].coarse_label")
+        _check_non_empty(
+            self.subpopulation_column,
+            "effect_model.metapopulation_jitter[].subpopulation_column",
+        )
+        if not self.subpopulations:
+            raise ValueError("effect_model.metapopulation_jitter[].subpopulations cannot be empty")
+        if len(set(self.subpopulations)) != len(self.subpopulations):
+            raise ValueError("effect_model.metapopulation_jitter[].subpopulations must be unique")
+        _check_non_negative(
+            self.within_label_subpopulation_deviation_variance,
+            "effect_model.metapopulation_jitter[].within_label_subpopulation_deviation_variance",
+        )
+        if not self.subpopulation_corr_matrix:
+            size = len(self.subpopulations)
+            self.subpopulation_corr_matrix = np.eye(size).tolist()
+        _validate_correlation_matrix(
+            self.subpopulation_corr_matrix,
+            len(self.subpopulations),
+            "effect_model.metapopulation_jitter[].subpopulation_corr_matrix",
+        )
+
+
+@dataclass
 class HapStoreInputConfig:
     """HapStore input configuration."""
 
@@ -229,6 +261,7 @@ class EffectModelConfig:
     population_order: List[str] = field(default_factory=list)
     population_corr_matrix: List[List[float]] = field(default_factory=list)
     jitter_sd_by_population: Dict[str, float] = field(default_factory=dict)
+    metapopulation_jitter: List[MetapopulationJitterConfig] = field(default_factory=list)
     random_seed: int = 42
 
     def validate(self) -> None:
@@ -277,6 +310,8 @@ class EffectModelConfig:
             len(self.population_order),
             "effect_model.population_corr_matrix",
         )
+        for item in self.metapopulation_jitter:
+            item.validate()
 
 
 @dataclass

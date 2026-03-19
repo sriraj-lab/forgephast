@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 
 import pandas as pd
 
 from forgephast.phenotype.config import RunConfig
-from forgephast.phenotype.validation.roundtrip import build_roundtrip_report
+from forgephast.phenotype.validation.roundtrip import _population_weights, build_roundtrip_report
 
 
 def _base_payload(tmp_path: Path) -> dict:
@@ -155,3 +156,33 @@ def test_build_roundtrip_report_harmonizes_allele_and_computes_metrics(tmp_path:
     assert float(report.loc[0, "beta_slope"]) > 0.0
     assert int(report.loc[0, "top_k_causal_count"]) == 2
 
+
+def test_population_weights_expand_admix_from_local_ancestry_tracts(tmp_path: Path) -> None:
+    payload = _base_payload(tmp_path)
+    sample_ids = tmp_path / "samples_admix.txt"
+    sample_ids.write_text("eur1\nadm1\n", encoding="utf-8")
+    pop_map = tmp_path / "pop_admix.tsv"
+    pop_map.write_text("IID\tpopulation\neur1\tEUR\nadm1\tADMIX\n", encoding="utf-8")
+    tracts = tmp_path / "chr1_tracts.tsv.gz"
+    with gzip.open(tracts, "wt", encoding="utf-8") as handle:
+        handle.write("sample_id\thap_idx\tleft_bp\tright_bp\tancestry\n")
+        handle.write("adm1\t0\t0\t40\tEUR\n")
+        handle.write("adm1\t0\t40\t100\tAFR\n")
+        handle.write("adm1\t1\t0\t100\tAFR\n")
+
+    payload["cohorts"][0]["sample_ids_file"] = str(sample_ids)
+    payload["cohorts"][0]["population_map_file"] = str(pop_map)
+    payload["cohorts"][0]["local_ancestry_tracts_pattern"] = str(tracts)
+    payload["chromosomes"] = [1]
+    payload["local_ancestry"] = {
+        "enabled": True,
+        "ancestry_order": ["EUR", "AFR"],
+        "label_map": {},
+    }
+
+    cfg = RunConfig.from_dict(payload)
+    weights = _population_weights(cfg.cohorts[0], ["eur1", "adm1"], cfg)
+
+    assert set(weights) == {"EUR", "AFR"}
+    assert abs(weights["EUR"] - 0.6) < 1e-9
+    assert abs(weights["AFR"] - 0.4) < 1e-9

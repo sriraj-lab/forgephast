@@ -21,6 +21,7 @@ from .config_schema import (
     HapStoreInputConfig,
     LocalAncestryConfig,
     MafBucketConfig,
+    MetapopulationJitterConfig,
     PathConfig,
     PgenExportConfig,
     PhenotypeConfig,
@@ -100,6 +101,11 @@ class RunConfig:
                 raise ValueError(
                     f"local_ancestry.ancestry_order labels must exist in effect_model.population_order; missing={missing}"
                 )
+            la_cohorts = [c for c in self.cohorts if c.local_ancestry_tracts_pattern]
+            if not la_cohorts:
+                raise ValueError(
+                    "local_ancestry.enabled=true requires at least one cohort.local_ancestry_tracts_pattern"
+                )
             for cohort in la_cohorts:
                 pattern = str(cohort.local_ancestry_tracts_pattern)
                 if len(self.chromosomes) > 1 and "{chrom}" not in pattern:
@@ -136,7 +142,12 @@ class RunConfig:
         ]
         causal_selection = CausalSelectionConfig(**causal_payload)
 
-        effect_model = EffectModelConfig(**payload.get("effect_model", {}))
+        effect_payload = dict(payload.get("effect_model", {}))
+        effect_payload["metapopulation_jitter"] = [
+            MetapopulationJitterConfig(**item)
+            for item in effect_payload.get("metapopulation_jitter", [])
+        ]
+        effect_model = EffectModelConfig(**effect_payload)
         local_ancestry = LocalAncestryConfig(**payload.get("local_ancestry", {}))
         covariates = CovariateConfig(**payload["covariates"])
         phenotype = PhenotypeConfig(**payload.get("phenotype", {}))
