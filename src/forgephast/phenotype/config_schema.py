@@ -246,7 +246,25 @@ class CausalSelectionConfig:
 
 @dataclass
 class EffectModelConfig:
-    """Effect model and population-specific jitter settings."""
+    """Effect model and population-specific jitter settings.
+
+    Cross-population betas are sampled with a shared-base-plus-jitter geometry:
+
+    - beta_pop = beta_base + delta_pop
+    - Var(beta_base) = base_beta_sd^2 or architecture.params.sigma_beta^2
+    - Var(delta_pop) = jitter_sd_by_population[pop]^2
+
+    The configured population_corr_matrix targets the final correlation of beta_pop,
+    not the correlation of delta_pop alone. This implies a derived jitter covariance
+    that must satisfy both:
+
+    - pairwise bounds: |Cov(delta_i, delta_j)| <= jitter_i * jitter_j
+    - whole-matrix validity: the derived jitter covariance must be positive semidefinite
+
+    If these constraints fail, adjust sigma_beta/base_beta_sd, jitter_sd_by_population,
+    or population_corr_matrix. Final phenotype-scale heritability is still enforced
+    later by variance-budget rescaling during simulation.
+    """
 
     base_beta_distribution: str = "normal"
     base_beta_sd: float = 1.0

@@ -21,6 +21,66 @@ _SVD_FALLBACK_MAX_ELEMENTS = 2_000_000
 _SVD_FALLBACK_MAX_DIM = 2000
 
 
+def _psam_header_tokens(psam_path: Path) -> list[str]:
+    with open(psam_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if line:
+                return line.split("\t")
+    raise ValueError(f"Empty PSAM file: {psam_path}")
+
+
+def _psam_has_fid(psam_path: Path) -> bool:
+    header = _psam_header_tokens(psam_path)
+    if not header:
+        return False
+    first = header[0]
+    return first in {"#FID", "FID"} or ("FID" in header and "IID" in header)
+
+
+def normalize_psam_fid_column(psam_path: Path) -> None:
+    """Ensure PSAM has explicit FID/IID columns for downstream PLINK2 filters."""
+    if not psam_path.exists():
+        raise FileNotFoundError(f"Missing PSAM file: {psam_path}")
+    if _psam_has_fid(psam_path):
+        return
+
+    header = _psam_header_tokens(psam_path)
+    if not header or header[0] not in {"#IID", "IID"}:
+        raise ValueError(f"Unsupported PSAM header for FID normalization: {header}")
+
+    tmp_path = psam_path.with_suffix(psam_path.suffix + ".tmp")
+    with open(psam_path, "r", encoding="utf-8") as src, open(
+        tmp_path, "w", encoding="utf-8"
+    ) as dst:
+        first_line = True
+        for raw_line in src:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            fields = line.split("\t")
+            if first_line:
+                dst.write("\t".join(["#FID", "IID", *fields[1:]]) + "\n")
+                first_line = False
+                continue
+            iid = str(fields[0])
+            dst.write("\t".join([iid, iid, *fields[1:]]) + "\n")
+
+    tmp_path.replace(psam_path)
+
+
+def _write_plink2_keep_file(keep_file: Path, sample_ids: list[str], *, psam_path: Path) -> None:
+    normalize_psam_fid_column(psam_path)
+    use_two_columns = _psam_has_fid(psam_path)
+    with open(keep_file, "w", encoding="utf-8") as handle:
+        for iid in sample_ids:
+            iid = str(iid)
+            if use_two_columns:
+                handle.write(f"{iid} {iid}\n")
+            else:
+                handle.write(f"{iid}\n")
+
+
 def _randomized_svd_compat(
     x: np.ndarray,
     *,
@@ -230,10 +290,8 @@ def _run_plink2_pca(
     """Run PLINK2 --pca directly on an exported PGEN prefix."""
     out_dir.mkdir(parents=True, exist_ok=True)
     keep_file = out_dir / "keep_samples.txt"
-    with open(keep_file, "w", encoding="utf-8") as handle:
-        handle.write("FID IID\n")
-        for iid in sample_ids:
-            handle.write(f"{iid} {iid}\n")
+    psam_path = Path(f"{pgen_prefix}.psam")
+    _write_plink2_keep_file(keep_file, sample_ids, psam_path=psam_path)
 
     approx = bool(getattr(mode_cfg, "plink2_approx", True))
     extra_args = getattr(mode_cfg, "plink2_extra_args", None)
@@ -284,6 +342,23 @@ def _file_hash(path: str | Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _global_pcs_cache_key_path(pcs_path: Path) -> Path:
+    return pcs_path.with_suffix(pcs_path.suffix + ".cache_key")
+
+
+def _read_global_pcs_cache_key(pcs_path: Path) -> str | None:
+    key_path = _global_pcs_cache_key_path(pcs_path)
+    if not pcs_path.exists() or not key_path.exists():
+        return None
+    text = key_path.read_text(encoding="utf-8").strip()
+    return text or None
+
+
+def _write_global_pcs_cache_key(pcs_path: Path, cache_key: str) -> None:
+    key_path = _global_pcs_cache_key_path(pcs_path)
+    key_path.write_text(str(cache_key).strip() + "\n", encoding="utf-8")
 
 
 def _write_precomputed_pcs(
@@ -359,12 +434,26 @@ def refresh_manifest_global_pcs(
                 "id_column": str(run_cfg.gwas.global_pcs.id_column),
             }
         )
+        disk_cache_key = _read_global_pcs_cache_key(pcs_path) if bool(run_cfg.gwas.global_pcs.reuse_cache) else None
+        if (
+            bool(run_cfg.gwas.global_pcs.reuse_cache)
+            and disk_cache_key == cache_key
+            and pcs_path.exists()
+        ):
+            bump_counter(runtime_cache, hit=True, name="global_pcs")
+            if cache is not None and cache_key not in cache:
+                cache[cache_key] = pd.read_csv(pcs_path, sep="\t")
+            manifest_df.loc[idx, "global_pcs_file"] = str(pcs_path)
+            logger.info("[global-pcs] cache-hit(row=disk) row=%d output=%s", int(idx), pcs_path)
+            continue
+
         if cache is not None and cache_key in cache:
             bump_counter(runtime_cache, hit=True, name="global_pcs")
             cached_df = cache[cache_key]
             if not isinstance(cached_df, pd.DataFrame):
                 raise TypeError("global_pcs_cache values must be pandas DataFrame objects")
             cached_df.to_csv(pcs_path, sep="\t", index=False)
+            _write_global_pcs_cache_key(pcs_path, cache_key)
             manifest_df.loc[idx, "global_pcs_file"] = str(pcs_path)
             logger.info("[global-pcs] cache-hit row=%d output=%s", int(idx), pcs_path)
             continue
@@ -401,6 +490,7 @@ def refresh_manifest_global_pcs(
 
         if cache is not None:
             cache[cache_key] = pcs_df.copy()
+        _write_global_pcs_cache_key(pcs_path, cache_key)
         manifest_df.loc[idx, "global_pcs_file"] = str(pcs_path)
 
     manifest_df.to_csv(out_manifest, sep="\t", index=False)

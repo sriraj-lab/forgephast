@@ -182,6 +182,43 @@ def test_export_haplotypes_reads_per_pop_per_chr(fake_adapter: HapStoreAdapter) 
     assert hap[1, :, :].tolist() == [[1, 1], [1, 0]]
 
 
+def test_export_genotypes_u8_matches_export_dosages(fake_adapter: HapStoreAdapter) -> None:
+    stores = {
+        ("EUR", 1): FakeStore(
+            sample_ids=["id1", "id3"],
+            positions=[10, 30],
+            refs=["A", "G"],
+            alts=["G", "A"],
+            genotypes=[[0, 255], [2, 1]],
+        ),
+        ("AFR", 1): FakeStore(
+            sample_ids=["id2"],
+            positions=[10, 30],
+            refs=["A", "G"],
+            alts=["G", "A"],
+            genotypes=[[1, 0]],
+        ),
+    }
+    _wire_fake_stores(fake_adapter, stores)
+
+    dosage = fake_adapter.export_dosages(
+        sample_ids=["id1", "id2", "id3"],
+        sample_populations=["EUR", "AFR", "EUR"],
+        variant_ids=["chr1:10", "chr1:30"],
+        out_dir=Path("/tmp"),
+    )
+    geno = fake_adapter.export_genotypes_u8(
+        sample_ids=["id1", "id2", "id3"],
+        sample_populations=["EUR", "AFR", "EUR"],
+        variant_ids=["chr1:10", "chr1:30"],
+        out_dir=Path("/tmp"),
+    )
+
+    expected = dosage[["chr1:10", "chr1:30"]].to_numpy(dtype=np.float32, copy=False)
+    expected[expected == np.float32(fake_adapter.missing_fill_value)] = 0.0
+    assert np.array_equal(geno, expected.astype(np.uint8))
+
+
 def test_export_dosages_single_store_ignores_sample_populations(tmp_path: Path) -> None:
     cfg = HapStoreInputConfig(
         root_dir="/tmp/ignored",

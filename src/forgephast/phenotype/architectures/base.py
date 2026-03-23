@@ -20,6 +20,7 @@ class ArchitectureInput:
     membership_df: pd.DataFrame
     beta_df: pd.DataFrame
     variant_id_column: str
+    genotype_matrix: Optional[np.ndarray] = None
     haplotypes: Optional[np.ndarray] = None
     local_ancestry_codes: Optional[np.ndarray] = None
     ancestry_order: Optional[List[str]] = None

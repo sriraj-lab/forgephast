@@ -7,7 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 from forgephast.phenotype.config import RunConfig
-from forgephast.phenotype.data.global_pcs import refresh_manifest_global_pcs
+from forgephast.phenotype.data.global_pcs import (
+    _global_pcs_cache_key_path,
+    refresh_manifest_global_pcs,
+)
 
 
 def _payload(tmp_path: Path) -> dict:
@@ -144,3 +147,60 @@ def test_refresh_manifest_global_pcs_dedupes_in_memory(monkeypatch, tmp_path: Pa
     assert all(Path(path).exists() for path in refreshed["global_pcs_file"].tolist())
     assert runtime_cache["cache_misses"]["global_pcs"] == 1
     assert runtime_cache["cache_hits"]["global_pcs"] == 1
+
+
+def test_refresh_manifest_global_pcs_reuses_existing_disk_cache(monkeypatch, tmp_path: Path) -> None:
+    cfg = RunConfig.from_dict(_payload(tmp_path))
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    out_dir = run_dir / "rep1" / "arch_a1" / "cohort_c1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    keep_file = tmp_path / "keep.tsv"
+    keep_file.write_text("FID IID\n0 s1\n0 s2\n", encoding="utf-8")
+
+    pcs_path = out_dir / "global_pcs.tsv"
+    pcs_df = pd.DataFrame(
+        {
+            "FID": ["s1", "s2"],
+            "IID": ["s1", "s2"],
+            "PC1": [0.1, -0.1],
+            "PC2": [0.2, 0.3],
+        }
+    )
+    pcs_df.to_csv(pcs_path, sep="\t", index=False)
+
+    manifest = pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "pgen_prefix": ["/tmp/fake"],
+            "keep_file": [str(keep_file)],
+            "output_dir": [str(out_dir)],
+            "global_pcs_file": [str(pcs_path)],
+        }
+    )
+    manifest_path = run_dir / "run_manifest.tsv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest.to_csv(manifest_path, sep="\t", index=False)
+
+    runtime_cache: dict[str, object] = {}
+    first_manifest = refresh_manifest_global_pcs(cfg, manifest_path, runtime_cache=runtime_cache)
+    first_df = pd.read_csv(first_manifest, sep="\t")
+    key_path = _global_pcs_cache_key_path(pcs_path)
+    assert key_path.exists()
+    assert first_df.loc[0, "global_pcs_file"] == str(pcs_path)
+
+    def _fail_write(*args, **kwargs):  # noqa: ANN001, ANN202
+        raise AssertionError("persistent PCA cache should have been reused")
+
+    monkeypatch.setattr("forgephast.phenotype.data.global_pcs._write_precomputed_pcs", _fail_write)
+
+    runtime_cache_2: dict[str, object] = {}
+    second_manifest = refresh_manifest_global_pcs(cfg, manifest_path, runtime_cache=runtime_cache_2)
+    second_df = pd.read_csv(second_manifest, sep="\t")
+
+    assert second_df.loc[0, "global_pcs_file"] == str(pcs_path)
+    assert runtime_cache_2["cache_hits"]["global_pcs"] == 1
+    assert runtime_cache_2.get("cache_misses", {}).get("global_pcs", 0) == 0

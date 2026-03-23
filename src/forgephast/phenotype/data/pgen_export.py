@@ -6,6 +6,8 @@ import concurrent.futures
 import hashlib
 import json
 import logging
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from hapstore.ids import align_by_ids, read_sample_ids
 from ..._internal.cache import bump_counter, canonical_hash
 from ..config import CohortConfig, RunConfig
 from .genotypes import build_genotype_adapter
+from .global_pcs import normalize_psam_fid_column
 
 logger = logging.getLogger(__name__)
 
@@ -41,15 +44,114 @@ def _pgen_triplet_exists(prefix: str | Path) -> bool:
 
 
 def _normalize_fid_for_exported_pgen(path: str) -> None:
-    """Set FID column to 0 for tables consumed by PLINK/REGENIE on exported PGEN."""
+    """Align FID to IID for tables consumed by PLINK/REGENIE on exported PGEN."""
     table_path = Path(path)
     if not table_path.exists():
         return
     df = pd.read_csv(table_path, sep="\t")
     if "FID" not in df.columns:
         return
-    df["FID"] = "0"
+    if "IID" not in df.columns:
+        return
+    df["FID"] = df["IID"].astype(str)
     df.to_csv(table_path, sep="\t", index=False)
+
+
+def _count_pvar_variants(pvar_path: Path) -> int:
+    count = -1
+    with open(pvar_path, "r", encoding="utf-8") as handle:
+        for count, _ in enumerate(handle):
+            pass
+    return max(0, count)
+
+
+def _filter_zero_maf_pgen(prefix: str | Path, *, plink2_path: str, threads: int) -> str:
+    """Create a filtered PGEN with monomorphic variants removed."""
+    input_prefix = Path(prefix)
+    if input_prefix.name.endswith(".maf_gt0"):
+        return str(input_prefix)
+
+    filtered_prefix = input_prefix.parent / f"{input_prefix.name}.maf_gt0"
+    if _pgen_triplet_exists(filtered_prefix):
+        normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
+        return str(filtered_prefix)
+
+    tmp_prefix = filtered_prefix.parent / f"{filtered_prefix.name}.tmp"
+    for ext in (".pgen", ".pvar", ".psam", ".log"):
+        Path(f"{tmp_prefix}{ext}").unlink(missing_ok=True)
+
+    cmd = [
+        plink2_path,
+        "--pfile",
+        str(input_prefix),
+        "--maf",
+        "1e-12",
+        "--make-pgen",
+        "--threads",
+        str(max(1, int(threads))),
+        "--out",
+        str(tmp_prefix),
+    ]
+    logger.info("Filtering monomorphic variants from PGEN: %s", " ".join(cmd))
+    completed = subprocess.run(cmd, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "PLINK2 monomorphic-variant filter failed\n"
+            f"CMD: {' '.join(cmd)}\n"
+            f"STDOUT:\n{completed.stdout}\n"
+            f"STDERR:\n{completed.stderr}"
+        )
+
+    for ext in (".pgen", ".pvar", ".psam"):
+        if not Path(f"{tmp_prefix}{ext}").exists():
+            raise RuntimeError(f"Filtered PGEN missing output artifact: {tmp_prefix}{ext}")
+
+    for ext in (".pgen", ".pvar", ".psam", ".log"):
+        Path(f"{filtered_prefix}{ext}").unlink(missing_ok=True)
+    for ext in (".pgen", ".pvar", ".psam", ".log"):
+        src = Path(f"{tmp_prefix}{ext}")
+        if src.exists():
+            shutil.move(str(src), str(Path(f"{filtered_prefix}{ext}")))
+
+    normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
+    before_n = _count_pvar_variants(Path(f"{input_prefix}.pvar"))
+    after_n = _count_pvar_variants(Path(f"{filtered_prefix}.pvar"))
+    logger.info(
+        "[hapstore-export] monomorphic filter before=%d after=%d removed=%d prefix=%s",
+        before_n,
+        after_n,
+        max(0, before_n - after_n),
+        filtered_prefix,
+    )
+    return str(filtered_prefix)
+
+
+def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.DataFrame) -> pd.DataFrame:
+    """Rewrite manifest PGEN prefixes to monomorphic-filtered exports."""
+    if "pgen_prefix" not in manifest_df.columns:
+        raise ValueError("Manifest missing pgen_prefix for monomorphic filtering")
+    filtered_df = manifest_df.copy()
+    if "filtered_pgen_prefix" not in filtered_df.columns:
+        filtered_df["filtered_pgen_prefix"] = ""
+
+    prefixes = filtered_df["pgen_prefix"].fillna("").astype(str).str.strip()
+    non_empty = sorted({prefix for prefix in prefixes.tolist() if prefix})
+    if not non_empty:
+        return filtered_df
+
+    plink2_path = str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path)
+    threads = max(1, int(run_cfg.gwas.plink2.threads))
+    prefix_map = {
+        prefix: _filter_zero_maf_pgen(prefix, plink2_path=plink2_path, threads=threads)
+        for prefix in non_empty
+    }
+
+    filtered_df["filtered_pgen_prefix"] = prefixes.map(lambda prefix: prefix_map.get(prefix, prefix))
+    changed = filtered_df["filtered_pgen_prefix"].astype(str) != prefixes
+    filtered_df["pgen_prefix"] = filtered_df["filtered_pgen_prefix"]
+    if changed.any() and "global_pcs_file" in filtered_df.columns:
+        filtered_df.loc[changed, "global_pcs_file"] = ""
+    return filtered_df
 
 
 def _load_population_labels(
@@ -433,6 +535,8 @@ def export_manifest_pgens(
 
         manifest_df.loc[mask, "pgen_prefix"] = str(exported_prefix)
         manifest_df.loc[mask, "exported_pgen_prefix"] = str(exported_prefix)
+
+    manifest_df = ensure_manifest_non_monomorphic_pgens(run_cfg, manifest_df)
 
     out_manifest = manifest_path.parent / "run_manifest_pgen.tsv"
     manifest_df.to_csv(out_manifest, sep="\t", index=False)

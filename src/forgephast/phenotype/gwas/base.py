@@ -94,7 +94,24 @@ def merge_covariates_for_gwas(
     if merged.empty:
         raise ValueError("covariate/PC merge is empty")
 
+    if "age" in merged.columns and "age_centered" in merged.columns:
+        logger.info("Dropping raw age from GWAS covariates because age_centered is present")
+        merged = merged.drop(columns=["age"])
+
     covar_cols = [c for c in merged.columns if c not in {"FID", "IID"}]
+
+    constant_cols = [col for col in covar_cols if merged[col].nunique(dropna=False) <= 1]
+    if constant_cols:
+        logger.info("Dropping constant GWAS covariates: %s", ",".join(constant_cols))
+        merged = merged.drop(columns=constant_cols)
+        covar_cols = [c for c in covar_cols if c not in set(constant_cols)]
+
+    pc_cols = [col for col in covar_cols if col.startswith("PC")]
+    if pc_cols and "population_code" in covar_cols:
+        logger.info("Dropping population_code from GWAS covariates because PCs are present")
+        merged = merged.drop(columns=["population_code"])
+        covar_cols = [c for c in covar_cols if c != "population_code"]
+
     merged.to_csv(out_path, sep="\t", index=False)
     return covar_cols
 

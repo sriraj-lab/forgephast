@@ -50,7 +50,10 @@ class Plink2Engine(GwasEngine):
         ]
         if task.chromosomes:
             cmd.extend(["--chr", ",".join(str(chrom) for chrom in task.chromosomes)])
-        cmd.extend(["--glm", "hide-covar"])
+        glm_modifiers = ["hide-covar"]
+        if not covar_cols:
+            glm_modifiers.append("allow-no-covars")
+        cmd.extend(["--glm", *glm_modifiers])
         if covar_cols:
             cmd.extend(
                 [
@@ -58,6 +61,7 @@ class Plink2Engine(GwasEngine):
                     str(covar_path),
                     "--covar-name",
                     ",".join(covar_cols),
+                    "--covar-variance-standardize",
                 ]
             )
         cmd.extend(

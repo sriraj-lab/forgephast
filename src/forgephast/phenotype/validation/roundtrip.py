@@ -187,8 +187,21 @@ def _linear_metrics(merged: pd.DataFrame) -> Tuple[float, float, float, float]:
         return np.nan, np.nan, np.nan, np.nan
     x = merged["beta_true"].to_numpy(dtype=float)
     y = merged["beta_hat_harmonized"].to_numpy(dtype=float)
-    slope, intercept = np.polyfit(x, y, deg=1)
-    corr = float(np.corrcoef(x, y)[0, 1])
+    finite = np.isfinite(x) & np.isfinite(y)
+    if np.count_nonzero(finite) < 2:
+        return np.nan, np.nan, np.nan, np.nan
+    x = x[finite]
+    y = y[finite]
+    if np.allclose(x, x[0]) or np.allclose(y, y[0]):
+        return np.nan, np.nan, np.nan, np.nan
+    try:
+        slope, intercept = np.polyfit(x, y, deg=1)
+        corr = float(np.corrcoef(x, y)[0, 1])
+    except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+        logger.warning(
+            "Round-trip linear metrics are numerically degenerate; returning NaN metrics"
+        )
+        return np.nan, np.nan, np.nan, np.nan
     nz = (np.abs(x) > 0) & (np.abs(y) > 0)
     sign = float(np.mean(np.sign(x[nz]) == np.sign(y[nz]))) if np.any(nz) else np.nan
     return float(slope), float(intercept), corr, sign

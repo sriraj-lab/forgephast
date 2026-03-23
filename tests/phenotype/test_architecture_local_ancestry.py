@@ -9,6 +9,66 @@ from forgephast.phenotype.architectures.polygenic_no_pleiotropy import Polygenic
 from forgephast.phenotype.architectures.base import ArchitectureInput
 
 
+def test_polygenic_no_pleiotropy_genotype_matrix_fast_path_matches_dataframe_path() -> None:
+    plugin = PolygenicNoPleiotropyPlugin()
+    sample_ids = ["eur1", "afr1", "eur2"]
+    sample_populations = ["EUR", "AFR", "EUR"]
+    variants = ["chr21:10", "chr21:20"]
+
+    membership_df = pd.DataFrame(
+        {
+            "variant_id": variants,
+            "maf_bucket": ["b1", "b2"],
+            "membership_type": ["fixed", "subset"],
+            "replicate": [1, 1],
+        }
+    )
+    beta_df = pd.DataFrame(
+        [
+            {"variant_id": "chr21:10", "population": "EUR", "beta": 2.0},
+            {"variant_id": "chr21:10", "population": "AFR", "beta": 5.0},
+            {"variant_id": "chr21:20", "population": "EUR", "beta": 1.0},
+            {"variant_id": "chr21:20", "population": "AFR", "beta": 3.0},
+        ]
+    )
+    genotype_matrix = np.asarray(
+        [
+            [0.0, 2.0],
+            [1.0, 1.0],
+            [2.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    dosage_df = pd.DataFrame(genotype_matrix, columns=variants)
+    dosage_df.insert(0, "IID", sample_ids)
+    dosage_df.insert(0, "FID", sample_ids)
+
+    baseline_genetic, baseline_effects = plugin.compute_genetic_component(
+        ArchitectureInput(
+            sample_ids=sample_ids,
+            sample_populations=sample_populations,
+            dosage_df=dosage_df,
+            membership_df=membership_df,
+            beta_df=beta_df,
+            variant_id_column="variant_id",
+        )
+    )
+    fast_genetic, fast_effects = plugin.compute_genetic_component(
+        ArchitectureInput(
+            sample_ids=sample_ids,
+            sample_populations=sample_populations,
+            dosage_df=dosage_df[["FID", "IID"]].copy(),
+            genotype_matrix=genotype_matrix,
+            membership_df=membership_df,
+            beta_df=beta_df,
+            variant_id_column="variant_id",
+        )
+    )
+
+    assert np.allclose(baseline_genetic, fast_genetic, atol=1e-12, rtol=0.0)
+    pd.testing.assert_frame_equal(baseline_effects, fast_effects)
+
+
 def test_polygenic_no_pleiotropy_local_ancestry_component_matches_hand_calc() -> None:
     plugin = PolygenicNoPleiotropyPlugin()
     sample_ids = ["adm1"]

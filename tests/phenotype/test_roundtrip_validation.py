@@ -8,7 +8,11 @@ from pathlib import Path
 import pandas as pd
 
 from forgephast.phenotype.config import RunConfig
-from forgephast.phenotype.validation.roundtrip import _population_weights, build_roundtrip_report
+from forgephast.phenotype.validation.roundtrip import (
+    _linear_metrics,
+    _population_weights,
+    build_roundtrip_report,
+)
 
 
 def _base_payload(tmp_path: Path) -> dict:
@@ -186,3 +190,19 @@ def test_population_weights_expand_admix_from_local_ancestry_tracts(tmp_path: Pa
     assert set(weights) == {"EUR", "AFR"}
     assert abs(weights["EUR"] - 0.6) < 1e-9
     assert abs(weights["AFR"] - 0.4) < 1e-9
+
+
+def test_linear_metrics_returns_nan_for_degenerate_null_fit() -> None:
+    merged = pd.DataFrame(
+        {
+            "beta_true": [0.0, 0.0, 0.0],
+            "beta_hat_harmonized": [0.0, 0.0, 0.0],
+        }
+    )
+
+    slope, intercept, corr, sign = _linear_metrics(merged)
+
+    assert pd.isna(slope)
+    assert pd.isna(intercept)
+    assert pd.isna(corr)
+    assert pd.isna(sign)

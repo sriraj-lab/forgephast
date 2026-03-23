@@ -25,7 +25,12 @@ def _load_covariates(cfg: CovariateConfig, sample_ids: List[str]) -> pd.DataFram
     cov = pd.read_csv(cfg.covariate_file, sep="\t")
     cov = align_by_ids(cov, cfg.id_column, sample_ids, "covariate alignment")
     cov = cov.rename(columns={cfg.id_column: "IID"})
-    cov.insert(0, "FID", cov["IID"])
+    if "FID" not in cov.columns:
+        cov.insert(0, "FID", cov["IID"])
+    else:
+        cov["FID"] = cov["IID"]
+        ordered = ["FID", "IID"] + [c for c in cov.columns if c not in {"FID", "IID"}]
+        cov = cov.loc[:, ordered]
     return cov
 
 

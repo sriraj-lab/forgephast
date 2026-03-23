@@ -108,3 +108,107 @@ outputs:
 ```
 
 With that config, amplifier will build donor HapStore caches under `runs/demo/cache/donor_panels/` as needed and reuse them across simulation and QC.
+
+## Phenotype effect geometry constraints
+
+`forgephast phenotype` samples population-specific effect sizes with a shared-base-plus-jitter construction:
+
+- `beta_pop = beta_base + delta_pop`
+- `Var(beta_base) = sigma_beta^2`
+- `Var(delta_pop) = jitter_sd_by_population[pop]^2`
+
+The configured `effect_model.population_corr_matrix` is interpreted as the target correlation of the final per-population betas, not the correlation of the jitter terms alone.
+
+For population pair `i, j`, the code builds:
+
+- `total_sd_i = sqrt(sigma_beta^2 + jitter_i^2)`
+- `Cov(beta_i, beta_j) = Corr(beta_i, beta_j) * total_sd_i * total_sd_j`
+- `Cov(delta_i, delta_j) = Cov(beta_i, beta_j) - sigma_beta^2`
+
+This derived jitter covariance must be mathematically valid before simulation can run.
+
+### Required validity conditions
+
+1. Pairwise bound:
+
+- `|Cov(delta_i, delta_j)| <= jitter_i * jitter_j`
+
+If this fails, the requested cross-pop correlation is incompatible with the amount of shared base variance and jitter variance.
+
+2. Positive semidefiniteness:
+
+- the full derived jitter covariance matrix must be positive semidefinite
+
+Even if every pairwise bound passes, the full matrix can still be invalid.
+
+### Practical interpretation
+
+- Lower cross-pop correlations require less shared-base dominance or more jitter variance.
+- Higher `sigma_beta` makes it harder to realize low target cross-pop correlations.
+- Increasing `jitter_sd_by_population` gives the model more room to express lower correlations.
+- If you see an error about `population_corr_matrix` incompatibility or a non-PSD derived jitter covariance, adjust one or more of:
+  - `architectures[].params.sigma_beta`
+  - `effect_model.jitter_sd_by_population`
+  - `effect_model.population_corr_matrix`
+
+### Important note about heritability
+
+These geometry parameters control whether the cross-pop beta construction is valid. They do not directly lock the final phenotype variance.
+
+Later in simulation, the realized fixed genetic component is rescaled to the requested target variance:
+
+- `genetic_fixed_scale = sqrt(target_h2_fixed / Var(genetic_raw))`
+- emitted per-variant truth betas are multiplied by the same scale
+
+So changing `sigma_beta` or jitter settings affects the geometry of sampled effects, while `variance_budget.h2_fixed` still controls the final fixed genetic variance target.
+
+## Phenotype GWAS prep performance guidance
+
+For large round-trip GWAS runs, the main bottlenecks are usually genotype materialization and PCA refresh, not effect sampling.
+
+### Recommended prep architecture
+
+- Prefer chromosome-local preprocessing over one monolithic whole-genome prep stage.
+- Filter monomorphic variants per chromosome before final genome-wide assembly.
+- Export each chromosome to PGEN independently, then merge chromosome-level PGENs into the final genome-wide PGEN surface.
+- Prefer PGEN-level merge/concat over temporary HapStore concat for final GWAS prep when possible.
+
+This is the preferred direction because HapStore-to-PGEN export is reasonably efficient, while whole-panel HapStore concat is often the slower and more memory-fragile step.
+
+### Why PGEN-first merge is preferable
+
+- PLINK2 exposes explicit memory control for merge operations.
+- PLINK2 merge is aggressively multithreaded and already optimized for this workload.
+- Per-chromosome PGEN surfaces are easier to cache and reuse than a large temporary merged HapStore.
+- Failures become easier to recover because a single chromosome can be regenerated without repeating the whole prep path.
+
+### PCA guidance
+
+- Do not compute ancestry PCs from the full dense association panel unless you specifically need that behavior.
+- Prefer LD-pruned PCA over full-panel PCA for GWAS covariate generation.
+- Cache the final PCA result by:
+  - merged PGEN prefix
+  - kept sample set
+  - chromosome list
+  - PCA settings
+  - pruning settings
+
+If those inputs have not changed, a rerun should reuse the existing PCA artifact instead of recomputing it.
+
+### Other worthwhile speedups
+
+- Precompute merged GWAS covariates once per replicate/cohort and reuse them across engines instead of rebuilding them separately for PLINK2 and REGENIE.
+- Treat the merged genome-wide PGEN as the canonical reusable prep artifact for reruns.
+- Prefer scheduler-level parallelism across chromosomes or replicate-level prep units over a single large threaded parent job when scaling on HPC.
+
+### Practical rule of thumb
+
+For large `forgephast phenotype gwas` runs, the target prep flow should be:
+
+1. per-chromosome filter
+2. per-chromosome PGEN export
+3. PLINK2 merge into final genome-wide PGEN
+4. LD-pruned cached PCA
+5. GWAS engines
+
+That flow is generally faster, easier to resume, and less OOM-prone than a prep path centered on temporary whole-genome HapStore concat.

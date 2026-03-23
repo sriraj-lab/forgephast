@@ -118,7 +118,13 @@ def _compute_grm_from_dosage(dosage_df: pd.DataFrame) -> np.ndarray:
     """Compute a simple GRM from standardized dosage columns."""
     variant_cols = [c for c in dosage_df.columns if c not in {"FID", "IID"}]
     x = dosage_df[variant_cols].to_numpy(dtype=float)
-    if x.shape[1] == 0:
+    return _compute_grm_from_matrix(x)
+
+
+def _compute_grm_from_matrix(x: np.ndarray) -> np.ndarray:
+    """Compute a simple GRM from an additive genotype matrix."""
+    x = np.asarray(x, dtype=float)
+    if x.ndim != 2 or x.shape[1] == 0:
         raise ValueError("Cannot compute GRM with zero dosage variants")
     x = x - x.mean(axis=0, keepdims=True)
     std = x.std(axis=0, keepdims=True)
@@ -131,6 +137,11 @@ def _compute_grm_from_dosage(dosage_df: pd.DataFrame) -> np.ndarray:
     grm = (x @ x.T) / float(m)
     grm = 0.5 * (grm + grm.T)
     return grm
+
+
+def _sample_frame(sample_ids: List[str]) -> pd.DataFrame:
+    """Minimal IID/FID frame for downstream interfaces that require it."""
+    return pd.DataFrame({"FID": sample_ids, "IID": sample_ids}, copy=False)
 
 
 def _sample_mvnormal_from_cov(
@@ -149,7 +160,8 @@ def _sample_mvnormal_from_cov(
 def _build_background_component(
     run_cfg: RunConfig,
     sample_ids: List[str],
-    dosage_df: pd.DataFrame,
+    dosage_df: pd.DataFrame | None,
+    genotype_matrix: np.ndarray | None,
     cache_key: str,
     replicate_seed: int,
     kinship_cache: Dict[str, np.ndarray],
@@ -167,7 +179,12 @@ def _build_background_component(
             )
         cov = kinship_cache[cache_key]
     elif mode == "compute_grm":
-        cov = _compute_grm_from_dosage(dosage_df)
+        if genotype_matrix is not None:
+            cov = _compute_grm_from_matrix(genotype_matrix)
+        elif dosage_df is not None:
+            cov = _compute_grm_from_dosage(dosage_df)
+        else:
+            raise ValueError("compute_grm mode requires dosage_df or genotype_matrix")
     else:
         raise ValueError(f"Unsupported background_genetic.mode={mode}")
 
@@ -219,7 +236,7 @@ def _parse_chr_pos_variant_id(variant_id: str) -> tuple[int, int]:
 def _build_global_pcs(
     mode_cfg: GlobalPCConfig,
     adapter: GenotypeAdapter,
-    dosage_df: pd.DataFrame,
+    sample_frame: pd.DataFrame,
     sample_ids: List[str],
     sample_populations: List[str],
     out_dir: Path,
@@ -227,8 +244,7 @@ def _build_global_pcs(
 ) -> pd.DataFrame:
     """Construct global PC covariate table for one record."""
     if mode_cfg.mode == "none":
-        out = dosage_df[["FID", "IID"]].copy()
-        return out
+        return sample_frame.copy()
 
     mode = mode_cfg.canonical_mode()
     if mode in {"plink2_pca", "svd_pca"}:
@@ -323,15 +339,23 @@ def run_simulation(
 
     def _cache_bytes(entry: dict[str, Any]) -> int:
         total = 0
-        dosage_df = entry.get("dosage_df")
-        if isinstance(dosage_df, pd.DataFrame):
-            total += int(dosage_df.memory_usage(deep=True).sum())
-        hap = entry.get("haplotypes")
-        if isinstance(hap, np.ndarray):
-            total += int(hap.nbytes)
-        la_codes = entry.get("local_ancestry_codes")
-        if isinstance(la_codes, np.ndarray):
-            total += int(la_codes.nbytes)
+        sample_frame = entry.get("sample_frame")
+        if isinstance(sample_frame, pd.DataFrame):
+            total += int(sample_frame.memory_usage(deep=True).sum())
+        genotype_matrix = entry.get("genotype_matrix")
+        if isinstance(genotype_matrix, np.ndarray):
+            total += int(genotype_matrix.nbytes)
+        admix_haplotypes = entry.get("admix_haplotypes")
+        if isinstance(admix_haplotypes, np.ndarray):
+            total += int(admix_haplotypes.nbytes)
+        admix_local_ancestry_codes = entry.get("admix_local_ancestry_codes")
+        if isinstance(admix_local_ancestry_codes, np.ndarray):
+            total += int(admix_local_ancestry_codes.nbytes)
+        la_genotypes_by_population = entry.get("la_genotypes_by_population")
+        if isinstance(la_genotypes_by_population, dict):
+            for value in la_genotypes_by_population.values():
+                if isinstance(value, np.ndarray):
+                    total += int(value.nbytes)
         return total
 
     for replicate in range(1, run_cfg.phenotype.n_replicates + 1):
@@ -350,6 +374,10 @@ def run_simulation(
         parsed = [_parse_chr_pos_variant_id(vid) for vid in variant_ids]
         variant_chrom = np.asarray([c for c, _ in parsed], dtype=np.int32)
         variant_pos_bp = np.asarray([p for _, p in parsed], dtype=np.int64)
+        variant_indices_by_chrom = {
+            int(chrom): np.where(variant_chrom == int(chrom))[0].astype(np.int64)
+            for chrom in run_cfg.chromosomes
+        }
         _timed(
             "simulate.parse_variants",
             t_membership,
@@ -397,28 +425,27 @@ def run_simulation(
             if genotype_cache_key in genotype_cache:
                 _bump("simulate_genotype", True)
                 cached = genotype_cache[genotype_cache_key]
-                dosage_df = cached["dosage_df"]
-                haplotypes = cached.get("haplotypes")
-                local_ancestry_codes = cached.get("local_ancestry_codes")
+                sample_frame = cached["sample_frame"]
+                genotype_matrix = cached.get("genotype_matrix")
                 admix_indices = cached.get("admix_indices")
                 admix_sample_ids = cached.get("admix_sample_ids")
                 admix_haplotypes = cached.get("admix_haplotypes")
                 admix_local_ancestry_codes = cached.get("admix_local_ancestry_codes")
+                la_genotypes_by_population = cached.get("la_genotypes_by_population", {})
                 dosage_effect_allele = dict(cached["dosage_effect_allele"])
             else:
                 _bump("simulate_genotype", False)
-                haplotypes = None
-                local_ancestry_codes = None
+                sample_frame = _sample_frame(sample_ids)
+                genotype_matrix = None
                 admix_indices = None
                 admix_sample_ids = None
                 admix_haplotypes = None
                 admix_local_ancestry_codes = None
+                la_genotypes_by_population: dict[str, np.ndarray] = {}
 
                 if la_enabled:
                     # Local ancestry mode needs phased haplotypes for *admixed* samples only.
                     # Avoid exporting a full dense dosage table (very expensive at 245k samples).
-                    dosage_df = pd.DataFrame({"FID": sample_ids, "IID": sample_ids})
-
                     ancestry_order = list(run_cfg.local_ancestry.ancestry_order)
                     ancestry_to_index = {a: i for i, a in enumerate(ancestry_order)}
 
@@ -456,7 +483,7 @@ def run_simulation(
 
                         pattern = str(cohort.local_ancestry_tracts_pattern)
                         for chrom in run_cfg.chromosomes:
-                            idx_for_chrom = np.where(variant_chrom == int(chrom))[0].astype(np.int64)
+                            idx_for_chrom = variant_indices_by_chrom[int(chrom)]
                             if int(idx_for_chrom.shape[0]) == 0:
                                 continue
                             positions_bp = variant_pos_bp[idx_for_chrom]
@@ -530,15 +557,17 @@ def run_simulation(
                         n_samples=int(len(sample_ids)),
                         n_variants=int(len(variant_ids)),
                     )
+                    sample_frame = dosage_df[["FID", "IID"]].copy()
+                    genotype_matrix = dosage_df[variant_ids].to_numpy(dtype=np.float32, copy=False)
                 dosage_effect_allele = dict(adapter.last_export_allele_by_variant)
                 cache_entry = {
-                    "dosage_df": dosage_df,
-                    "haplotypes": None,
-                    "local_ancestry_codes": None,
+                    "sample_frame": sample_frame,
+                    "genotype_matrix": genotype_matrix,
                     "admix_indices": list(admix_indices) if admix_indices is not None else None,
                     "admix_sample_ids": list(admix_sample_ids) if admix_sample_ids is not None else None,
                     "admix_haplotypes": admix_haplotypes,
                     "admix_local_ancestry_codes": admix_local_ancestry_codes,
+                    "la_genotypes_by_population": la_genotypes_by_population,
                     "dosage_effect_allele": dict(dosage_effect_allele),
                 }
                 entry_bytes = _cache_bytes(cache_entry)
@@ -551,7 +580,7 @@ def run_simulation(
                         if runtime_cache is not None:
                             runtime_cache["simulate_genotype_cache_bytes"] = used_bytes + entry_bytes
 
-            check_id_alignment(sample_ids, dosage_df)
+            check_id_alignment(sample_ids, sample_frame)
 
             t_cov = time.perf_counter()
             cov_out = build_covariate_effects(
@@ -571,12 +600,12 @@ def run_simulation(
             # In plink2_pca mode, PCs are refreshed from exported PGEN in
             # the GWAS prep stage; avoid expensive in-simulation SVD here.
             if run_cfg.gwas.global_pcs.canonical_mode() == "plink2_pca":
-                pcs_df = dosage_df[["FID", "IID"]].copy()
+                pcs_df = sample_frame.copy()
             else:
                 pcs_df = _build_global_pcs(
                     mode_cfg=run_cfg.gwas.global_pcs,
                     adapter=adapter,
-                    dosage_df=dosage_df,
+                    sample_frame=sample_frame,
                     sample_ids=sample_ids,
                     sample_populations=sample_populations,
                     out_dir=run_dir / "tmp" / "global_pcs" / f"rep{replicate}" / cohort.name,
@@ -626,25 +655,29 @@ def run_simulation(
                         row_idx = np.where(np.char.upper(pops_arr.astype(str)) == pop_label)[0].astype(np.int64)
                         if int(row_idx.size) == 0:
                             continue
-                        sub_ids = [sample_ids[int(i)] for i in row_idx.tolist()]
-                        sub_pops = [sample_populations[int(i)] for i in row_idx.tolist()]
-                        t_geno = time.perf_counter()
-                        geno_u8 = adapter.export_genotypes_u8(
-                            sample_ids=sub_ids,
-                            sample_populations=sub_pops,
-                            variant_ids=variant_ids,
-                            out_dir=cohort_tmp,
-                            chromosomes=run_cfg.chromosomes,
-                        )
-                        _timed(
-                            "simulate.export_genotypes_u8",
-                            t_geno,
-                            replicate=int(replicate),
-                            cohort=str(cohort.name),
-                            population=str(pop_label),
-                            n_samples=int(len(sub_ids)),
-                            n_variants=int(len(variant_ids)),
-                        )
+                        if pop_label in la_genotypes_by_population:
+                            geno_u8 = la_genotypes_by_population[pop_label]
+                        else:
+                            sub_ids = [sample_ids[int(i)] for i in row_idx.tolist()]
+                            sub_pops = [sample_populations[int(i)] for i in row_idx.tolist()]
+                            t_geno = time.perf_counter()
+                            geno_u8 = adapter.export_genotypes_u8(
+                                sample_ids=sub_ids,
+                                sample_populations=sub_pops,
+                                variant_ids=variant_ids,
+                                out_dir=cohort_tmp,
+                                chromosomes=run_cfg.chromosomes,
+                            )
+                            _timed(
+                                "simulate.export_genotypes_u8",
+                                t_geno,
+                                replicate=int(replicate),
+                                cohort=str(cohort.name),
+                                population=str(pop_label),
+                                n_samples=int(len(sub_ids)),
+                                n_variants=int(len(variant_ids)),
+                            )
+                            la_genotypes_by_population[pop_label] = geno_u8
                         if pop_label not in beta_pivot.columns:
                             raise ValueError(f"Missing beta population column for homogeneous pop={pop_label}")
                         betas = beta_pivot.loc[variant_ids, pop_label].to_numpy(dtype=np.float32)
@@ -657,7 +690,7 @@ def run_simulation(
                         la_input = ArchitectureInput(
                             sample_ids=list(admix_sample_ids),
                             sample_populations=["ADMIX"] * len(admix_sample_ids),
-                            dosage_df=pd.DataFrame({"FID": list(admix_sample_ids), "IID": list(admix_sample_ids)}),
+                            dosage_df=_sample_frame(list(admix_sample_ids)),
                             haplotypes=admix_haplotypes,
                             local_ancestry_codes=admix_local_ancestry_codes,
                             ancestry_order=list(run_cfg.local_ancestry.ancestry_order),
@@ -687,9 +720,8 @@ def run_simulation(
                         ArchitectureInput(
                             sample_ids=sample_ids,
                             sample_populations=sample_populations,
-                            dosage_df=dosage_df,
-                            haplotypes=haplotypes,
-                            local_ancestry_codes=local_ancestry_codes,
+                            dosage_df=sample_frame,
+                            genotype_matrix=genotype_matrix,
                             ancestry_order=None,
                             la_chunk_n_samples=None,
                             la_chunk_n_variants=None,
@@ -718,7 +750,8 @@ def run_simulation(
                 genetic_bg_raw = _build_background_component(
                     run_cfg=run_cfg,
                     sample_ids=sample_ids,
-                    dosage_df=dosage_df,
+                    dosage_df=None,
+                    genotype_matrix=genotype_matrix,
                     cache_key=f"{cohort.name}",
                     replicate_seed=bg_seed,
                     kinship_cache=kinship_cache,

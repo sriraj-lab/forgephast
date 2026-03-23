@@ -68,6 +68,7 @@ def test_plink2_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert Path(result.primary_output).exists()
     assert "--chr" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--chr") + 1] == "1,3"
+    assert "--covar-variance-standardize" in captured["cmd"]
 
 
 def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
@@ -154,6 +155,64 @@ def test_merge_covariates_for_gwas_allows_ids_only(tmp_path: Path) -> None:
     assert list(out_df.columns) == ["FID", "IID"]
 
 
+def test_merge_covariates_for_gwas_drops_age_when_age_centered_present(tmp_path: Path) -> None:
+    cov_path = tmp_path / "cov.tsv"
+    pcs_path = tmp_path / "pcs.tsv"
+    out_path = tmp_path / "merged.tsv"
+    pd.DataFrame(
+        {
+            "FID": ["s1", "s2"],
+            "IID": ["s1", "s2"],
+            "age": [30, 40],
+            "age_centered": [-20, -10],
+            "sex": [0, 1],
+        }
+    ).to_csv(cov_path, sep="\t", index=False)
+    pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"], "PC1": [0.1, -0.2]}).to_csv(
+        pcs_path, sep="\t", index=False
+    )
+
+    covars = merge_covariates_for_gwas(str(cov_path), str(pcs_path), out_path)
+    out_df = pd.read_csv(out_path, sep="\t")
+
+    assert "age" not in covars
+    assert covars == ["age_centered", "sex", "PC1"]
+    assert "age" not in out_df.columns
+
+
+def test_merge_covariates_for_gwas_drops_constant_and_population_code_with_pcs(tmp_path: Path) -> None:
+    cov_path = tmp_path / "cov.tsv"
+    pcs_path = tmp_path / "pcs.tsv"
+    out_path = tmp_path / "merged.tsv"
+    pd.DataFrame(
+        {
+            "FID": ["s1", "s2", "s3"],
+            "IID": ["s1", "s2", "s3"],
+            "age_centered": [0, 1, -1],
+            "sex": [0, 1, 0],
+            "admix_indicator": [0, 0, 0],
+            "population_code": [0, 1, 2],
+        }
+    ).to_csv(cov_path, sep="\t", index=False)
+    pd.DataFrame(
+        {
+            "FID": ["s1", "s2", "s3"],
+            "IID": ["s1", "s2", "s3"],
+            "PC1": [0.1, -0.2, 0.3],
+            "PC2": [0.4, -0.5, 0.6],
+        }
+    ).to_csv(pcs_path, sep="\t", index=False)
+
+    covars = merge_covariates_for_gwas(str(cov_path), str(pcs_path), out_path)
+    out_df = pd.read_csv(out_path, sep="\t")
+
+    assert "admix_indicator" not in covars
+    assert "population_code" not in covars
+    assert covars == ["age_centered", "sex", "PC1", "PC2"]
+    assert "admix_indicator" not in out_df.columns
+    assert "population_code" not in out_df.columns
+
+
 def test_plink2_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path) -> None:
     task = _make_task(tmp_path)
     pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}).to_csv(
@@ -180,6 +239,10 @@ def test_plink2_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path) 
     assert result.engine == "plink2"
     assert "--covar" not in captured["cmd"]
     assert "--covar-name" not in captured["cmd"]
+    assert "--covar-variance-standardize" not in captured["cmd"]
+    assert "--glm" in captured["cmd"]
+    glm_idx = captured["cmd"].index("--glm")
+    assert captured["cmd"][glm_idx + 1 : glm_idx + 3] == ["hide-covar", "allow-no-covars"]
 
 
 def test_regenie_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path) -> None:

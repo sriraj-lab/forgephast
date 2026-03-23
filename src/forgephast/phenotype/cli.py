@@ -29,7 +29,7 @@ from .._internal.cache import bump_counter, canonical_hash, counter_delta, snaps
 from .config import RunConfig
 from .data.genotypes import build_genotype_adapter
 from .data.global_pcs import refresh_manifest_global_pcs
-from .data.pgen_export import export_manifest_pgens
+from .data.pgen_export import ensure_manifest_non_monomorphic_pgens, export_manifest_pgens
 from .grid import (
     build_grouped_cases,
     execute_group,
@@ -82,6 +82,29 @@ def _write_stage_timing(
         out_path,
     )
     return out_path
+
+
+def _pgen_triplet_exists(prefix: str | Path) -> bool:
+    base = Path(prefix)
+    return all(Path(f"{base}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
+
+
+def _manifest_has_ready_pgens(manifest_df: pd.DataFrame) -> bool:
+    if "pgen_prefix" not in manifest_df.columns:
+        return False
+    prefixes = manifest_df["pgen_prefix"].fillna("").astype(str).str.strip()
+    if prefixes.empty or (prefixes == "").any():
+        return False
+    return all(_pgen_triplet_exists(prefix) for prefix in prefixes.tolist())
+
+
+def _manifest_has_ready_global_pcs(manifest_df: pd.DataFrame) -> bool:
+    if "global_pcs_file" not in manifest_df.columns:
+        return False
+    paths = manifest_df["global_pcs_file"].fillna("").astype(str).str.strip()
+    if paths.empty or (paths == "").any():
+        return False
+    return all(Path(path).exists() for path in paths.tolist())
 
 
 
@@ -360,27 +383,41 @@ def _prepare_manifest_for_gwas(
     """Prepare manifest for GWAS (HapStore export + global PCA refresh)."""
     stage_rows: list[dict[str, Any]] = []
     current = manifest_path
-    t0 = time.perf_counter()
-    logger.info("[prep] exporting HapStore cohorts to PGEN")
-    current = export_manifest_pgens(config, current, runtime_cache=runtime_state)
-    stage_rows.append(
-        {
-            "stage": "hapstore_export",
-            "elapsed_seconds": float(time.perf_counter() - t0),
-        }
-    )
-    logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
-    if config.gwas.global_pcs.canonical_mode() in {"plink2_pca", "precomputed"}:
-        t1 = time.perf_counter()
-        logger.info("[prep] refreshing global PCs from manifest PGENs")
-        current = refresh_manifest_global_pcs(config, current, runtime_cache=runtime_state)
+    manifest_df = pd.read_csv(manifest_path, sep="\t")
+
+    if _manifest_has_ready_pgens(manifest_df):
+        logger.info("[prep] detected ready PGEN prefixes in manifest=%s; skipping HapStore export", manifest_path)
+    else:
+        t0 = time.perf_counter()
+        logger.info("[prep] exporting HapStore cohorts to PGEN")
+        current = export_manifest_pgens(config, current, runtime_cache=runtime_state)
         stage_rows.append(
             {
-                "stage": "refresh_global_pcs",
-                "elapsed_seconds": float(time.perf_counter() - t1),
+                "stage": "hapstore_export",
+                "elapsed_seconds": float(time.perf_counter() - t0),
             }
         )
-        logger.info("PREP_STAGE_DONE run=%s stage=refresh_global_pcs", config.name)
+        logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
+        manifest_df = pd.read_csv(current, sep="\t")
+    if config.gwas.global_pcs.canonical_mode() in {"plink2_pca", "precomputed"}:
+        filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
+        if not filtered_manifest_df.equals(manifest_df):
+            current = current.parent / "run_manifest_pgen.tsv"
+            filtered_manifest_df.to_csv(current, sep="\t", index=False)
+            manifest_df = filtered_manifest_df
+        if _manifest_has_ready_global_pcs(manifest_df):
+            logger.info("[prep] detected ready global PCs in manifest=%s; skipping PCA refresh", current)
+        else:
+            t1 = time.perf_counter()
+            logger.info("[prep] refreshing global PCs from manifest PGENs")
+            current = refresh_manifest_global_pcs(config, current, runtime_cache=runtime_state)
+            stage_rows.append(
+                {
+                    "stage": "refresh_global_pcs",
+                    "elapsed_seconds": float(time.perf_counter() - t1),
+                }
+            )
+            logger.info("PREP_STAGE_DONE run=%s stage=refresh_global_pcs", config.name)
     return current, stage_rows
 
 

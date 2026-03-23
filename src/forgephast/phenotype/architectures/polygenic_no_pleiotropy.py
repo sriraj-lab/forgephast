@@ -37,6 +37,22 @@ class PolygenicNoPleiotropyPlugin(ArchitecturePlugin):
     """Polygenic sum across selected variants with population-specific betas."""
 
     @staticmethod
+    def _build_effects_detail(data: ArchitectureInput) -> pd.DataFrame:
+        variant_col = data.variant_id_column
+        effects_detail = data.membership_df[
+            [variant_col, "maf_bucket", "membership_type", "replicate"]
+        ].merge(
+            data.beta_df,
+            left_on=variant_col,
+            right_on="variant_id",
+            how="left",
+        )
+        if variant_col != "variant_id":
+            effects_detail = effects_detail.drop(columns=["variant_id"])
+            effects_detail = effects_detail.rename(columns={variant_col: "variant_id"})
+        return effects_detail
+
+    @staticmethod
     def _compute_local_ancestry_genetic_component(data: ArchitectureInput) -> np.ndarray:
         if data.haplotypes is None or data.local_ancestry_codes is None:
             raise ValueError("Local ancestry component requires haplotypes and local_ancestry_codes")
@@ -121,19 +137,26 @@ class PolygenicNoPleiotropyPlugin(ArchitecturePlugin):
         if data.haplotypes is not None and data.local_ancestry_codes is not None:
             genetic = self._compute_local_ancestry_genetic_component(data)
         else:
-            for variant_id in variants:
-                if variant_id not in data.dosage_df.columns:
-                    raise ValueError(f"Missing dosage column for selected variant: {variant_id}")
-
             beta_pivot = data.beta_df.pivot(index="variant_id", columns="population", values="beta")
             missing_beta_variants = [v for v in variants if v not in beta_pivot.index]
             if missing_beta_variants:
                 raise ValueError(f"Missing betas for variants: {missing_beta_variants[:5]}")
 
+            if data.genotype_matrix is not None:
+                dosage_matrix = np.asarray(data.genotype_matrix, dtype=np.float32)
+                if dosage_matrix.shape != (len(data.sample_ids), len(variants)):
+                    raise ValueError(
+                        "genotype_matrix shape mismatch: "
+                        f"got {dosage_matrix.shape}, expected {(len(data.sample_ids), len(variants))}"
+                    )
+            else:
+                for variant_id in variants:
+                    if variant_id not in data.dosage_df.columns:
+                        raise ValueError(f"Missing dosage column for selected variant: {variant_id}")
+                dosage_matrix = data.dosage_df[variants].to_numpy(dtype=np.float32, copy=False)
+
             sample_count = len(data.sample_ids)
             genetic = np.zeros(sample_count, dtype=float)
-
-            dosage_matrix = data.dosage_df[variants].to_numpy(dtype=float)
             populations = np.asarray(data.sample_populations, dtype=object)
             for pop in np.unique(populations):
                 if pop not in beta_pivot.columns:
@@ -141,19 +164,7 @@ class PolygenicNoPleiotropyPlugin(ArchitecturePlugin):
                 row_idx = np.where(populations == pop)[0]
                 if row_idx.size == 0:
                     continue
-                betas = beta_pivot.loc[variants, pop].to_numpy(dtype=float)
+                betas = beta_pivot.loc[variants, pop].to_numpy(dtype=np.float32)
                 genetic[row_idx] = dosage_matrix[row_idx, :] @ betas
 
-        effects_detail = data.membership_df[
-            [variant_col, "maf_bucket", "membership_type", "replicate"]
-        ].merge(
-            data.beta_df,
-            left_on=variant_col,
-            right_on="variant_id",
-            how="left",
-        )
-        if variant_col != "variant_id":
-            effects_detail = effects_detail.drop(columns=["variant_id"])
-            effects_detail = effects_detail.rename(columns={variant_col: "variant_id"})
-
-        return genetic, effects_detail
+        return genetic, self._build_effects_detail(data)

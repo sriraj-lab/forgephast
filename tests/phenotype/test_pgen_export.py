@@ -7,7 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 from forgephast.phenotype.config import RunConfig
-from forgephast.phenotype.data.pgen_export import export_manifest_pgens
+from forgephast.phenotype.data.pgen_export import (
+    _normalize_fid_for_exported_pgen,
+    export_manifest_pgens,
+)
 
 
 class _FakeAdapter:
@@ -141,12 +144,18 @@ def test_export_manifest_pgens_updates_manifest(monkeypatch, tmp_path: Path) -> 
 
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int) -> str:
+        out_prefix = Path(f"{prefix}.maf_gt0")
+        for ext in (".pgen", ".pvar", ".psam"):
+            Path(f"{out_prefix}{ext}").write_text("", encoding="utf-8")
+        return str(out_prefix)
+    monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
 
     out_manifest = export_manifest_pgens(cfg, manifest_path)
     assert out_manifest.exists()
     out = pd.read_csv(out_manifest, sep="\t")
-    assert out.loc[0, "pgen_prefix"] != ""
-    assert out.loc[0, "exported_pgen_prefix"] == out.loc[0, "pgen_prefix"]
+    assert out.loc[0, "pgen_prefix"].endswith(".maf_gt0")
+    assert out.loc[0, "exported_pgen_prefix"] != out.loc[0, "pgen_prefix"]
     assert len(fake.calls) == 1
     assert fake.calls[0]["variant_ids"] == ["chr1:10", "chr1:20"]
 
@@ -187,6 +196,12 @@ def test_export_manifest_pgens_reuses_identical_exports_in_memory(
 
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int) -> str:
+        out_prefix = Path(f"{prefix}.maf_gt0")
+        for ext in (".pgen", ".pvar", ".psam"):
+            Path(f"{out_prefix}{ext}").write_text("", encoding="utf-8")
+        return str(out_prefix)
+    monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
 
     runtime_cache: dict[str, object] = {}
     out_manifest = export_manifest_pgens(cfg, manifest_path, runtime_cache=runtime_cache)
@@ -195,7 +210,20 @@ def test_export_manifest_pgens_reuses_identical_exports_in_memory(
     assert len(fake.calls) == 1
     assert out["pgen_prefix"].nunique() == 1
     assert out["exported_pgen_prefix"].nunique() == 1
+    assert out["pgen_prefix"].iloc[0].endswith(".maf_gt0")
 
     export_manifest_pgens(cfg, manifest_path, runtime_cache=runtime_cache)
     assert len(fake.calls) == 1
     assert runtime_cache["cache_hits"]["pgen_export"] == 2
+
+
+def test_normalize_fid_for_exported_pgen_sets_fid_to_iid(tmp_path: Path) -> None:
+    table = tmp_path / "phenotype.tsv"
+    table.write_text(
+        "FID\tIID\tPHENO\n0\ts1\t1.2\n0\ts2\t-0.4\n",
+        encoding="utf-8",
+    )
+    _normalize_fid_for_exported_pgen(str(table))
+    out = pd.read_csv(table, sep="\t")
+    assert out["FID"].astype(str).tolist() == ["s1", "s2"]
+    assert out["IID"].astype(str).tolist() == ["s1", "s2"]
