@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forgephast"
-version = "0.4.0"
+version = "0.4.1"
 description = "HapStore-native population amplifier and polygenic phenotype simulator"
 requires-python = ">=3.10"
 license = "MIT"

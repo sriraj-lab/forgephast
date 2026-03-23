@@ -206,3 +206,63 @@ def test_linear_metrics_returns_nan_for_degenerate_null_fit() -> None:
     assert pd.isna(intercept)
     assert pd.isna(corr)
     assert pd.isna(sign)
+
+
+def test_build_roundtrip_report_ids_only_reuses_base_truth(tmp_path: Path) -> None:
+    payload = _base_payload(tmp_path)
+    payload["name"] = "rt_unit__ids_only"
+    cfg = RunConfig.from_dict(payload)
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    base_truth_dir = run_dir.parent / "rt_unit" / "truth"
+    base_truth_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        {
+            "variant_id": ["chr1:10", "chr1:20", "chr1:10", "chr1:20"],
+            "population": ["EUR", "EUR", "AFR", "AFR"],
+            "beta": [0.5, -0.4, 0.5, -0.4],
+            "dosage_effect_allele": ["A", "G", "A", "G"],
+            "architecture": ["a1", "a1", "a1", "a1"],
+            "cohort": ["c1", "c1", "c1", "c1"],
+            "replicate": [1, 1, 1, 1],
+        }
+    ).to_csv(base_truth_dir / "effect_sizes.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        {
+            "causal_id": ["chr1:10", "chr1:20"],
+            "replicate": [1, 1],
+            "architecture": ["a1", "a1"],
+            "cohort": ["c1", "c1"],
+        }
+    ).to_csv(base_truth_dir / "causal_membership.tsv", sep="\t", index=False)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    assoc_path = run_dir / "assoc.tsv"
+    pd.DataFrame(
+        {
+            "ID": ["chr1:10", "chr1:20"],
+            "A1": ["A", "A"],
+            "BETA": [0.45, 0.35],
+            "P": [1e-9, 2e-8],
+        }
+    ).to_csv(assoc_path, sep="\t", index=False)
+    gwas_manifest_path = run_dir / "gwas_manifest.tsv"
+    pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "engine": ["plink2"],
+            "status": ["success"],
+            "primary_output": [str(assoc_path)],
+        }
+    ).to_csv(gwas_manifest_path, sep="\t", index=False)
+
+    report_path = build_roundtrip_report(
+        run_cfg=cfg,
+        run_dir=run_dir,
+        gwas_manifest_path=gwas_manifest_path,
+    )
+
+    assert report_path.exists()

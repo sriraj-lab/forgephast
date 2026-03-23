@@ -38,6 +38,7 @@ from .grid import (
     write_grid_manifest,
 )
 from .gwas import GwasTask
+from .gwas.base import prepare_manifest_covariates_for_gwas
 from .gwas.registry import available_engine_names, build_engines
 from .io.write_outputs import write_simulation_outputs
 from .phenotypes.simulate import run_simulation
@@ -102,6 +103,15 @@ def _manifest_has_ready_global_pcs(manifest_df: pd.DataFrame) -> bool:
     if "global_pcs_file" not in manifest_df.columns:
         return False
     paths = manifest_df["global_pcs_file"].fillna("").astype(str).str.strip()
+    if paths.empty or (paths == "").any():
+        return False
+    return all(Path(path).exists() for path in paths.tolist())
+
+
+def _manifest_has_ready_merged_covariates(manifest_df: pd.DataFrame) -> bool:
+    if "merged_covariates_file" not in manifest_df.columns:
+        return False
+    paths = manifest_df["merged_covariates_file"].fillna("").astype(str).str.strip()
     if paths.empty or (paths == "").any():
         return False
     return all(Path(path).exists() for path in paths.tolist())
@@ -234,6 +244,7 @@ def _manifest_to_tasks(manifest_df: pd.DataFrame, chromosomes: List[int]) -> Lis
                 covariates_file=str(row["covariates_file"]),
                 global_pcs_file=str(row["global_pcs_file"]),
                 output_dir=str(row["output_dir"]),
+                merged_covariates_file=str(row.get("merged_covariates_file", "")),
                 chromosomes=list(chromosomes),
             )
         )
@@ -294,6 +305,18 @@ def _run_gwas(
             jobs.append((idx, task, engine_name, engine))
             idx += 1
 
+    for task, engine_name in [(task, engine_name) for task in tasks for engine_name in engines]:
+        task_out_dir = Path(task.output_dir) / "gwas" / engine_name
+        logger.info(
+            "GWAS_MONITOR run=%s rep=%d arch=%s cohort=%s engine=%s output_dir=%s",
+            task.run_name,
+            int(task.replicate),
+            task.architecture,
+            task.cohort,
+            engine_name,
+            task_out_dir,
+        )
+
     def _run_one(job: tuple[int, GwasTask, str, object]) -> tuple[int, dict[str, Any]]:
         job_idx, task, engine_name, engine = job
         task_out_dir = Path(task.output_dir) / "gwas" / engine_name
@@ -323,6 +346,16 @@ def _run_gwas(
                 "primary_output": str(result.primary_output),
             }
             row.update(dict(result.metadata))
+            logger.info(
+                "GWAS_JOB_DONE run=%s rep=%d arch=%s cohort=%s engine=%s output_dir=%s primary_output=%s",
+                task.run_name,
+                int(task.replicate),
+                task.architecture,
+                task.cohort,
+                engine_name,
+                result.output_dir,
+                result.primary_output,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("[gwas] failure for engine=%s task=%s", engine_name, task)
             row = {
@@ -400,11 +433,12 @@ def _prepare_manifest_for_gwas(
         logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
         manifest_df = pd.read_csv(current, sep="\t")
     if config.gwas.global_pcs.canonical_mode() in {"plink2_pca", "precomputed"}:
-        filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
-        if not filtered_manifest_df.equals(manifest_df):
-            current = current.parent / "run_manifest_pgen.tsv"
-            filtered_manifest_df.to_csv(current, sep="\t", index=False)
-            manifest_df = filtered_manifest_df
+        if config.pgen_export.prep_mode == "legacy_whole_store":
+            filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
+            if not filtered_manifest_df.equals(manifest_df):
+                current = current.parent / "run_manifest_pgen.tsv"
+                filtered_manifest_df.to_csv(current, sep="\t", index=False)
+                manifest_df = filtered_manifest_df
         if _manifest_has_ready_global_pcs(manifest_df):
             logger.info("[prep] detected ready global PCs in manifest=%s; skipping PCA refresh", current)
         else:
@@ -418,6 +452,22 @@ def _prepare_manifest_for_gwas(
                 }
             )
             logger.info("PREP_STAGE_DONE run=%s stage=refresh_global_pcs", config.name)
+            manifest_df = pd.read_csv(current, sep="\t")
+    if _manifest_has_ready_merged_covariates(manifest_df):
+        logger.info("[prep] detected ready merged GWAS covariates in manifest=%s; skipping covariate prep", current)
+    else:
+        t2 = time.perf_counter()
+        logger.info("[prep] preparing one-time merged GWAS covariates")
+        manifest_df = prepare_manifest_covariates_for_gwas(manifest_df)
+        current = current.parent / current.name.replace(".tsv", "_prepared.tsv")
+        manifest_df.to_csv(current, sep="\t", index=False)
+        stage_rows.append(
+            {
+                "stage": "prepare_gwas_covariates",
+                "elapsed_seconds": float(time.perf_counter() - t2),
+            }
+        )
+        logger.info("PREP_STAGE_DONE run=%s stage=prepare_gwas_covariates", config.name)
     return current, stage_rows
 
 

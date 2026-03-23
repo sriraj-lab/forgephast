@@ -8,6 +8,7 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,14 @@ class ExportTask:
     cache_key: str
 
 
+@dataclass
+class ExportArtifacts:
+    """Resolved PGEN artifacts for one cohort/replicate export unit."""
+
+    pgen_prefix: str
+    chrom_pgen_manifest: dict[int, str]
+
+
 def _pgen_triplet_exists(prefix: str | Path) -> bool:
     base = Path(prefix)
     return all(Path(f"{base}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
@@ -65,7 +74,20 @@ def _count_pvar_variants(pvar_path: Path) -> int:
     return max(0, count)
 
 
-def _filter_zero_maf_pgen(prefix: str | Path, *, plink2_path: str, threads: int) -> str:
+def _plink_memory_args(run_cfg: RunConfig) -> list[str]:
+    memory_mb = getattr(run_cfg.gwas.plink2, "memory_mb", None)
+    if memory_mb is None:
+        return []
+    return ["--memory", str(int(memory_mb))]
+
+
+def _filter_zero_maf_pgen(
+    prefix: str | Path,
+    *,
+    plink2_path: str,
+    threads: int,
+    memory_mb: int | None = None,
+) -> str:
     """Create a filtered PGEN with monomorphic variants removed."""
     input_prefix = Path(prefix)
     if input_prefix.name.endswith(".maf_gt0"):
@@ -89,9 +111,10 @@ def _filter_zero_maf_pgen(prefix: str | Path, *, plink2_path: str, threads: int)
         "--make-pgen",
         "--threads",
         str(max(1, int(threads))),
-        "--out",
-        str(tmp_prefix),
     ]
+    if memory_mb is not None:
+        cmd.extend(["--memory", str(int(memory_mb))])
+    cmd.extend(["--out", str(tmp_prefix)])
     logger.info("Filtering monomorphic variants from PGEN: %s", " ".join(cmd))
     completed = subprocess.run(cmd, capture_output=True, text=True)
     if completed.returncode != 0:
@@ -126,11 +149,22 @@ def _filter_zero_maf_pgen(prefix: str | Path, *, plink2_path: str, threads: int)
     return str(filtered_prefix)
 
 
+def _filter_zero_maf_pgen_for_config(prefix: str | Path, run_cfg: RunConfig) -> str:
+    return _filter_zero_maf_pgen(
+        prefix,
+        plink2_path=str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path),
+        threads=max(1, int(run_cfg.gwas.plink2.threads)),
+        memory_mb=getattr(run_cfg.gwas.plink2, "memory_mb", None),
+    )
+
+
 def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.DataFrame) -> pd.DataFrame:
     """Rewrite manifest PGEN prefixes to monomorphic-filtered exports."""
     if "pgen_prefix" not in manifest_df.columns:
         raise ValueError("Manifest missing pgen_prefix for monomorphic filtering")
     filtered_df = manifest_df.copy()
+    if "merged_pgen_prefix" not in filtered_df.columns:
+        filtered_df["merged_pgen_prefix"] = filtered_df["pgen_prefix"].fillna("").astype(str)
     if "filtered_pgen_prefix" not in filtered_df.columns:
         filtered_df["filtered_pgen_prefix"] = ""
 
@@ -346,13 +380,100 @@ def _build_export_cache_key(
             "chromosomes": [int(chrom) for chrom in run_cfg.chromosomes],
             "plink2_path": str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path),
             "merge_threads": int(run_cfg.gwas.plink2.threads),
+            "plink2_memory_mb": getattr(run_cfg.gwas.plink2, "memory_mb", None),
+            "prep_mode": str(run_cfg.pgen_export.prep_mode),
             "concat_workers": int(run_cfg.pgen_export.concat_workers),
             "pgen_shard_workers": int(run_cfg.pgen_export.pgen_shard_workers),
         }
     )
 
 
-def _export_one_task(task: ExportTask, run_cfg: RunConfig, merge_cfg: SimpleNamespace) -> str:
+def _variant_ids_by_chrom(
+    variant_ids: list[str] | None,
+) -> dict[int, list[str]]:
+    by_chrom: dict[int, list[str]] = {}
+    if variant_ids is None:
+        return by_chrom
+    for variant_id in variant_ids:
+        prefix, _, rest = str(variant_id).partition(":")
+        chrom_text = prefix.replace("chr", "", 1)
+        if not chrom_text or not rest:
+            continue
+        by_chrom.setdefault(int(chrom_text), []).append(str(variant_id))
+    return by_chrom
+
+
+def _expected_filtered_chrom_prefix(out_prefix: Path, chrom: int) -> Path:
+    chrom_root = out_prefix.parent / "chrom"
+    chrom_root.mkdir(parents=True, exist_ok=True)
+    return chrom_root / f"{out_prefix.name}.chr{int(chrom)}.maf_gt0"
+
+
+def _merge_filtered_chrom_pgens(
+    *,
+    chrom_prefixes: dict[int, str],
+    out_prefix: Path,
+    run_cfg: RunConfig,
+) -> str:
+    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    if not chrom_prefixes:
+        raise ValueError("No chromosome-level PGEN prefixes available for merge")
+
+    ordered = [Path(chrom_prefixes[chrom]) for chrom in sorted(chrom_prefixes)]
+    if _pgen_triplet_exists(out_prefix):
+        normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
+        return str(out_prefix)
+
+    if len(ordered) == 1:
+        src = ordered[0]
+        for ext in (".pgen", ".pvar", ".psam"):
+            shutil.copy2(f"{src}{ext}", f"{out_prefix}{ext}")
+        normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
+        return str(out_prefix)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".pmerge.list",
+        delete=False,
+        encoding="utf-8",
+    ) as handle:
+        merge_list = Path(handle.name)
+        for prefix in ordered:
+            handle.write(f"{prefix}\n")
+
+    merge_threads = max(1, int(run_cfg.pgen_export.concat_workers))
+    cmd = [
+        str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path),
+        "--threads",
+        str(merge_threads),
+        "--pmerge-list",
+        str(merge_list),
+        "pfile",
+        "--indiv-sort",
+        "none",
+        "--make-pgen",
+        *(_plink_memory_args(run_cfg)),
+        "--out",
+        str(out_prefix),
+    ]
+    logger.info("[hapstore-export] merging chromosome PGENs: %s", " ".join(cmd))
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "PLINK2 --pmerge-list failed during chromosome-level merge\n"
+                f"CMD: {' '.join(cmd)}\n"
+                f"STDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
+    finally:
+        merge_list.unlink(missing_ok=True)
+
+    normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
+    return str(out_prefix)
+
+
+def _export_one_task_legacy(task: ExportTask, run_cfg: RunConfig, merge_cfg: SimpleNamespace) -> str:
     adapter = build_genotype_adapter(
         hapstore_cfg=run_cfg.genotype_input.hapstore,
     )
@@ -365,6 +486,46 @@ def _export_one_task(task: ExportTask, run_cfg: RunConfig, merge_cfg: SimpleName
         variant_ids=task.variant_ids,
         export_cfg=merge_cfg,
     )
+
+
+def _export_one_task_per_chrom(
+    task: ExportTask,
+    run_cfg: RunConfig,
+    merge_cfg: SimpleNamespace,
+) -> ExportArtifacts:
+    adapter = build_genotype_adapter(hapstore_cfg=run_cfg.genotype_input.hapstore)
+    adapter.validate_files()
+
+    variant_ids_by_chrom = _variant_ids_by_chrom(task.variant_ids)
+    chrom_prefixes: dict[int, str] = {}
+    for chrom in [int(chrom) for chrom in run_cfg.chromosomes]:
+        requested_ids = variant_ids_by_chrom.get(chrom) if task.variant_ids is not None else None
+        if task.variant_ids is not None and not requested_ids:
+            continue
+        filtered_prefix = _expected_filtered_chrom_prefix(task.out_prefix, chrom)
+        if _pgen_triplet_exists(filtered_prefix):
+            normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
+            chrom_prefixes[chrom] = str(filtered_prefix)
+            continue
+
+        raw_prefix = filtered_prefix.with_name(filtered_prefix.name.removesuffix(".maf_gt0"))
+        if not _pgen_triplet_exists(raw_prefix):
+            adapter.export_to_pgen(
+                sample_ids=task.sample_ids,
+                sample_populations=task.sample_populations,
+                out_prefix=raw_prefix,
+                chromosomes=[chrom],
+                variant_ids=None if requested_ids is None else list(requested_ids),
+                export_cfg=merge_cfg,
+            )
+        chrom_prefixes[chrom] = _filter_zero_maf_pgen_for_config(raw_prefix, run_cfg)
+
+    merged_prefix = _merge_filtered_chrom_pgens(
+        chrom_prefixes=chrom_prefixes,
+        out_prefix=task.out_prefix,
+        run_cfg=run_cfg,
+    )
+    return ExportArtifacts(pgen_prefix=merged_prefix, chrom_pgen_manifest=chrom_prefixes)
 
 
 def export_manifest_pgens(
@@ -384,6 +545,12 @@ def export_manifest_pgens(
     manifest_df["pgen_prefix"] = manifest_df["pgen_prefix"].fillna("").astype(str)
     if "exported_pgen_prefix" not in manifest_df.columns:
         manifest_df["exported_pgen_prefix"] = ""
+    if "merged_pgen_prefix" not in manifest_df.columns:
+        manifest_df["merged_pgen_prefix"] = ""
+    if "chrom_pgen_manifest" not in manifest_df.columns:
+        manifest_df["chrom_pgen_manifest"] = ""
+    if "filtered_pgen_prefix" not in manifest_df.columns:
+        manifest_df["filtered_pgen_prefix"] = ""
 
     truth_membership_path = manifest_path.parent / "truth" / "causal_membership.tsv"
     if not truth_membership_path.exists():
@@ -460,18 +627,32 @@ def export_manifest_pgens(
         pgen_shard_workers=max(1, int(run_cfg.pgen_export.pgen_shard_workers)),
     )
 
-    export_cache: dict[str, str] | None = None
+    export_cache: dict[str, Any] | None = None
     if runtime_cache is not None and bool(run_cfg.pgen_export.reuse_exports):
         export_cache = runtime_cache.setdefault("pgen_export_cache", {})
 
     pending_unique: dict[str, ExportTask] = {}
-    resolved_prefix_by_key: dict[str, str] = {}
+    resolved_artifacts_by_key: dict[str, ExportArtifacts] = {}
     for task in tasks:
         if export_cache is not None and task.cache_key in export_cache:
-            cached_prefix = export_cache[task.cache_key]
-            if _pgen_triplet_exists(cached_prefix):
+            cached = export_cache[task.cache_key]
+            if isinstance(cached, str):
+                cached_artifacts = ExportArtifacts(pgen_prefix=cached, chrom_pgen_manifest={})
+            else:
+                cached_artifacts = ExportArtifacts(
+                    pgen_prefix=str(cached["pgen_prefix"]),
+                    chrom_pgen_manifest={
+                        int(chrom): str(prefix)
+                        for chrom, prefix in dict(cached.get("chrom_pgen_manifest", {})).items()
+                    },
+                )
+            chrom_ready = all(
+                _pgen_triplet_exists(prefix)
+                for prefix in cached_artifacts.chrom_pgen_manifest.values()
+            )
+            if _pgen_triplet_exists(cached_artifacts.pgen_prefix) and chrom_ready:
                 bump_counter(runtime_cache, hit=True, name="pgen_export")
-                resolved_prefix_by_key[task.cache_key] = cached_prefix
+                resolved_artifacts_by_key[task.cache_key] = cached_artifacts
                 continue
         bump_counter(runtime_cache, hit=False, name="pgen_export")
         if task.cache_key not in pending_unique:
@@ -494,11 +675,25 @@ def export_manifest_pgens(
                     task.cohort,
                     "all" if task.variant_ids is None else len(task.variant_ids),
                 )
-                resolved_prefix_by_key[task.cache_key] = _export_one_task(task, run_cfg, merge_cfg)
+                if run_cfg.pgen_export.prep_mode == "legacy_whole_store":
+                    prefix = _export_one_task_legacy(task, run_cfg, merge_cfg)
+                    resolved_artifacts_by_key[task.cache_key] = ExportArtifacts(
+                        pgen_prefix=prefix,
+                        chrom_pgen_manifest={},
+                    )
+                else:
+                    resolved_artifacts_by_key[task.cache_key] = _export_one_task_per_chrom(
+                        task, run_cfg, merge_cfg
+                    )
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 future_map = {
-                    executor.submit(_export_one_task, task, run_cfg, merge_cfg): task
+                    executor.submit(
+                        _export_one_task_legacy if run_cfg.pgen_export.prep_mode == "legacy_whole_store" else _export_one_task_per_chrom,
+                        task,
+                        run_cfg,
+                        merge_cfg,
+                    ): task
                     for task in pending_tasks
                 }
                 for future in concurrent.futures.as_completed(future_map):
@@ -509,14 +704,25 @@ def export_manifest_pgens(
                         task.cohort,
                         "all" if task.variant_ids is None else len(task.variant_ids),
                     )
-                    resolved_prefix_by_key[task.cache_key] = future.result()
+                    result = future.result()
+                    if isinstance(result, str):
+                        resolved_artifacts_by_key[task.cache_key] = ExportArtifacts(
+                            pgen_prefix=result,
+                            chrom_pgen_manifest={},
+                        )
+                    else:
+                        resolved_artifacts_by_key[task.cache_key] = result
 
-    for key, prefix in resolved_prefix_by_key.items():
+    for key, artifacts in resolved_artifacts_by_key.items():
         if export_cache is not None:
-            export_cache[key] = prefix
+            export_cache[key] = {
+                "pgen_prefix": artifacts.pgen_prefix,
+                "chrom_pgen_manifest": {str(chrom): prefix for chrom, prefix in artifacts.chrom_pgen_manifest.items()},
+            }
 
     for task in tasks:
-        exported_prefix = resolved_prefix_by_key[task.cache_key]
+        artifacts = resolved_artifacts_by_key[task.cache_key]
+        exported_prefix = artifacts.pgen_prefix
         mask = (
             (manifest_df["replicate"] == int(task.replicate))
             & (manifest_df["cohort"] == str(task.cohort))
@@ -535,8 +741,17 @@ def export_manifest_pgens(
 
         manifest_df.loc[mask, "pgen_prefix"] = str(exported_prefix)
         manifest_df.loc[mask, "exported_pgen_prefix"] = str(exported_prefix)
+        manifest_df.loc[mask, "merged_pgen_prefix"] = str(exported_prefix)
+        manifest_df.loc[mask, "filtered_pgen_prefix"] = str(exported_prefix)
+        manifest_df.loc[mask, "chrom_pgen_manifest"] = json.dumps(
+            {str(chrom): prefix for chrom, prefix in sorted(artifacts.chrom_pgen_manifest.items())},
+            sort_keys=True,
+        )
 
-    manifest_df = ensure_manifest_non_monomorphic_pgens(run_cfg, manifest_df)
+    if run_cfg.pgen_export.prep_mode == "legacy_whole_store":
+        manifest_df = ensure_manifest_non_monomorphic_pgens(run_cfg, manifest_df)
+        if "pgen_prefix" in manifest_df.columns:
+            manifest_df["merged_pgen_prefix"] = manifest_df["pgen_prefix"]
 
     out_manifest = manifest_path.parent / "run_manifest_pgen.tsv"
     manifest_df.to_csv(out_manifest, sep="\t", index=False)

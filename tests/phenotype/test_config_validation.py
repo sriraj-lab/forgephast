@@ -94,6 +94,8 @@ def test_valid_config_builds() -> None:
     payload = _base_payload()
     cfg = RunConfig.from_dict(payload)
     assert cfg.name == "unit_test"
+    assert cfg.pgen_export.prep_mode == "per_chrom_plink_merge"
+    assert cfg.gwas.global_pcs.prune_before_pca is True
 
 
 def test_effect_model_accepts_metapopulation_jitter_placeholder() -> None:

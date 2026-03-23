@@ -166,6 +166,23 @@ So changing `sigma_beta` or jitter settings affects the geometry of sampled effe
 
 For large round-trip GWAS runs, the main bottlenecks are usually genotype materialization and PCA refresh, not effect sampling.
 
+As of `v0.4.0`, the default phenotype GWAS prep path is now:
+
+1. per-chromosome HapStore -> PGEN export
+2. per-chromosome monomorphic filtering
+3. PLINK2 merge into one canonical genome-wide PGEN
+4. LD-pruned cached PCA on the merged PGEN
+5. one-time merged covariate preparation per `replicate x cohort`
+6. PLINK2 and/or REGENIE GWAS on the cached merged PGEN
+
+The legacy whole-store path is still available as a fallback with:
+
+- `pgen_export.prep_mode: legacy_whole_store`
+
+The staged-default production path is:
+
+- `pgen_export.prep_mode: per_chrom_plink_merge`
+
 ### Recommended prep architecture
 
 - Prefer chromosome-local preprocessing over one monolithic whole-genome prep stage.
@@ -182,10 +199,84 @@ This is the preferred direction because HapStore-to-PGEN export is reasonably ef
 - Per-chromosome PGEN surfaces are easier to cache and reuse than a large temporary merged HapStore.
 - Failures become easier to recover because a single chromosome can be regenerated without repeating the whole prep path.
 
+### Important note about HapStore direct-copy fast paths
+
+`forgephast` still relies on `hapstore.concat_hapstores()` for some intermediate sample-axis assembly before PGEN export. That concat step is much faster when `hapstore` can promote the work from blockwise NumPy copy to raw chunk-copy.
+
+That direct-copy fast path only triggers when the source and output HapStores are layout-compatible. In practice, the important conditions are:
+
+- same `chunk_variant_size`
+- same `chunk_haplotype_size`
+- same compressor and compression level
+- same dtype/filter/fill-value contract
+- no genotype sidecar write is requested during concat
+- sample-axis chunk boundaries line up exactly with the source-store boundaries being copied
+
+When those conditions are met, `hapstore` can copy chunk payloads directly instead of decoding and rewriting each `(hap_chunk, variant_chunk)` block through NumPy.
+
+When those conditions are not met, `forgephast` correctly falls back to the slower generic concat path.
+
+For future phenotype/GWAS-facing cohort regeneration, prefer stable shared chunking across populations if you want this fast path to apply consistently.
+
+### Best practices for fast sample-axis concat
+
+If you expect to use `forgephast phenotype` on a panel repeatedly, design the upstream HapStores for sample-axis concat from the start.
+
+Recommended defaults:
+
+- keep `chunk_variant_size` constant across all population stores for a chromosome
+- keep `chunk_haplotype_size` constant across all population stores for a chromosome
+- keep compressor type and compression level constant across all population stores
+- prefer sample/haplotype chunk sizes that divide each source population cleanly
+- for large phenotype/GWAS-facing cohorts, prefer larger variant chunks such as `chunk_variant_size: 1500`
+
+Why this matters:
+
+- most phenotype-prep concats are along the sample axis, not the variant axis
+- matching layout and codec settings maximize eligibility for raw chunk-copy instead of decode-copy-reencode
+- divisible sample/haplotype chunking reduces boundary chunks that span multiple source stores
+- larger variant chunks reduce metadata churn and the number of per-block copies on wide chromosomes
+
+In practice, the fastest `forgephast` prep path is:
+
+- standardized chunking
+- standardized compression
+- sample-axis chunk boundaries aligned to source cohort sizes
+- per-chromosome PGEN export and PLINK2 merge downstream
+
+### Where the new direct-copy concat path helps most
+
+The new `hapstore` fast path matters most in the intermediate sample-axis concat steps that happen before PGEN export.
+
+It is most likely to help in:
+
+- per-chromosome population stacking before phenotype/GWAS PGEN export
+  - for example, combining `AFR/EUR/CSA/EAS` chromosome stores into one temporary chromosome-local panel
+- repeated homogeneous-panel assembly where every population store was regenerated with the same layout contract
+- any workflow where concat is along the sample axis and the source stores are already chunk-aligned
+
+It is less relevant or unlikely to trigger in:
+
+- final genome-wide assembly, which now prefers PLINK2 merge on chromosome-level PGENs
+- variant-axis concat, where the current direct-copy optimization does not apply
+- concat runs that request genotype sidecar materialization during the copy
+- mixed-layout or mixed-compression stores
+- source cohorts whose sample counts force many boundary chunks to span multiple stores
+
+So the practical mental model is:
+
+- the fast path is mainly a speedup for the remaining HapStore sample-axis assembly that still exists inside the new PGEN-first prep flow
+- it is not a replacement for the downstream PLINK2 merge stage
+
 ### PCA guidance
 
 - Do not compute ancestry PCs from the full dense association panel unless you specifically need that behavior.
 - Prefer LD-pruned PCA over full-panel PCA for GWAS covariate generation.
+- The default PLINK2 PCA path now supports:
+  - `gwas.global_pcs.prune_before_pca`
+  - `gwas.global_pcs.prune_window_kb`
+  - `gwas.global_pcs.prune_step_variants`
+  - `gwas.global_pcs.prune_r2`
 - Cache the final PCA result by:
   - merged PGEN prefix
   - kept sample set

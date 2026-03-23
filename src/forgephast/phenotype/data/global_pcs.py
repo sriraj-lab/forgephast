@@ -81,6 +81,13 @@ def _write_plink2_keep_file(keep_file: Path, sample_ids: list[str], *, psam_path
                 handle.write(f"{iid}\n")
 
 
+def _plink_memory_args(run_cfg: RunConfig) -> list[str]:
+    memory_mb = getattr(run_cfg.gwas.plink2, "memory_mb", None)
+    if memory_mb is None:
+        return []
+    return ["--memory", str(int(memory_mb))]
+
+
 def _randomized_svd_compat(
     x: np.ndarray,
     *,
@@ -285,6 +292,7 @@ def _run_plink2_pca(
     n_components: int,
     out_dir: Path,
     mode_cfg: object,
+    memory_mb: int | None = None,
     chromosomes: Sequence[int] | None = None,
 ) -> pd.DataFrame:
     """Run PLINK2 --pca directly on an exported PGEN prefix."""
@@ -301,9 +309,42 @@ def _run_plink2_pca(
         pca_args.append("approx")
 
     cmd = [plink2_path, "--pfile", pgen_prefix, "--keep", str(keep_file)]
+    prune_before_pca = bool(getattr(mode_cfg, "prune_before_pca", True))
+    if prune_before_pca:
+        prune_prefix = out_dir / "ld_prune"
+        prune_cmd = [plink2_path, "--pfile", pgen_prefix, "--keep", str(keep_file)]
+        if chromosomes:
+            prune_cmd.extend(["--chr", ",".join(str(int(c)) for c in chromosomes)])
+        prune_cmd.extend(
+            [
+                "--indep-pairwise",
+                f"{int(getattr(mode_cfg, 'prune_window_kb', 1000))}kb",
+                str(int(getattr(mode_cfg, "prune_step_variants", 50))),
+                str(float(getattr(mode_cfg, "prune_r2", 0.1))),
+            ]
+        )
+        if memory_mb is not None:
+            prune_cmd.extend(["--memory", str(int(memory_mb))])
+        prune_cmd.extend(["--out", str(prune_prefix)])
+        logger.info("Computing LD prune set with PLINK2: %s", " ".join(prune_cmd))
+        completed = subprocess.run(prune_cmd, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "PLINK2 LD pruning failed\n"
+                f"CMD: {' '.join(prune_cmd)}\n"
+                f"STDOUT:\n{completed.stdout}\n"
+                f"STDERR:\n{completed.stderr}"
+            )
+        prune_in = Path(f"{prune_prefix}.prune.in")
+        if not prune_in.exists():
+            raise RuntimeError(f"Missing PLINK2 prune output: {prune_in}")
+        cmd.extend(["--extract", str(prune_in)])
     if chromosomes:
         cmd.extend(["--chr", ",".join(str(int(c)) for c in chromosomes)])
-    cmd.extend(["--pca", *pca_args, "--out", str(out_prefix)])
+    cmd.extend(["--pca", *pca_args])
+    if memory_mb is not None:
+        cmd.extend(["--memory", str(int(memory_mb))])
+    cmd.extend(["--out", str(out_prefix)])
     if extra_args:
         cmd.extend(list(extra_args))
 
@@ -391,6 +432,8 @@ def refresh_manifest_global_pcs(
         manifest_df["global_pcs_file"] = manifest_df["global_pcs_file"].fillna("").astype(str)
     else:
         manifest_df["global_pcs_file"] = ""
+    if "pca_cache_key" not in manifest_df.columns:
+        manifest_df["pca_cache_key"] = ""
 
     mode = run_cfg.gwas.global_pcs.canonical_mode()
     if mode == "none":
@@ -428,8 +471,13 @@ def refresh_manifest_global_pcs(
                 "chromosomes": [int(chrom) for chrom in run_cfg.chromosomes],
                 "n_components": int(run_cfg.gwas.global_pcs.n_components),
                 "plink2_path": str(run_cfg.gwas.plink2.path),
+                "plink2_memory_mb": getattr(run_cfg.gwas.plink2, "memory_mb", None),
                 "plink2_approx": bool(run_cfg.gwas.global_pcs.plink2_approx),
                 "plink2_extra_args": list(run_cfg.gwas.global_pcs.plink2_extra_args),
+                "prune_before_pca": bool(run_cfg.gwas.global_pcs.prune_before_pca),
+                "prune_window_kb": int(run_cfg.gwas.global_pcs.prune_window_kb),
+                "prune_step_variants": int(run_cfg.gwas.global_pcs.prune_step_variants),
+                "prune_r2": float(run_cfg.gwas.global_pcs.prune_r2),
                 "precomputed_file": str(run_cfg.gwas.global_pcs.precomputed_file or ""),
                 "id_column": str(run_cfg.gwas.global_pcs.id_column),
             }
@@ -444,6 +492,7 @@ def refresh_manifest_global_pcs(
             if cache is not None and cache_key not in cache:
                 cache[cache_key] = pd.read_csv(pcs_path, sep="\t")
             manifest_df.loc[idx, "global_pcs_file"] = str(pcs_path)
+            manifest_df.loc[idx, "pca_cache_key"] = cache_key
             logger.info("[global-pcs] cache-hit(row=disk) row=%d output=%s", int(idx), pcs_path)
             continue
 
@@ -455,6 +504,7 @@ def refresh_manifest_global_pcs(
             cached_df.to_csv(pcs_path, sep="\t", index=False)
             _write_global_pcs_cache_key(pcs_path, cache_key)
             manifest_df.loc[idx, "global_pcs_file"] = str(pcs_path)
+            manifest_df.loc[idx, "pca_cache_key"] = cache_key
             logger.info("[global-pcs] cache-hit row=%d output=%s", int(idx), pcs_path)
             continue
 
@@ -468,6 +518,7 @@ def refresh_manifest_global_pcs(
                 n_components=int(run_cfg.gwas.global_pcs.n_components),
                 out_dir=output_dir / "tmp" / "global_pcs_plink2",
                 mode_cfg=run_cfg.gwas.global_pcs,
+                memory_mb=getattr(run_cfg.gwas.plink2, "memory_mb", None),
                 chromosomes=run_cfg.chromosomes,
             )
             pcs_df.to_csv(pcs_path, sep="\t", index=False)
@@ -492,6 +543,7 @@ def refresh_manifest_global_pcs(
             cache[cache_key] = pcs_df.copy()
         _write_global_pcs_cache_key(pcs_path, cache_key)
         manifest_df.loc[idx, "global_pcs_file"] = str(pcs_path)
+        manifest_df.loc[idx, "pca_cache_key"] = cache_key
 
     manifest_df.to_csv(out_manifest, sep="\t", index=False)
     if runtime_cache is not None:

@@ -144,6 +144,7 @@ def test_refresh_manifest_global_pcs_dedupes_in_memory(monkeypatch, tmp_path: Pa
 
     assert calls["n"] == 1
     assert refreshed["global_pcs_file"].nunique() == 2
+    assert refreshed["pca_cache_key"].nunique() == 1
     assert all(Path(path).exists() for path in refreshed["global_pcs_file"].tolist())
     assert runtime_cache["cache_misses"]["global_pcs"] == 1
     assert runtime_cache["cache_hits"]["global_pcs"] == 1
@@ -202,5 +203,6 @@ def test_refresh_manifest_global_pcs_reuses_existing_disk_cache(monkeypatch, tmp
     second_df = pd.read_csv(second_manifest, sep="\t")
 
     assert second_df.loc[0, "global_pcs_file"] == str(pcs_path)
+    assert second_df.loc[0, "pca_cache_key"]
     assert runtime_cache_2["cache_hits"]["global_pcs"] == 1
     assert runtime_cache_2.get("cache_misses", {}).get("global_pcs", 0) == 0

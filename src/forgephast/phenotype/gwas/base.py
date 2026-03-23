@@ -25,6 +25,7 @@ class GwasTask:
     covariates_file: str
     global_pcs_file: str
     output_dir: str
+    merged_covariates_file: str = ""
     chromosomes: List[int] | None = None
 
 
@@ -116,9 +117,43 @@ def merge_covariates_for_gwas(
     return covar_cols
 
 
+def read_prepared_covariate_columns(merged_covariates_file: str) -> List[str]:
+    """Read covariate column names from an already-prepared GWAS covariate table."""
+    import pandas as pd
+
+    merged = pd.read_csv(merged_covariates_file, sep="\t", nrows=1)
+    return [c for c in merged.columns if c not in {"FID", "IID"}]
+
+
+def prepare_manifest_covariates_for_gwas(manifest_df):  # noqa: ANN001
+    """Prepare one merged covariate table per manifest row for engine reuse."""
+    import pandas as pd
+
+    prepared = manifest_df.copy()
+    if "merged_covariates_file" not in prepared.columns:
+        prepared["merged_covariates_file"] = ""
+
+    for idx, row in prepared.iterrows():
+        output_dir = Path(str(row["output_dir"]))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        covar_path = output_dir / "merged_covariates.tsv"
+        merge_covariates_for_gwas(
+            covariates_file=str(row["covariates_file"]),
+            pcs_file=str(row["global_pcs_file"]),
+            out_path=covar_path,
+        )
+        prepared.loc[idx, "merged_covariates_file"] = str(covar_path)
+
+    if not isinstance(prepared, pd.DataFrame):
+        raise TypeError("prepared manifest must remain a DataFrame")
+    return prepared
+
+
 __all__ = [
     "GwasEngine",
     "GwasResult",
     "GwasTask",
     "merge_covariates_for_gwas",
+    "prepare_manifest_covariates_for_gwas",
+    "read_prepared_covariate_columns",
 ]

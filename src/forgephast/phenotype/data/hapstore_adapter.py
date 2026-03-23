@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -376,6 +377,7 @@ class HapStoreAdapter:
             sample_populations=sample_populations,
             variant_ids=variant_ids,
         )
+        export_t0 = time.perf_counter()
         allele_by_variant: dict[str, str] = {}
 
         if kind == "genotypes":
@@ -385,11 +387,35 @@ class HapStoreAdapter:
         else:
             raise ValueError(f"Unsupported HapStore export kind={kind!r}")
 
-        for population, row_ids in pop_rows.items():
+        total_groups = int(len(pop_rows) * len(variant_by_chrom))
+        logger.info(
+            "[hapstore-export-array] start kind=%s n_samples=%d n_variants=%d n_populations=%d n_chromosomes=%d total_groups=%d io_threads=%d",
+            kind,
+            int(len(sample_ids)),
+            int(len(variant_ids)),
+            int(len(pop_rows)),
+            int(len(variant_by_chrom)),
+            total_groups,
+            int(self.io_threads),
+        )
+
+        completed_groups = 0
+        for pop_idx, (population, row_ids) in enumerate(pop_rows.items(), start=1):
+            pop_t0 = time.perf_counter()
             cohort_iids = [sample_ids[i] for i in row_ids]
             row_indices = np.asarray(row_ids, dtype=np.int64)
+            logger.info(
+                "[hapstore-export-array] population-start kind=%s population=%s pop_index=%d/%d n_samples=%d n_chromosomes=%d elapsed_seconds=%.3f",
+                kind,
+                population,
+                int(pop_idx),
+                int(len(pop_rows)),
+                int(len(cohort_iids)),
+                int(len(variant_by_chrom)),
+                float(time.perf_counter() - export_t0),
+            )
 
-            def _work(chrom_item: tuple[int, list[str]]) -> tuple[list[str], np.ndarray, list[str]]:
+            def _work(chrom_item: tuple[int, list[str]]) -> tuple[int, list[str], np.ndarray, list[str]]:
                 chrom, chrom_variant_ids = chrom_item
                 store = self._open_store(population, chrom)
                 idx_map = self._get_sample_index_map(population, chrom)
@@ -423,17 +449,51 @@ class HapStoreAdapter:
                         ),
                         max_slice_variants=int(getattr(self.cfg, "max_slice_variants", 0) or 0),
                     )
-                return chrom_variant_ids, block, alt_alleles
+                return chrom, chrom_variant_ids, block, alt_alleles
 
             threads = self._effective_io_threads(len(variant_by_chrom))
             items = list(variant_by_chrom.items())
+            results: list[tuple[int, list[str], np.ndarray, list[str]]] = []
             if threads <= 1 or len(items) <= 1:
-                results = [_work(item) for item in items]
+                for item in items:
+                    result = _work(item)
+                    results.append(result)
+                    chrom, chrom_variant_ids, _, _ = result
+                    completed_groups += 1
+                    logger.info(
+                        "[hapstore-export-array] chromosome-done kind=%s population=%s chrom=%s variants=%d completed_groups=%d/%d population_elapsed_seconds=%.3f total_elapsed_seconds=%.3f",
+                        kind,
+                        population,
+                        int(chrom),
+                        int(len(chrom_variant_ids)),
+                        int(completed_groups),
+                        int(total_groups),
+                        float(time.perf_counter() - pop_t0),
+                        float(time.perf_counter() - export_t0),
+                    )
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=int(threads)) as ex:
-                    results = list(ex.map(_work, items))
+                    future_map = {ex.submit(_work, item): item[0] for item in items}
+                    done_by_chrom: dict[int, tuple[int, list[str], np.ndarray, list[str]]] = {}
+                    for future in concurrent.futures.as_completed(future_map):
+                        result = future.result()
+                        chrom, chrom_variant_ids, _, _ = result
+                        done_by_chrom[int(chrom)] = result
+                        completed_groups += 1
+                        logger.info(
+                            "[hapstore-export-array] chromosome-done kind=%s population=%s chrom=%s variants=%d completed_groups=%d/%d population_elapsed_seconds=%.3f total_elapsed_seconds=%.3f",
+                            kind,
+                            population,
+                            int(chrom),
+                            int(len(chrom_variant_ids)),
+                            int(completed_groups),
+                            int(total_groups),
+                            float(time.perf_counter() - pop_t0),
+                            float(time.perf_counter() - export_t0),
+                        )
+                    results = [done_by_chrom[int(chrom)] for chrom, _ in items]
 
-            for chrom_variant_ids, block, alt_alleles in results:
+            for _, chrom_variant_ids, block, alt_alleles in results:
                 for variant_id, alt in zip(chrom_variant_ids, alt_alleles):
                     prev = allele_by_variant.get(variant_id)
                     if prev is None:
@@ -449,6 +509,25 @@ class HapStoreAdapter:
                     out[np.ix_(row_indices, cols, np.array([0, 1], dtype=np.int64))] = np.transpose(
                         block, (0, 2, 1)
                     )
+
+            logger.info(
+                "[hapstore-export-array] population-done kind=%s population=%s pop_index=%d/%d n_samples=%d elapsed_seconds=%.3f total_elapsed_seconds=%.3f",
+                kind,
+                population,
+                int(pop_idx),
+                int(len(pop_rows)),
+                int(len(cohort_iids)),
+                float(time.perf_counter() - pop_t0),
+                float(time.perf_counter() - export_t0),
+            )
+
+        logger.info(
+            "[hapstore-export-array] done kind=%s n_samples=%d n_variants=%d elapsed_seconds=%.3f",
+            kind,
+            int(len(sample_ids)),
+            int(len(variant_ids)),
+            float(time.perf_counter() - export_t0),
+        )
 
         return out, allele_by_variant
 

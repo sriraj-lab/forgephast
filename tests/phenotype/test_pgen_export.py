@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pandas as pd
 
@@ -40,8 +41,9 @@ class _FakeAdapter:
         )
         out_prefix = Path(out_prefix)
         out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        for ext in (".pgen", ".pvar", ".psam"):
-            Path(f"{out_prefix}{ext}").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
+        Path(f"{out_prefix}.psam").write_text("#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8")
         return str(out_prefix)
 
 
@@ -144,20 +146,26 @@ def test_export_manifest_pgens_updates_manifest(monkeypatch, tmp_path: Path) -> 
 
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
-    def _fake_filter(prefix: str, *, plink2_path: str, threads: int) -> str:
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None) -> str:  # noqa: ANN001
         out_prefix = Path(f"{prefix}.maf_gt0")
-        for ext in (".pgen", ".pvar", ".psam"):
-            Path(f"{out_prefix}{ext}").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
+        Path(f"{out_prefix}.psam").write_text("#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8")
         return str(out_prefix)
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
 
     out_manifest = export_manifest_pgens(cfg, manifest_path)
     assert out_manifest.exists()
     out = pd.read_csv(out_manifest, sep="\t")
-    assert out.loc[0, "pgen_prefix"].endswith(".maf_gt0")
-    assert out.loc[0, "exported_pgen_prefix"] != out.loc[0, "pgen_prefix"]
+    assert out.loc[0, "pgen_prefix"].endswith("rep1_c1")
+    assert out.loc[0, "exported_pgen_prefix"] == out.loc[0, "pgen_prefix"]
+    assert out.loc[0, "merged_pgen_prefix"] == out.loc[0, "pgen_prefix"]
+    chrom_manifest = json.loads(out.loc[0, "chrom_pgen_manifest"])
+    assert chrom_manifest == {"1": str(run_dir / "exports" / "pgen" / "chrom" / "rep1_c1.chr1.maf_gt0")}
+    assert Path(f"{out.loc[0, 'pgen_prefix']}.pgen").exists()
     assert len(fake.calls) == 1
     assert fake.calls[0]["variant_ids"] == ["chr1:10", "chr1:20"]
+    assert fake.calls[0]["chromosomes"] == [1]
 
 
 def test_export_manifest_pgens_reuses_identical_exports_in_memory(
@@ -196,10 +204,11 @@ def test_export_manifest_pgens_reuses_identical_exports_in_memory(
 
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
-    def _fake_filter(prefix: str, *, plink2_path: str, threads: int) -> str:
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None) -> str:  # noqa: ANN001
         out_prefix = Path(f"{prefix}.maf_gt0")
-        for ext in (".pgen", ".pvar", ".psam"):
-            Path(f"{out_prefix}{ext}").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
+        Path(f"{out_prefix}.psam").write_text("#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8")
         return str(out_prefix)
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
 
@@ -210,11 +219,65 @@ def test_export_manifest_pgens_reuses_identical_exports_in_memory(
     assert len(fake.calls) == 1
     assert out["pgen_prefix"].nunique() == 1
     assert out["exported_pgen_prefix"].nunique() == 1
-    assert out["pgen_prefix"].iloc[0].endswith(".maf_gt0")
+    assert out["pgen_prefix"].iloc[0].endswith("rep1_c1")
+    assert out["chrom_pgen_manifest"].nunique() == 1
 
     export_manifest_pgens(cfg, manifest_path, runtime_cache=runtime_cache)
     assert len(fake.calls) == 1
     assert runtime_cache["cache_hits"]["pgen_export"] == 2
+
+
+def test_export_manifest_pgens_legacy_path_still_filters_merged_prefix(
+    monkeypatch, tmp_path: Path
+) -> None:
+    payload = _payload(tmp_path)
+    payload["pgen_export"]["prep_mode"] = "legacy_whole_store"
+    cfg = RunConfig.from_dict(payload)
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    truth_dir = run_dir / "truth"
+    truth_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "causal_id": ["chr1:10", "chr1:20"],
+            "replicate": [1, 1],
+            "architecture": ["a1", "a1"],
+            "cohort": ["c1", "c1"],
+        }
+    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+
+    out_dir = run_dir / "replicate_1" / "architecture_a1" / "cohort_c1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "pgen_prefix": [""],
+            "output_dir": [str(out_dir)],
+        }
+    )
+    manifest_path = run_dir / "run_manifest.tsv"
+    manifest.to_csv(manifest_path, sep="\t", index=False)
+
+    fake = _FakeAdapter()
+    monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
+
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None) -> str:  # noqa: ANN001
+        out_prefix = Path(f"{prefix}.maf_gt0")
+        Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
+        Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
+        Path(f"{out_prefix}.psam").write_text("#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8")
+        return str(out_prefix)
+
+    monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
+
+    out_manifest = export_manifest_pgens(cfg, manifest_path)
+    out = pd.read_csv(out_manifest, sep="\t")
+
+    assert out.loc[0, "pgen_prefix"].endswith(".maf_gt0")
+    assert out.loc[0, "exported_pgen_prefix"] != out.loc[0, "pgen_prefix"]
+    assert out.loc[0, "chrom_pgen_manifest"] == "{}"
 
 
 def test_normalize_fid_for_exported_pgen_sets_fid_to_iid(tmp_path: Path) -> None:

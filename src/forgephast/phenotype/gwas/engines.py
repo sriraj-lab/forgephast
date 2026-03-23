@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..._internal.command import run_checked_command
-from .base import GwasEngine, GwasResult, GwasTask, merge_covariates_for_gwas
+from .base import (
+    GwasEngine,
+    GwasResult,
+    GwasTask,
+    merge_covariates_for_gwas,
+    read_prepared_covariate_columns,
+)
 
 if TYPE_CHECKING:
     from ..config_schema import Plink2EngineConfig, RegenieEngineConfig
@@ -29,14 +35,28 @@ class Plink2Engine(GwasEngine):
         out_dir = run_dir / "plink2"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        covar_path = out_dir / "merged_covariates.tsv"
-        covar_cols = merge_covariates_for_gwas(
-            covariates_file=task.covariates_file,
-            pcs_file=task.global_pcs_file,
-            out_path=covar_path,
-        )
+        if task.merged_covariates_file:
+            covar_path = Path(task.merged_covariates_file)
+            covar_cols = read_prepared_covariate_columns(str(covar_path))
+        else:
+            covar_path = out_dir / "merged_covariates.tsv"
+            covar_cols = merge_covariates_for_gwas(
+                covariates_file=task.covariates_file,
+                pcs_file=task.global_pcs_file,
+                out_path=covar_path,
+            )
 
         out_prefix = out_dir / "assoc"
+        expected_glob = str(out_dir / "assoc*.glm.*")
+        expected_log = str(out_dir / "assoc.log")
+        logger.info(
+            "[gwas-monitor] engine=plink2 rep=%d cohort=%s out_dir=%s primary_glob=%s log=%s",
+            int(task.replicate),
+            task.cohort,
+            out_dir,
+            expected_glob,
+            expected_log,
+        )
         cmd = [
             self.cfg.path,
             "--pfile",
@@ -68,6 +88,12 @@ class Plink2Engine(GwasEngine):
             [
                 "--threads",
                 str(self.cfg.threads),
+            ]
+        )
+        if self.cfg.memory_mb is not None:
+            cmd.extend(["--memory", str(int(self.cfg.memory_mb))])
+        cmd.extend(
+            [
                 "--out",
                 str(out_prefix),
             ]
@@ -82,10 +108,21 @@ class Plink2Engine(GwasEngine):
         if not candidates:
             raise RuntimeError(f"PLINK2 GWAS produced no .glm output under {out_dir}")
 
+        logger.info(
+            "[gwas-monitor] engine=plink2 rep=%d cohort=%s completed primary_output=%s",
+            int(task.replicate),
+            task.cohort,
+            candidates[0],
+        )
+
         return GwasResult(
             engine=self.name(),
             output_dir=str(out_dir),
             primary_output=str(candidates[0]),
+            metadata={
+                "monitor_log": expected_log,
+                "monitor_primary_glob": expected_glob,
+            },
         )
 
 
@@ -103,16 +140,33 @@ class RegenieEngine(GwasEngine):
         out_dir = run_dir / "regenie"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        covar_path = out_dir / "merged_covariates.tsv"
-        covar_cols = merge_covariates_for_gwas(
-            covariates_file=task.covariates_file,
-            pcs_file=task.global_pcs_file,
-            out_path=covar_path,
-        )
+        if task.merged_covariates_file:
+            covar_path = Path(task.merged_covariates_file)
+            covar_cols = read_prepared_covariate_columns(str(covar_path))
+        else:
+            covar_path = out_dir / "merged_covariates.tsv"
+            covar_cols = merge_covariates_for_gwas(
+                covariates_file=task.covariates_file,
+                pcs_file=task.global_pcs_file,
+                out_path=covar_path,
+            )
         covar_col_list = ",".join(covar_cols)
         chr_list = ",".join(str(chrom) for chrom in task.chromosomes) if task.chromosomes else ""
 
         step1_prefix = out_dir / "step1"
+        step1_log = str(Path(f"{step1_prefix}.log"))
+        step1_pred = str(Path(f"{step1_prefix}_pred.list"))
+        step2_prefix = out_dir / "step2"
+        step2_glob = str(out_dir / "step2*.regenie*")
+        logger.info(
+            "[gwas-monitor] engine=regenie rep=%d cohort=%s out_dir=%s step1_log=%s step1_pred=%s step2_glob=%s",
+            int(task.replicate),
+            task.cohort,
+            out_dir,
+            step1_log,
+            step1_pred,
+            step2_glob,
+        )
         cmd1 = [
             self.cfg.path,
             "--step",
@@ -155,7 +209,6 @@ class RegenieEngine(GwasEngine):
         if not pred_list.exists():
             raise RuntimeError(f"REGENIE step 1 missing prediction list: {pred_list}")
 
-        step2_prefix = out_dir / "step2"
         cmd2 = [
             self.cfg.path,
             "--step",
@@ -203,10 +256,22 @@ class RegenieEngine(GwasEngine):
                 f"REGENIE step 2 output missing/empty under {out_dir} (expected step2*.regenie*)"
             )
 
+        logger.info(
+            "[gwas-monitor] engine=regenie rep=%d cohort=%s completed primary_output=%s",
+            int(task.replicate),
+            task.cohort,
+            primary,
+        )
+
         return GwasResult(
             engine=self.name(),
             output_dir=str(out_dir),
             primary_output=str(primary),
+            metadata={
+                "monitor_step1_log": step1_log,
+                "monitor_step1_pred_list": step1_pred,
+                "monitor_step2_glob": step2_glob,
+            },
         )
 
 

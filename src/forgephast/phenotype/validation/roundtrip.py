@@ -207,6 +207,17 @@ def _linear_metrics(merged: pd.DataFrame) -> Tuple[float, float, float, float]:
     return float(slope), float(intercept), corr, sign
 
 
+def _resolve_truth_dir(run_dir: Path) -> Path:
+    truth_dir = run_dir / "truth"
+    if truth_dir.exists():
+        return truth_dir
+    if run_dir.name.endswith("__ids_only"):
+        base_truth_dir = run_dir.parent / run_dir.name.removesuffix("__ids_only") / "truth"
+        if base_truth_dir.exists():
+            return base_truth_dir
+    return truth_dir
+
+
 def build_roundtrip_report(
     *,
     run_cfg: RunConfig,
@@ -219,8 +230,9 @@ def build_roundtrip_report(
     if gwas_manifest.empty:
         raise ValueError("No successful GWAS rows found for round-trip validation")
 
-    truth_path = run_dir / "truth" / "effect_sizes.tsv"
-    membership_path = run_dir / "truth" / "causal_membership.tsv"
+    truth_dir = _resolve_truth_dir(run_dir)
+    truth_path = truth_dir / "effect_sizes.tsv"
+    membership_path = truth_dir / "causal_membership.tsv"
     if not truth_path.exists():
         raise FileNotFoundError(f"Missing truth effect file: {truth_path}")
     if not membership_path.exists():

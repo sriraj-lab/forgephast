@@ -471,6 +471,7 @@ class PgenExportConfig:
 
     enabled: bool = True
     out_dir: Optional[str] = None
+    prep_mode: str = "per_chrom_plink_merge"
     reuse_exports: bool = True
     task_workers: int = 1
     concat_workers: int = 1
@@ -481,6 +482,11 @@ class PgenExportConfig:
     random_seed: int = 42
 
     def validate(self) -> None:
+        _check_one_of(
+            self.prep_mode,
+            {"per_chrom_plink_merge", "legacy_whole_store"},
+            "pgen_export.prep_mode",
+        )
         _check_one_of(
             self.variant_scope,
             {"all", "causal_only", "causal_plus_tags", "causal_plus_tags_random", "variant_list"},
@@ -504,6 +510,10 @@ class GlobalPCConfig:
     mode: str = "plink2_pca"
     reuse_cache: bool = True
     n_components: int = 10
+    prune_before_pca: bool = True
+    prune_window_kb: int = 1000
+    prune_step_variants: int = 50
+    prune_r2: float = 0.1
     plink2_approx: bool = True
     plink2_extra_args: List[str] = field(default_factory=list)
     precomputed_file: Optional[str] = None
@@ -516,10 +526,15 @@ class GlobalPCConfig:
         _check_one_of(self.mode, {"precomputed", "none", "plink2_pca", "svd_pca"}, "gwas.global_pcs.mode")
         if not isinstance(self.reuse_cache, bool):
             raise ValueError("gwas.global_pcs.reuse_cache must be a boolean")
+        if not isinstance(self.prune_before_pca, bool):
+            raise ValueError("gwas.global_pcs.prune_before_pca must be a boolean")
         if self.mode == "precomputed" and not self.precomputed_file:
             raise ValueError("gwas.global_pcs.precomputed_file is required for mode=precomputed")
         if self.mode != "none":
             _check_positive(self.n_components, "gwas.global_pcs.n_components")
+        _check_positive(self.prune_window_kb, "gwas.global_pcs.prune_window_kb")
+        _check_positive(self.prune_step_variants, "gwas.global_pcs.prune_step_variants")
+        _check_in_range(self.prune_r2, 0.0, 1.0, "gwas.global_pcs.prune_r2")
         _check_positive(self.svd_max_variants, "gwas.global_pcs.svd_max_variants")
         _check_in_range(self.svd_min_maf, 0.0, 0.5, "gwas.global_pcs.svd_min_maf")
 
@@ -533,10 +548,13 @@ class Plink2EngineConfig:
 
     path: str = "plink2"
     threads: int = 1
+    memory_mb: Optional[int] = None
     extra_args: List[str] = field(default_factory=list)
 
     def validate(self) -> None:
         _check_positive(self.threads, "gwas.plink2.threads")
+        if self.memory_mb is not None:
+            _check_positive(self.memory_mb, "gwas.plink2.memory_mb")
 
 
 @dataclass

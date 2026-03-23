@@ -1,6 +1,13 @@
 """GWAS engine exports."""
 
-from .base import GwasEngine, GwasResult, GwasTask, merge_covariates_for_gwas
+from .base import (
+    GwasEngine,
+    GwasResult,
+    GwasTask,
+    merge_covariates_for_gwas,
+    prepare_manifest_covariates_for_gwas,
+    read_prepared_covariate_columns,
+)
 from .engines import Plink2Engine, RegenieEngine
 from .registry import available_engine_names, build_engines, validate_engine_names
 
@@ -13,5 +20,7 @@ __all__ = [
     "available_engine_names",
     "build_engines",
     "merge_covariates_for_gwas",
+    "prepare_manifest_covariates_for_gwas",
+    "read_prepared_covariate_columns",
     "validate_engine_names",
 ]
