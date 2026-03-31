@@ -231,8 +231,9 @@ The built-in preset is `GRCh38` only and derives one interval per gene from a bu
 
 - `+` strand: `100 kb upstream of TSS` through `gene_end`
 - `-` strand: `gene_start` through `100 kb upstream of TSS` on the reverse strand
-- bundled source: GENCODE Human Release 49 (`GRCh38.p14`), reference chromosomes only
-- provenance: generated from `https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.annotation.gtf.gz` using `gene` features only
+- bundled source: GENCODE Human Release 49 (`GRCh38.p14`)
+- packaged default subset: autosomes only, `protein_coding` genes only
+- provenance: generated from `https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.annotation.gtf.gz` using `gene` features filtered to autosomal `protein_coding`
 
 The package also includes a direct gene BED derived from the same source:
 
