@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, List
 
@@ -30,6 +31,8 @@ def write_simulation_outputs(
     membership_frames = []
     effect_frames = []
     component_rows = []
+    effect_geometry_rows = []
+    effect_geometry_seen: set[tuple[int, str]] = set()
 
     for rec in records:
         replicate = int(rec["replicate"])
@@ -61,6 +64,7 @@ def write_simulation_outputs(
 
         targets = rec["component_targets"]
         realized = rec.get("component_realized", {})
+        effect_geometry = rec.get("effect_geometry", {})
 
         component_rows.append(
             {
@@ -68,6 +72,23 @@ def write_simulation_outputs(
                 "replicate": replicate,
                 "architecture": architecture,
                 "cohort": cohort,
+                "base_h2_fixed": targets.get("base_h2_fixed", targets.get("genetic_fixed", 0.0)),
+                "resolved_h2_fixed": targets.get("resolved_h2_fixed", targets.get("genetic_fixed", 0.0)),
+                "h2_jitter_delta": targets.get("h2_jitter_delta", 0.0),
+                "h2_jitter_clipped": targets.get("h2_jitter_clipped", False),
+                "target_mode": targets.get("target_mode", "single_population"),
+                "resolved_h2_fixed_by_population": targets.get(
+                    "resolved_h2_fixed_by_population_json",
+                    "{}",
+                ),
+                "h2_jitter_delta_by_population": targets.get(
+                    "h2_jitter_delta_by_population_json",
+                    "{}",
+                ),
+                "h2_jitter_clipped_by_population": targets.get(
+                    "h2_jitter_clipped_by_population_json",
+                    "{}",
+                ),
                 "target_var_genetic_fixed": targets.get("genetic_fixed", 0.0),
                 "target_var_genetic_bg": targets.get("genetic_bg", 0.0),
                 "target_var_genetic_total": targets.get("genetic_total", 0.0),
@@ -97,6 +118,23 @@ def write_simulation_outputs(
                 "global_pcs_file": str(pcs_path),
                 "covariate_coefficients_file": str(coeff_path),
                 "output_dir": str(out_dir),
+                "base_h2_fixed": targets.get("base_h2_fixed", targets.get("genetic_fixed", 0.0)),
+                "resolved_h2_fixed": targets.get("resolved_h2_fixed", targets.get("genetic_fixed", 0.0)),
+                "h2_jitter_delta": targets.get("h2_jitter_delta", 0.0),
+                "h2_jitter_clipped": targets.get("h2_jitter_clipped", False),
+                "target_mode": targets.get("target_mode", "single_population"),
+                "resolved_h2_fixed_by_population": targets.get(
+                    "resolved_h2_fixed_by_population_json",
+                    "{}",
+                ),
+                "h2_jitter_delta_by_population": targets.get(
+                    "h2_jitter_delta_by_population_json",
+                    "{}",
+                ),
+                "h2_jitter_clipped_by_population": targets.get(
+                    "h2_jitter_clipped_by_population_json",
+                    "{}",
+                ),
                 "target_var_genetic_fixed": targets.get("genetic_fixed", 0.0),
                 "target_var_genetic_bg": targets.get("genetic_bg", 0.0),
                 "target_var_genetic_total": targets.get("genetic_total", 0.0),
@@ -104,15 +142,62 @@ def write_simulation_outputs(
                 "target_var_residual": targets.get("residual", 0.0),
             }
         )
+        geometry_key = (replicate, architecture)
+        if geometry_key not in effect_geometry_seen:
+            effect_geometry_seen.add(geometry_key)
+            effect_geometry_rows.append(
+                {
+                    "run_name": run_name,
+                    "replicate": replicate,
+                    "architecture": architecture,
+                    "population_corr_mode": effect_geometry.get("population_corr_mode", ""),
+                    "base_jitter_sd": effect_geometry.get("base_jitter_sd", 0.0),
+                    "resolved_jitter_sd_by_population": json.dumps(
+                        effect_geometry.get("resolved_jitter_sd_by_population", {}),
+                        sort_keys=True,
+                    ),
+                    "population_fst_file": effect_geometry.get("population_fst_file", ""),
+                    "fst_corr_transform": effect_geometry.get("fst_corr_transform", ""),
+                    "fst_corr_lambda": effect_geometry.get("fst_corr_lambda", 0.0),
+                    "resolved_population_corr_matrix": effect_geometry.get(
+                        "population_corr_matrix_json", "[]"
+                    ),
+                }
+            )
 
     membership_df = pd.concat(membership_frames, ignore_index=True)
     effects_df = pd.concat(effect_frames, ignore_index=True)
     manifest_df = pd.DataFrame(manifest_rows)
     component_df = pd.DataFrame(component_rows)
+    membership_work = membership_df.copy()
+    if "annotation_hit" not in membership_work.columns:
+        membership_work["annotation_hit"] = False
+    if "maf_bucket" not in membership_work.columns:
+        membership_work["maf_bucket"] = ""
+    membership_work["annotation_hit"] = membership_work["annotation_hit"].fillna(False).astype(bool)
+    membership_summary_df = (
+        membership_work.groupby(
+            ["replicate", "architecture", "cohort", "maf_bucket"],
+            dropna=False,
+            as_index=False,
+        )["annotation_hit"]
+        .agg(selected_causal_count="size", annotation_hit_count="sum")
+        .assign(
+            annotation_hit_fraction=lambda frame: frame["annotation_hit_count"]
+            / frame["selected_causal_count"].clip(lower=1)
+        )
+    )
+    effect_geometry_df = pd.DataFrame(effect_geometry_rows)
 
     membership_df.to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+    membership_summary_df.to_csv(
+        truth_dir / "causal_membership_summary.tsv",
+        sep="\t",
+        index=False,
+    )
     effects_df.to_csv(truth_dir / "effect_sizes.tsv", sep="\t", index=False)
     component_df.to_csv(truth_dir / "component_summary.tsv", sep="\t", index=False)
+    effect_geometry_df.to_csv(truth_dir / "effect_geometry.tsv", sep="\t", index=False)
     manifest_df.to_csv(run_dir / "run_manifest.tsv", sep="\t", index=False)
 
     return manifest_df

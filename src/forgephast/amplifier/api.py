@@ -74,6 +74,7 @@ def merge(
     n_shards: int,
     merge_combined: bool | None = None,
     input_root: str | Path | None = None,
+    populations: list[str] | None = None,
 ) -> MergeResult:
     cfg = from_yaml(config_path)
     return merge_chromosome(
@@ -82,6 +83,7 @@ def merge(
         n_shards=n_shards,
         merge_combined=merge_combined,
         input_root=input_root,
+        populations=populations,
     )
 
 

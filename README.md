@@ -153,14 +153,157 @@ Even if every pairwise bound passes, the full matrix can still be invalid.
 
 ### Important note about heritability
 
-These geometry parameters control whether the cross-pop beta construction is valid. They do not directly lock the final phenotype variance.
+These geometry parameters control whether the cross-pop beta construction is valid. Final fixed-effect heritability is now resolved on the source-population axis, not by a single cohort-wide post hoc rescale.
 
-Later in simulation, the realized fixed genetic component is rescaled to the requested target variance:
+`forgephast phenotype` first samples one resolved `h2_fixed` target per source population for each `replicate x architecture`, then calibrates source-population betas to those targets. Homogeneous single-population cohorts use their source population's resolved target directly. Admixed cohorts do not get a separate target `h2`; they inherit the already-scaled source-population betas through local ancestry.
 
-- `genetic_fixed_scale = sqrt(target_h2_fixed / Var(genetic_raw))`
-- emitted per-variant truth betas are multiplied by the same scale
+So changing `sigma_beta`, jitter settings, or the FST-derived correlation affects the geometry of sampled effects, while `variance_budget.h2_fixed` and `variance_budget.h2_jitter_*` control the resolved source-population fixed-effect targets.
 
-So changing `sigma_beta` or jitter settings affects the geometry of sampled effects, while `variance_budget.h2_fixed` still controls the final fixed genetic variance target.
+### Auto population correlation from donor FST
+
+`forgephast phenotype` can now derive the population-correlation matrix automatically from a precomputed donor-panel pairwise-FST table.
+
+Use:
+
+- `effect_model.population_corr_mode: auto_from_fst`
+- `effect_model.population_fst_file: <pairwise_fst.tsv>`
+
+Required FST table columns:
+
+- `population_i`
+- `population_j`
+- `fst`
+
+Behavior:
+
+- all unordered pairs in `effect_model.population_order` must be present
+- diagonal FST is implied as `0.0`
+- the raw correlation transform is:
+  - `corr_ij = exp(-fst_corr_lambda * fst_ij)`
+- the resulting matrix is then projected to a valid PSD correlation matrix before beta sampling
+
+This auto mode is explicit:
+
+- when `population_corr_mode: manual`, the existing `population_corr_matrix` behavior is unchanged
+- when `population_corr_mode: auto_from_fst`, `population_corr_matrix` must be omitted
+
+`effect_model.base_jitter_sd` provides the default per-population jitter floor for populations not explicitly listed in `effect_model.jitter_sd_by_population`.
+
+### `h2_fixed` jitter
+
+`forgephast phenotype` can also jitter the fixed genetic variance target on the source-population axis:
+
+- `variance_budget.h2_jitter_sd`
+- `variance_budget.h2_jitter_seed`
+
+Behavior:
+
+- jitter applies only to `h2_fixed`
+- one deterministic draw is sampled per source population for each `replicate x architecture`
+- if baseline `h2_fixed <= 0`, no jitter is applied
+- the resolved `h2_fixed` is clipped to the remaining variance budget after `h2_bg` and covariates
+- homogeneous single-population cohorts use their population-specific resolved target directly
+- admixed cohorts do not get an admixed-specific target `h2`; they inherit the already-scaled source-population betas
+- residual variance is recomputed from the realized inherited fixed-effect variance plus the configured background and covariate targets
+
+Auditable outputs now include:
+
+- `target_mode` in `truth/component_summary.tsv` and `run_manifest.tsv`
+- `resolved_h2_fixed_by_population`
+- `h2_jitter_delta_by_population`
+- `h2_jitter_clipped_by_population`
+
+## Annotation-weighted causal sampling
+
+`forgephast phenotype` can optionally enrich causal-variant sampling in functional regions while preserving the existing MAF-bucket fixed-plus-subset workflow.
+
+When `causal_selection.annotation_sampling.enabled: true`:
+
+- sampling remains bucketed by `causal_selection.maf_buckets`
+- fixed-set and subset draws both switch from uniform to weighted sampling without replacement
+- baseline weight is `1.0`
+- overlapping annotations raise a variant's weight via the configured multiplier
+- v1 uses `combine_rule: max` only
+
+### Built-in default gene-window mode
+
+The built-in preset is `GRCh38` only and derives one interval per gene from a bundled simple annotation table:
+
+- `+` strand: `100 kb upstream of TSS` through `gene_end`
+- `-` strand: `gene_start` through `100 kb upstream of TSS` on the reverse strand
+- bundled source: GENCODE Human Release 49 (`GRCh38.p14`), reference chromosomes only
+- provenance: generated from `https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.annotation.gtf.gz` using `gene` features only
+
+The package also includes a direct gene BED derived from the same source:
+
+- `forgephast/phenotype/assets/grch38_gencode_v49_genes.bed`
+
+Example:
+
+```yaml
+causal_selection:
+  source_pairs_file: source_pairs.tsv
+  variant_id_column: causal_id
+  maf_columns_by_population:
+    EUR: maf_eur
+    AFR: maf_afr
+  anchor_population: EUR
+  maf_buckets:
+    - name: low
+      maf_min: 0.01
+      maf_max: 0.05
+      fixed_count: 100
+      subset_count: 100
+  annotation_sampling:
+    enabled: true
+    combine_rule: max
+    default_gene_window:
+      enabled: true
+      genome_build: GRCh38
+      upstream_bp: 100000
+      weight_multiplier: 5.0
+```
+
+### Custom BED annotations
+
+You can also provide one or more BED files with independent weight multipliers:
+
+```yaml
+causal_selection:
+  annotation_sampling:
+    enabled: true
+    combine_rule: max
+    variant_chrom_column: chrom
+    variant_pos_column: pos
+    default_gene_window:
+      enabled: false
+    custom_annotations:
+      - name: enhancers
+        bed_file: /path/to/enhancers.bed
+        weight_multiplier: 3.0
+      - name: promoters
+        bed_file: /path/to/promoters.bed
+        weight_multiplier: 2.0
+```
+
+Coordinate conventions:
+
+- source-pool `pos` values are 1-based
+- BED intervals are interpreted as 0-based half-open
+- overlap is tested on the single-base point `pos - 1`
+
+Truth outputs now include per-variant annotation metadata in `truth/causal_membership.tsv`:
+
+- `sampling_weight`
+- `annotation_hit`
+- `annotation_labels`
+
+and a grouped summary in `truth/causal_membership_summary.tsv` with counts and hit fractions by:
+
+- `replicate`
+- `architecture`
+- `cohort`
+- `maf_bucket`
 
 ## Phenotype GWAS prep performance guidance
 

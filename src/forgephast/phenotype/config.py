@@ -9,11 +9,14 @@ from typing import Any, Dict, List
 import yaml
 
 from .config_schema import (
+    AnnotationSamplingConfig,
     ArchitectureConfig,
     BackgroundGeneticConfig,
     CausalSelectionConfig,
     CohortConfig,
     CovariateConfig,
+    CustomAnnotationConfig,
+    DefaultGeneWindowConfig,
     EffectModelConfig,
     GenotypeInputConfig,
     GlobalPCConfig,
@@ -140,6 +143,15 @@ class RunConfig:
         causal_payload["maf_buckets"] = [
             MafBucketConfig(**item) for item in causal_payload.get("maf_buckets", [])
         ]
+        annotation_sampling_payload = dict(causal_payload.get("annotation_sampling", {}))
+        annotation_sampling_payload["default_gene_window"] = DefaultGeneWindowConfig(
+            **annotation_sampling_payload.get("default_gene_window", {})
+        )
+        annotation_sampling_payload["custom_annotations"] = [
+            CustomAnnotationConfig(**item)
+            for item in annotation_sampling_payload.get("custom_annotations", [])
+        ]
+        causal_payload["annotation_sampling"] = AnnotationSamplingConfig(**annotation_sampling_payload)
         causal_selection = CausalSelectionConfig(**causal_payload)
 
         effect_payload = dict(payload.get("effect_model", {}))

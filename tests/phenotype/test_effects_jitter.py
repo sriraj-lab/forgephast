@@ -7,7 +7,11 @@ import pandas as pd
 import pytest
 
 from forgephast.phenotype.config import ArchitectureConfig, EffectModelConfig
-from forgephast.phenotype.effects.betas import build_variant_scale_by_maf, sample_population_specific_betas
+from forgephast.phenotype.effects.betas import (
+    build_variant_scale_by_maf,
+    resolve_effect_geometry,
+    sample_population_specific_betas,
+)
 
 
 def test_correlated_population_betas_match_target_correlation() -> None:
@@ -137,3 +141,54 @@ def test_incompatible_corr_and_shared_base_raises() -> None:
 
     with pytest.raises(ValueError, match="incompatible"):
         sample_population_specific_betas(["v1", "v2"], arch, effect_cfg, replicate_seed=5)
+
+
+def test_auto_fst_mode_resolves_psd_corr_and_base_jitter_floor(tmp_path) -> None:
+    fst_path = tmp_path / "pairwise_fst.tsv"
+    pd.DataFrame(
+        {
+            "population_i": ["EUR"],
+            "population_j": ["AFR"],
+            "fst": [0.05],
+        }
+    ).to_csv(fst_path, sep="\t", index=False)
+
+    effect_cfg = EffectModelConfig(
+        population_order=["EUR", "AFR"],
+        population_corr_mode="auto_from_fst",
+        population_fst_file=str(fst_path),
+        base_jitter_sd=0.3,
+        jitter_sd_by_population={"EUR": 0.5},
+    )
+    effect_cfg.validate()
+
+    geometry = resolve_effect_geometry(effect_cfg)
+    corr = np.asarray(geometry["population_corr_matrix"], dtype=float)
+
+    assert geometry["resolved_jitter_sd_by_population"] == {"EUR": 0.5, "AFR": 0.3}
+    assert np.allclose(corr, corr.T)
+    assert np.allclose(np.diag(corr), np.ones(2))
+    assert float(np.min(np.linalg.eigvalsh(corr))) >= -1e-8
+    assert 0.0 < float(corr[0, 1]) < 1.0
+
+
+def test_auto_fst_mode_rejects_missing_pairs(tmp_path) -> None:
+    fst_path = tmp_path / "pairwise_fst.tsv"
+    pd.DataFrame(
+        {
+            "population_i": ["EUR"],
+            "population_j": ["AFR"],
+            "fst": [0.05],
+        }
+    ).to_csv(fst_path, sep="\t", index=False)
+
+    effect_cfg = EffectModelConfig(
+        population_order=["EUR", "AFR", "EAS"],
+        population_corr_mode="auto_from_fst",
+        population_fst_file=str(fst_path),
+        base_jitter_sd=0.5,
+    )
+    effect_cfg.validate()
+
+    with pytest.raises(ValueError, match="missing pairwise FST entries"):
+        resolve_effect_geometry(effect_cfg)

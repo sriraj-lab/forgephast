@@ -182,6 +182,24 @@ def test_msprime_mixed_simulate_pool_merge_qc_integration(tmp_path):
     assert all(status["reason"] == "skipped_admixed_pair_policy" for status in p3_pair_status)
 
 
+def test_msprime_merge_can_target_deliverable_population_only(tmp_path):
+    cfg_path = _write_msprime_config(tmp_path, name="msprime_merge_subset", admixed=True, n_shards=2)
+    cfg = from_yaml(cfg_path)
+    build_manifest_from_config(cfg)
+
+    simulate_chromosome_population_shard_pool(
+        cfg,
+        chrom=21,
+        n_shards=2,
+        task_workers=2,
+    )
+
+    merge_result = merge_chromosome(cfg, chrom=21, n_shards=2, populations=["P3"])
+    assert merge_result.merged_manifest.exists()
+    assert set(merge_result.population_merged_hapstores.keys()) == {"P3"}
+    assert merge_result.population_merged_hapstores["P3"].exists()
+
+
 def test_single_source_msprime_remains_hard_gated(tmp_path):
     cfg_path = _write_msprime_config(tmp_path, name="msprime_single_source", admixed=False, n_shards=1)
     cfg = from_yaml(cfg_path)

@@ -251,6 +251,7 @@ def merge_chromosome(
     n_shards: int,
     merge_combined: bool | None = None,
     input_root: str | Path | None = None,
+    populations: list[str] | None = None,
 ) -> MergeResult:
     if n_shards <= 0:
         raise ValueError("n_shards must be > 0")
@@ -260,9 +261,23 @@ def merge_chromosome(
 
     input_run_root = Path(input_root) if input_root is not None else config.run_root
 
-    populations = [pop.name for pop in config.populations]
-    if not populations:
+    configured_populations = [pop.name for pop in config.populations]
+    if not configured_populations:
         raise ValueError("No populations configured")
+    if populations is None:
+        populations = configured_populations
+    else:
+        configured_set = set(configured_populations)
+        deduped: list[str] = []
+        for pop in populations:
+            pop_name = str(pop)
+            if pop_name not in configured_set:
+                raise ValueError(f"Unknown merge population: {pop_name}")
+            if pop_name not in deduped:
+                deduped.append(pop_name)
+        if not deduped:
+            raise ValueError("No merge populations requested")
+        populations = deduped
 
     thread_plan = _resolve_thread_plan(config, n_populations=len(populations))
 

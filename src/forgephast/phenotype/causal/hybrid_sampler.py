@@ -7,6 +7,7 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+from .selection import sample_rows_without_replacement
 from ..config import CausalSelectionConfig
 
 
@@ -35,8 +36,11 @@ def sample_membership_for_replicate(
                 f"candidates but subset_count={bucket.subset_count}"
             )
 
-        picks = rng.choice(bucket_df.index.to_numpy(), size=bucket.subset_count, replace=False)
-        sampled = bucket_df.loc[picks].copy()
+        sampled = sample_rows_without_replacement(
+            bucket_df,
+            count=bucket.subset_count,
+            rng=rng,
+        )
         sampled["membership_type"] = "subset"
         sampled_frames.append(sampled)
 

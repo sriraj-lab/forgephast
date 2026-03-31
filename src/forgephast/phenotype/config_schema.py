@@ -209,6 +209,99 @@ class MafBucketConfig:
 
 
 @dataclass
+class DefaultGeneWindowConfig:
+    """Built-in default gene-window enrichment settings."""
+
+    enabled: bool = False
+    genome_build: str = "GRCh38"
+    upstream_bp: int = 100000
+    weight_multiplier: float = 5.0
+
+    def validate(self) -> None:
+        _check_one_of(
+            self.genome_build,
+            {"GRCh38"},
+            "causal_selection.annotation_sampling.default_gene_window.genome_build",
+        )
+        _check_non_negative(
+            self.upstream_bp,
+            "causal_selection.annotation_sampling.default_gene_window.upstream_bp",
+        )
+        if float(self.weight_multiplier) < 1.0:
+            raise ValueError(
+                "causal_selection.annotation_sampling.default_gene_window.weight_multiplier "
+                "must be >= 1.0"
+            )
+
+
+@dataclass
+class CustomAnnotationConfig:
+    """User-supplied BED-backed annotation weighting."""
+
+    name: str
+    bed_file: str
+    weight_multiplier: float
+
+    def validate(self) -> None:
+        _check_non_empty(self.name, "causal_selection.annotation_sampling.custom_annotations.name")
+        _check_non_empty(self.bed_file, "causal_selection.annotation_sampling.custom_annotations.bed_file")
+        if not Path(self.bed_file).exists():
+            raise FileNotFoundError(
+                "causal_selection.annotation_sampling.custom_annotations.bed_file not found: "
+                f"{self.bed_file}"
+            )
+        if float(self.weight_multiplier) < 1.0:
+            raise ValueError(
+                "causal_selection.annotation_sampling.custom_annotations.weight_multiplier "
+                "must be >= 1.0"
+            )
+
+
+@dataclass
+class AnnotationSamplingConfig:
+    """Optional annotation-aware weighting for causal sampling."""
+
+    enabled: bool = False
+    combine_rule: str = "max"
+    variant_chrom_column: str = "chrom"
+    variant_pos_column: str = "pos"
+    default_gene_window: DefaultGeneWindowConfig = field(default_factory=DefaultGeneWindowConfig)
+    custom_annotations: List[CustomAnnotationConfig] = field(default_factory=list)
+
+    def validate(self) -> None:
+        if not self.enabled:
+            return
+        _check_one_of(
+            self.combine_rule,
+            {"max"},
+            "causal_selection.annotation_sampling.combine_rule",
+        )
+        _check_non_empty(
+            self.variant_chrom_column,
+            "causal_selection.annotation_sampling.variant_chrom_column",
+        )
+        _check_non_empty(
+            self.variant_pos_column,
+            "causal_selection.annotation_sampling.variant_pos_column",
+        )
+        self.default_gene_window.validate()
+        names: set[str] = set()
+        for item in self.custom_annotations:
+            item.validate()
+            if item.name in names:
+                raise ValueError(
+                    "causal_selection.annotation_sampling.custom_annotations names must be unique; "
+                    f"duplicate={item.name}"
+                )
+            names.add(item.name)
+        if not self.default_gene_window.enabled and not self.custom_annotations:
+            raise ValueError(
+                "causal_selection.annotation_sampling requires either default_gene_window.enabled=true "
+                "or at least one custom_annotations entry"
+            )
+
+
+@dataclass
 class CausalSelectionConfig:
     """Causal pool and MAF bucket selection settings."""
 
@@ -217,6 +310,7 @@ class CausalSelectionConfig:
     maf_columns_by_population: Dict[str, str] = field(default_factory=dict)
     anchor_population: Optional[str] = None
     maf_buckets: List[MafBucketConfig] = field(default_factory=list)
+    annotation_sampling: AnnotationSamplingConfig = field(default_factory=AnnotationSamplingConfig)
     random_seed: int = 42
 
     def validate(self) -> None:
@@ -242,6 +336,7 @@ class CausalSelectionConfig:
                     f"MAF buckets overlap: {left.name} ({left.maf_min}-{left.maf_max}) "
                     f"and {right.name} ({right.maf_min}-{right.maf_max})"
                 )
+        self.annotation_sampling.validate()
 
 
 @dataclass
@@ -268,6 +363,7 @@ class EffectModelConfig:
 
     base_beta_distribution: str = "normal"
     base_beta_sd: float = 1.0
+    base_jitter_sd: float = 0.0
     student_t_df: float = 4.0
     mixture_slab_prob: float = 0.1
     mixture_slab_sd_ratio: float = 10.0
@@ -276,9 +372,16 @@ class EffectModelConfig:
     maf_min_clip: float = 1e-4
     maf_max_clip: float = 0.4999
     population_jitter_mode: str = "correlated_deltas"
+    population_corr_mode: str = "manual"
     population_order: List[str] = field(default_factory=list)
     population_corr_matrix: List[List[float]] = field(default_factory=list)
     jitter_sd_by_population: Dict[str, float] = field(default_factory=dict)
+    population_fst_file: str = ""
+    population_fst_population_i_column: str = "population_i"
+    population_fst_population_j_column: str = "population_j"
+    population_fst_value_column: str = "fst"
+    fst_corr_transform: str = "exp_decay"
+    fst_corr_lambda: float = 10.0
     metapopulation_jitter: List[MetapopulationJitterConfig] = field(default_factory=list)
     random_seed: int = 42
 
@@ -313,21 +416,53 @@ class EffectModelConfig:
             {"correlated_deltas"},
             "effect_model.population_jitter_mode",
         )
+        _check_one_of(
+            self.population_corr_mode,
+            {"manual", "auto_from_fst"},
+            "effect_model.population_corr_mode",
+        )
         if not self.population_order:
             raise ValueError("effect_model.population_order cannot be empty")
+        _check_non_negative(self.base_jitter_sd, "effect_model.base_jitter_sd")
         for pop in self.population_order:
             _check_non_negative(
-                self.jitter_sd_by_population.get(pop, 0.0),
+                self.jitter_sd_by_population.get(pop, self.base_jitter_sd),
                 f"effect_model jitter SD for {pop}",
             )
-        if not self.population_corr_matrix:
-            size = len(self.population_order)
-            self.population_corr_matrix = np.eye(size).tolist()
-        _validate_correlation_matrix(
-            self.population_corr_matrix,
-            len(self.population_order),
-            "effect_model.population_corr_matrix",
-        )
+        if self.population_corr_mode == "manual":
+            if not self.population_corr_matrix:
+                size = len(self.population_order)
+                self.population_corr_matrix = np.eye(size).tolist()
+            _validate_correlation_matrix(
+                self.population_corr_matrix,
+                len(self.population_order),
+                "effect_model.population_corr_matrix",
+            )
+        else:
+            if self.population_corr_matrix:
+                raise ValueError(
+                    "effect_model.population_corr_matrix must be omitted when "
+                    "population_corr_mode=auto_from_fst"
+                )
+            _check_non_empty(self.population_fst_file, "effect_model.population_fst_file")
+            _check_non_empty(
+                self.population_fst_population_i_column,
+                "effect_model.population_fst_population_i_column",
+            )
+            _check_non_empty(
+                self.population_fst_population_j_column,
+                "effect_model.population_fst_population_j_column",
+            )
+            _check_non_empty(
+                self.population_fst_value_column,
+                "effect_model.population_fst_value_column",
+            )
+            _check_one_of(
+                self.fst_corr_transform,
+                {"exp_decay"},
+                "effect_model.fst_corr_transform",
+            )
+            _check_positive(self.fst_corr_lambda, "effect_model.fst_corr_lambda")
         for item in self.metapopulation_jitter:
             item.validate()
 
@@ -427,6 +562,8 @@ class VarianceBudgetConfig:
     h2_bg: float = 0.0
     covariate: float = 0.2
     residual: float = 0.4
+    h2_jitter_sd: float = 0.0
+    h2_jitter_seed: int = 42
     strict_sum_to_one: bool = True
 
     def validate(self) -> None:
@@ -437,6 +574,7 @@ class VarianceBudgetConfig:
             ("residual", self.residual),
         ]:
             _check_non_negative(val, f"variance_budget.{name}")
+        _check_non_negative(self.h2_jitter_sd, "variance_budget.h2_jitter_sd")
         total = float(self.h2_fixed + self.h2_bg + self.covariate + self.residual)
         if self.strict_sum_to_one:
             if not np.isclose(total, 1.0, atol=1e-6):

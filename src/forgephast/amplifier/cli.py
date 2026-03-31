@@ -73,6 +73,12 @@ def _parse_args() -> argparse.Namespace:
     )
     p_merge.add_argument("--chrom", required=True, type=int)
     p_merge.add_argument("--n-shards", required=True, type=int)
+    p_merge.add_argument(
+        "--population",
+        action="append",
+        default=None,
+        help="Restrict merge to one or more configured population names. Repeat for multiple populations.",
+    )
     p_merge.add_argument("--merge-combined", dest="merge_combined", action="store_true")
     p_merge.add_argument("--no-merge-combined", dest="merge_combined", action="store_false")
     p_merge.set_defaults(merge_combined=None)
@@ -183,6 +189,7 @@ def main() -> None:
             chrom=args.chrom,
             n_shards=args.n_shards,
             merge_combined=args.merge_combined,
+            populations=args.population,
         )
         logger.info("combined_hapstore=%s", result.combined_hapstore)
         logger.info("merged_manifest=%s", result.merged_manifest)

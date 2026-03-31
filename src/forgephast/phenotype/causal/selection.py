@@ -9,6 +9,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
+from .annotations import annotate_sampling_weights
 from ..config import CausalSelectionConfig, MafBucketConfig
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,32 @@ class BucketedPool:
 def _bucket_mask(df: pd.DataFrame, maf_col: str, bucket: MafBucketConfig) -> pd.Series:
     """Boolean mask for selecting rows in one MAF bucket."""
     return (df[maf_col] >= bucket.maf_min) & (df[maf_col] < bucket.maf_max)
+
+
+def sample_rows_without_replacement(
+    df: pd.DataFrame,
+    *,
+    count: int,
+    rng: np.random.Generator,
+    weight_column: str = "sampling_weight",
+) -> pd.DataFrame:
+    """Sample rows without replacement, optionally using per-row weights."""
+    if count == 0:
+        return df.iloc[0:0].copy()
+    if count > len(df):
+        raise ValueError(f"Cannot sample count={count} from only {len(df)} rows")
+
+    weights = pd.to_numeric(df.get(weight_column, 1.0), errors="raise").to_numpy(dtype=np.float64)
+    if np.any(~np.isfinite(weights)) or np.any(weights <= 0.0):
+        raise ValueError(f"Sampling weights in column {weight_column!r} must be finite and > 0")
+
+    indices = df.index.to_numpy()
+    if np.allclose(weights, weights[0]):
+        picks = rng.choice(indices, size=count, replace=False)
+    else:
+        probs = weights / weights.sum()
+        picks = rng.choice(indices, size=count, replace=False, p=probs)
+    return df.loc[picks].copy()
 
 
 def load_causal_pool(config: CausalSelectionConfig) -> pd.DataFrame:
@@ -67,7 +94,7 @@ def load_causal_pool(config: CausalSelectionConfig) -> pd.DataFrame:
     if df.empty:
         raise ValueError("No variants remain in causal pool after MAF bucket assignment")
 
-    return df
+    return annotate_sampling_weights(df, config)
 
 
 def select_fixed_set(
@@ -90,8 +117,11 @@ def select_fixed_set(
         if bucket.fixed_count == 0:
             continue
 
-        picks = rng.choice(bucket_df.index.to_numpy(), size=bucket.fixed_count, replace=False)
-        fixed_bucket = bucket_df.loc[picks].copy()
+        fixed_bucket = sample_rows_without_replacement(
+            bucket_df,
+            count=bucket.fixed_count,
+            rng=rng,
+        )
         fixed_bucket["membership_type"] = "fixed"
         fixed_frames.append(fixed_bucket)
 

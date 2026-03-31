@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -136,12 +137,126 @@ def _population_jitter_covariance(
     return delta_cov
 
 
+def _resolve_population_jitter_sds(effect_model: EffectModelConfig) -> Dict[str, float]:
+    """Resolve per-population jitter SDs using explicit overrides plus a base floor."""
+    return {
+        pop: float(effect_model.jitter_sd_by_population.get(pop, effect_model.base_jitter_sd))
+        for pop in effect_model.population_order
+    }
+
+
+def _load_population_fst_matrix(effect_model: EffectModelConfig) -> np.ndarray:
+    """Load a symmetric pairwise-FST matrix in population_order."""
+    fst_df = pd.read_csv(effect_model.population_fst_file, sep=None, engine="python")
+    required_cols = {
+        effect_model.population_fst_population_i_column,
+        effect_model.population_fst_population_j_column,
+        effect_model.population_fst_value_column,
+    }
+    missing = required_cols.difference(fst_df.columns)
+    if missing:
+        raise ValueError(
+            f"population_fst_file missing required columns: {sorted(missing)}"
+        )
+
+    pop_to_idx = {pop: idx for idx, pop in enumerate(effect_model.population_order)}
+    size = len(effect_model.population_order)
+    matrix = np.full((size, size), np.nan, dtype=float)
+    np.fill_diagonal(matrix, 0.0)
+
+    for _, row in fst_df.iterrows():
+        pop_i = str(row[effect_model.population_fst_population_i_column])
+        pop_j = str(row[effect_model.population_fst_population_j_column])
+        if pop_i == pop_j:
+            continue
+        if pop_i not in pop_to_idx or pop_j not in pop_to_idx:
+            raise ValueError(
+                f"population_fst_file contains unknown populations: ({pop_i}, {pop_j})"
+            )
+        fst = float(row[effect_model.population_fst_value_column])
+        if not np.isfinite(fst) or fst < 0.0:
+            raise ValueError(
+                f"Invalid FST value for pair ({pop_i}, {pop_j}): {fst!r}"
+            )
+        i = pop_to_idx[pop_i]
+        j = pop_to_idx[pop_j]
+        if np.isfinite(matrix[i, j]) and not np.isclose(matrix[i, j], fst, atol=1e-8):
+            raise ValueError(
+                f"population_fst_file has inconsistent duplicate FST values for ({pop_i}, {pop_j})"
+            )
+        matrix[i, j] = fst
+        matrix[j, i] = fst
+
+    missing_pairs = []
+    for i in range(size):
+        for j in range(i + 1, size):
+            if not np.isfinite(matrix[i, j]):
+                missing_pairs.append((effect_model.population_order[i], effect_model.population_order[j]))
+    if missing_pairs:
+        preview = ", ".join(f"({a}, {b})" for a, b in missing_pairs[:5])
+        raise ValueError(
+            f"population_fst_file missing pairwise FST entries for {len(missing_pairs)} pairs; first few: {preview}"
+        )
+    return matrix
+
+
+def _project_to_psd_correlation(matrix: np.ndarray) -> np.ndarray:
+    """Project a symmetric matrix to the nearest PSD correlation-like matrix."""
+    corr = 0.5 * (np.asarray(matrix, dtype=float) + np.asarray(matrix, dtype=float).T)
+    evals, evecs = np.linalg.eigh(corr)
+    evals = np.clip(evals, a_min=0.0, a_max=None)
+    projected = evecs @ np.diag(evals) @ evecs.T
+    projected = 0.5 * (projected + projected.T)
+    diag = np.diag(projected)
+    if np.any(diag <= 0.0) or not np.all(np.isfinite(diag)):
+        raise ValueError("Derived population correlation matrix could not be normalized to unit diagonal")
+    scale = np.sqrt(diag)
+    projected = projected / np.outer(scale, scale)
+    np.fill_diagonal(projected, 1.0)
+    projected = 0.5 * (projected + projected.T)
+    evals = np.linalg.eigvalsh(projected)
+    if float(np.min(evals)) < -1e-8:
+        raise ValueError(
+            "Derived population correlation matrix is not positive semidefinite after projection"
+        )
+    return projected
+
+
+def resolve_effect_geometry(effect_model: EffectModelConfig) -> Dict[str, object]:
+    """Resolve auditable population jitter SDs and correlation geometry."""
+    resolved_jitter = _resolve_population_jitter_sds(effect_model)
+    if effect_model.population_corr_mode == "manual":
+        corr = np.asarray(effect_model.population_corr_matrix, dtype=float)
+        fst_path = ""
+    else:
+        fst_matrix = _load_population_fst_matrix(effect_model)
+        if effect_model.fst_corr_transform != "exp_decay":
+            raise ValueError(
+                f"Unsupported effect_model.fst_corr_transform={effect_model.fst_corr_transform!r}"
+            )
+        corr = np.exp(-float(effect_model.fst_corr_lambda) * fst_matrix)
+        np.fill_diagonal(corr, 1.0)
+        corr = _project_to_psd_correlation(corr)
+        fst_path = str(effect_model.population_fst_file)
+    return {
+        "population_corr_mode": str(effect_model.population_corr_mode),
+        "base_jitter_sd": float(effect_model.base_jitter_sd),
+        "resolved_jitter_sd_by_population": resolved_jitter,
+        "population_corr_matrix": corr,
+        "population_corr_matrix_json": json.dumps(corr.tolist()),
+        "population_fst_file": fst_path,
+        "fst_corr_transform": str(effect_model.fst_corr_transform),
+        "fst_corr_lambda": float(effect_model.fst_corr_lambda),
+    }
+
+
 def sample_population_specific_betas(
     variant_ids: List[str],
     architecture: ArchitectureConfig,
     effect_model: EffectModelConfig,
     replicate_seed: int,
     variant_scale_by_id: Optional[Dict[str, float]] = None,
+    resolved_geometry: Optional[Dict[str, object]] = None,
 ) -> pd.DataFrame:
     """Sample per-variant per-population betas with calibrated total correlation."""
     rng = np.random.default_rng(replicate_seed)
@@ -149,11 +264,12 @@ def sample_population_specific_betas(
     base_beta_sd = _resolve_base_beta_sd(architecture, effect_model)
 
     pop_order = effect_model.population_order
-    corr = np.asarray(effect_model.population_corr_matrix, dtype=float)
+    geometry = resolved_geometry or resolve_effect_geometry(effect_model)
+    corr = np.asarray(geometry["population_corr_matrix"], dtype=float)
     cov = _population_jitter_covariance(
         pop_order,
         corr,
-        effect_model.jitter_sd_by_population,
+        geometry["resolved_jitter_sd_by_population"],
         base_beta_sd=base_beta_sd,
     )
 

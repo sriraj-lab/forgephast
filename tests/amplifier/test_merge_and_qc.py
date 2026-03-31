@@ -150,6 +150,33 @@ def test_merge_from_population_shards_when_combined_shard_output_disabled(tmp_pa
     assert diag["synthetic_shard_round_robin"]["status"] == "ok"
 
 
+def test_merge_can_restrict_to_population_subset(tmp_path):
+    cfg_path = write_test_config(tmp_path, name="merge_subset")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["outputs"]["write_combined_shard_output"] = False
+    payload["outputs"]["merge_combined_populations"] = False
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    cfg = from_yaml(cfg_path)
+    build_manifest_from_config(cfg)
+    simulate_chromosome_population_shard_pool(
+        cfg,
+        chrom=21,
+        n_shards=2,
+        task_workers=2,
+        threads_per_task=1,
+        task_start_method="fork",
+    )
+
+    merge_result = merge_chromosome(cfg, chrom=21, n_shards=2, populations=["P2"])
+    assert merge_result.combined_hapstore is None
+    assert set(merge_result.population_merged_hapstores.keys()) == {"P2"}
+    assert merge_result.population_merged_hapstores["P2"].exists()
+    assert merge_result.merged_manifest.exists()
+
+
 def test_merge_and_qc_hapstore_only_when_vcf_output_disabled(tmp_path):
     cfg_path = write_test_config(tmp_path, name="merge_hapstore_only")
     with open(cfg_path, "r", encoding="utf-8") as handle:

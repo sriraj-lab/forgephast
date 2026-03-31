@@ -153,6 +153,66 @@ def test_rejects_invalid_population_corr() -> None:
         RunConfig.from_dict(payload)
 
 
+def test_auto_fst_mode_requires_fst_file() -> None:
+    payload = _base_payload()
+    payload["effect_model"]["population_corr_mode"] = "auto_from_fst"
+    payload["effect_model"]["population_corr_matrix"] = []
+    with pytest.raises(ValueError, match="population_fst_file"):
+        RunConfig.from_dict(payload)
+
+
+def test_auto_fst_mode_rejects_manual_corr_matrix() -> None:
+    payload = _base_payload()
+    payload["effect_model"]["population_corr_mode"] = "auto_from_fst"
+    payload["effect_model"]["population_fst_file"] = "/tmp/fst.tsv"
+    with pytest.raises(ValueError, match="must be omitted"):
+        RunConfig.from_dict(payload)
+
+
+def test_annotation_sampling_rejects_missing_bed_path() -> None:
+    payload = _base_payload()
+    payload["causal_selection"]["annotation_sampling"] = {
+        "enabled": True,
+        "custom_annotations": [
+            {
+                "name": "enhancers",
+                "bed_file": "/tmp/does_not_exist.bed",
+                "weight_multiplier": 2.0,
+            }
+        ],
+    }
+    with pytest.raises(FileNotFoundError, match="bed_file not found"):
+        RunConfig.from_dict(payload)
+
+
+def test_annotation_sampling_rejects_invalid_weight_multiplier() -> None:
+    payload = _base_payload()
+    payload["causal_selection"]["annotation_sampling"] = {
+        "enabled": True,
+        "default_gene_window": {
+            "enabled": True,
+            "genome_build": "GRCh38",
+            "weight_multiplier": 0.5,
+        },
+    }
+    with pytest.raises(ValueError, match="weight_multiplier"):
+        RunConfig.from_dict(payload)
+
+
+def test_annotation_sampling_rejects_unsupported_genome_build() -> None:
+    payload = _base_payload()
+    payload["causal_selection"]["annotation_sampling"] = {
+        "enabled": True,
+        "default_gene_window": {
+            "enabled": True,
+            "genome_build": "GRCh37",
+            "weight_multiplier": 2.0,
+        },
+    }
+    with pytest.raises(ValueError, match="genome_build"):
+        RunConfig.from_dict(payload)
+
+
 def test_rejects_invalid_maf_scaling_mode() -> None:
     payload = _base_payload()
     payload["effect_model"]["maf_scaling_mode"] = "invalid"
