@@ -266,3 +266,69 @@ def test_build_roundtrip_report_ids_only_reuses_base_truth(tmp_path: Path) -> No
     )
 
     assert report_path.exists()
+
+
+def test_build_roundtrip_report_regenie_resolves_assoc_output_and_parses_trait_suffix_columns(
+    tmp_path: Path,
+) -> None:
+    cfg = RunConfig.from_dict(_base_payload(tmp_path))
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    truth_dir = run_dir / "truth"
+    truth_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(
+        {
+            "variant_id": ["chr1:10", "chr1:20", "chr1:10", "chr1:20"],
+            "population": ["EUR", "EUR", "AFR", "AFR"],
+            "beta": [0.5, -0.4, 0.5, -0.4],
+            "dosage_effect_allele": ["A", "G", "A", "G"],
+            "architecture": ["a1", "a1", "a1", "a1"],
+            "cohort": ["c1", "c1", "c1", "c1"],
+            "replicate": [1, 1, 1, 1],
+        }
+    ).to_csv(truth_dir / "effect_sizes.tsv", sep="\t", index=False)
+
+    pd.DataFrame(
+        {
+            "causal_id": ["chr1:10", "chr1:20"],
+            "replicate": [1, 1],
+            "architecture": ["a1", "a1"],
+            "cohort": ["c1", "c1"],
+        }
+    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+
+    assoc_path = run_dir / "step2.regenie.gz"
+    ydict_path = run_dir / "step2.regenie.Ydict"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with gzip.open(assoc_path, "wt", encoding="utf-8") as handle:
+        handle.write(
+            "CHROM GENPOS ID ALLELE0 ALLELE1 A1FREQ N TEST BETA.Y1 SE.Y1 CHISQ.Y1 LOG10P.Y1 EXTRA\n"
+        )
+        handle.write("1 10 rs1 C A 0.1 2 ADD 0.45 0.1 20 9.0 NA\n")
+        handle.write("1 20 rs2 G A 0.1 2 ADD 0.35 0.1 20 8.0 NA\n")
+    ydict_path.write_text("Y1 PHENO\n", encoding="utf-8")
+
+    gwas_manifest_path = run_dir / "gwas_manifest.tsv"
+    pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "engine": ["regenie"],
+            "status": ["success"],
+            "primary_output": [str(ydict_path)],
+        }
+    ).to_csv(gwas_manifest_path, sep="\t", index=False)
+
+    report_path = build_roundtrip_report(
+        run_cfg=cfg,
+        run_dir=run_dir,
+        gwas_manifest_path=gwas_manifest_path,
+    )
+
+    report = pd.read_csv(report_path, sep="\t")
+    assert report.shape[0] == 1
+    assert int(report.loc[0, "n_assoc_variants"]) == 2
+    assert int(report.loc[0, "n_overlap"]) == 2
+    assert int(report.loc[0, "top_k_causal_count"]) == 2

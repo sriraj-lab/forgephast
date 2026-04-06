@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,31 +17,62 @@ from ..local_ancestry.tracts import load_tracts_tsv_gz
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class RoundTripComparison:
+    """Per-engine round-trip comparison payload for reports and plots."""
+
+    run_name: str
+    replicate: int
+    architecture: str
+    cohort: str
+    engine: str
+    assoc_path: Path
+    assoc_df: pd.DataFrame
+    truth_df: pd.DataFrame
+    merged_df: pd.DataFrame
+    top_df: pd.DataFrame
+    metrics: dict[str, Any]
+
+
 def _choose_column(columns: list[str], candidates: list[str]) -> str | None:
     lookup = {c.lower(): c for c in columns}
     for candidate in candidates:
-        found = lookup.get(candidate.lower())
+        needle = candidate.lower()
+        found = lookup.get(needle)
         if found is not None:
             return found
+        for lowered, original in lookup.items():
+            if lowered.startswith(f"{needle}.") or lowered.startswith(f"{needle}_"):
+                return original
     return None
 
 
 def _read_assoc_table(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep=r"\s+", compression="infer")
-    id_col = _choose_column(list(df.columns), ["ID", "SNP", "VARIANT"])
-    if id_col is None:
-        chrom_col = _choose_column(list(df.columns), ["#CHROM", "CHROM"])
-        pos_col = _choose_column(list(df.columns), ["POS", "BP"])
-        if chrom_col is None or pos_col is None:
-            raise ValueError(f"Unable to infer variant identifier columns from {path}")
+    chrom_col = _choose_column(list(df.columns), ["#CHROM", "CHROM"])
+    pos_col = _choose_column(list(df.columns), ["POS", "BP", "GENPOS"])
+    chrom_values = pd.Series(pd.NA, index=df.index, dtype="object")
+    pos_values = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    if chrom_col is not None and pos_col is not None:
+        chrom_values = (
+            df[chrom_col].astype(str).str.replace("^chr", "", regex=True)
+        )
+        pos_values = pd.to_numeric(df[pos_col], errors="coerce").astype("Int64")
         df["variant_id"] = (
             "chr"
-            + df[chrom_col].astype(str).str.replace("^chr", "", regex=True)
+            + chrom_values.astype(str)
             + ":"
-            + df[pos_col].astype(str)
+            + pos_values.astype(str)
         )
     else:
+        id_col = _choose_column(list(df.columns), ["ID", "SNP", "VARIANT"])
+        if id_col is None:
+            raise ValueError(f"Unable to infer variant identifier columns from {path}")
         df["variant_id"] = df[id_col].astype(str)
+        parsed = df["variant_id"].str.extract(r"^chr(?P<chrom>[^:]+):(?P<pos>\d+)$")
+        if not parsed.empty:
+            chrom_values = parsed["chrom"].astype("object")
+            pos_values = pd.to_numeric(parsed["pos"], errors="coerce").astype("Int64")
 
     beta_col = _choose_column(list(df.columns), ["BETA", "Effect"])
     if beta_col is None:
@@ -58,7 +90,31 @@ def _read_assoc_table(path: Path) -> pd.DataFrame:
 
     allele_col = _choose_column(list(df.columns), ["A1", "ALLELE1", "ALT"])
     df["gwas_effect_allele"] = "" if allele_col is None else df[allele_col].astype(str)
-    return df[["variant_id", "beta_hat", "p_value", "gwas_effect_allele"]].copy()
+    df["chrom"] = chrom_values
+    df["pos"] = pos_values
+    return df[["variant_id", "chrom", "pos", "beta_hat", "p_value", "gwas_effect_allele"]].copy()
+
+
+def _resolve_assoc_output_path(engine: str, primary_output: Path) -> Path:
+    if engine.lower() != "regenie":
+        return primary_output
+    if primary_output.name.endswith(".regenie") or primary_output.name.endswith(".regenie.gz"):
+        return primary_output
+
+    out_dir = primary_output.parent
+    candidates = [
+        path
+        for path in sorted(out_dir.glob("step2*.regenie*"))
+        if path.exists() and path.stat().st_size > 0
+    ]
+    assoc_candidates = [
+        path
+        for path in candidates
+        if path.name.endswith(".regenie") or path.name.endswith(".regenie.gz")
+    ]
+    if assoc_candidates:
+        return assoc_candidates[0]
+    return primary_output
 
 
 def _admix_population_mass(
@@ -182,6 +238,65 @@ def _weighted_truth_effects(
     return out
 
 
+def _membership_subset(
+    *,
+    membership_df: pd.DataFrame,
+    replicate: int,
+    architecture: str,
+    cohort: str,
+    variant_id_column: str,
+) -> pd.DataFrame:
+    rows = membership_df[
+        (membership_df["replicate"] == int(replicate))
+        & (membership_df["architecture"] == str(architecture))
+        & (membership_df["cohort"] == str(cohort))
+    ].copy()
+    if rows.empty:
+        return pd.DataFrame(
+            columns=["variant_id", "sampling_weight", "annotation_hit", "annotation_labels"]
+        )
+    keep_cols = [variant_id_column]
+    for optional in ("sampling_weight", "annotation_hit", "annotation_labels"):
+        if optional in rows.columns:
+            keep_cols.append(optional)
+    out = rows[keep_cols].rename(columns={variant_id_column: "variant_id"}).copy()
+    if "sampling_weight" not in out.columns:
+        out["sampling_weight"] = 1.0
+    else:
+        out["sampling_weight"] = pd.to_numeric(out["sampling_weight"], errors="coerce").fillna(1.0)
+    if "annotation_hit" not in out.columns:
+        out["annotation_hit"] = False
+    else:
+        out["annotation_hit"] = out["annotation_hit"].fillna(False).astype(bool)
+    if "annotation_labels" not in out.columns:
+        out["annotation_labels"] = ""
+    else:
+        out["annotation_labels"] = out["annotation_labels"].fillna("").astype(str)
+    out = out.drop_duplicates(subset=["variant_id"], keep="first").reset_index(drop=True)
+    return out
+
+
+def merge_assoc_truth_effects(
+    assoc_df: pd.DataFrame,
+    truth_weighted: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge association and truth tables with allele-aware beta harmonization."""
+    merged = assoc_df.merge(truth_weighted, on="variant_id", how="inner")
+    if merged.empty:
+        merged["beta_hat_harmonized"] = pd.Series(dtype=float)
+        return merged
+    merged["beta_hat_harmonized"] = merged["beta_hat"].astype(float)
+    allele_present = (
+        merged["gwas_effect_allele"].astype(str) != ""
+    ) & (merged["dosage_effect_allele"].astype(str) != "")
+    flip_mask = allele_present & (
+        merged["gwas_effect_allele"].astype(str).str.upper()
+        != merged["dosage_effect_allele"].astype(str).str.upper()
+    )
+    merged.loc[flip_mask, "beta_hat_harmonized"] *= -1.0
+    return merged
+
+
 def _linear_metrics(merged: pd.DataFrame) -> Tuple[float, float, float, float]:
     if merged.shape[0] < 2:
         return np.nan, np.nan, np.nan, np.nan
@@ -218,13 +333,13 @@ def _resolve_truth_dir(run_dir: Path) -> Path:
     return truth_dir
 
 
-def build_roundtrip_report(
+def collect_roundtrip_details(
     *,
     run_cfg: RunConfig,
     run_dir: Path,
     gwas_manifest_path: Path,
-) -> Path:
-    """Build GWAS-vs-truth validation report and enforce configured gates."""
+) -> tuple[pd.DataFrame, list[RoundTripComparison], list[str]]:
+    """Collect per-comparison round-trip detail tables for reports and plots."""
     gwas_manifest = pd.read_csv(gwas_manifest_path, sep="\t")
     gwas_manifest = gwas_manifest[gwas_manifest["status"] == "success"].copy()
     if gwas_manifest.empty:
@@ -246,13 +361,14 @@ def build_roundtrip_report(
     pop_weights_cache: Dict[str, Dict[str, float]] = {}
 
     rows = []
-    failures = []
+    failures: list[str] = []
+    comparisons: list[RoundTripComparison] = []
     for _, row in gwas_manifest.iterrows():
         replicate = int(row["replicate"])
         architecture = str(row["architecture"])
         cohort_name = str(row["cohort"])
         engine = str(row["engine"])
-        assoc_path = Path(str(row["primary_output"]))
+        assoc_path = _resolve_assoc_output_path(engine, Path(str(row["primary_output"])))
         if not assoc_path.exists():
             raise FileNotFoundError(f"GWAS primary output missing: {assoc_path}")
 
@@ -272,52 +388,73 @@ def build_roundtrip_report(
             pop_weights=pop_weights_cache[cohort_name],
             default_population=default_pop,
         )
-        merged = assoc.merge(truth_weighted, on="variant_id", how="inner")
+        membership_subset = _membership_subset(
+            membership_df=membership_df,
+            replicate=replicate,
+            architecture=architecture,
+            cohort=cohort_name,
+            variant_id_column=run_cfg.causal_selection.variant_id_column,
+        )
+        assoc = assoc.merge(membership_subset, on="variant_id", how="left")
+        assoc["sampling_weight"] = pd.to_numeric(
+            assoc.get("sampling_weight", 1.0), errors="coerce"
+        ).fillna(1.0)
+        annotation_hit = assoc.get("annotation_hit")
+        if annotation_hit is None:
+            assoc["annotation_hit"] = False
+        else:
+            assoc["annotation_hit"] = (
+                annotation_hit.astype("boolean").fillna(False).astype(bool)
+            )
+        annotation_labels = assoc.get("annotation_labels")
+        if annotation_labels is None:
+            assoc["annotation_labels"] = ""
+        else:
+            assoc["annotation_labels"] = annotation_labels.fillna("").astype(str)
+        causal_set = set(membership_subset["variant_id"].astype(str).tolist())
+        assoc["is_causal"] = assoc["variant_id"].astype(str).isin(causal_set)
+        merged = merge_assoc_truth_effects(assoc, truth_weighted)
         if merged.empty:
-            rows.append(
-                {
-                    "run_name": str(row["run_name"]),
-                    "replicate": replicate,
-                    "architecture": architecture,
-                    "cohort": cohort_name,
-                    "engine": engine,
-                    "n_assoc_variants": int(assoc.shape[0]),
-                    "n_truth_variants": int(truth_weighted.shape[0]),
-                    "n_overlap": 0,
-                    "beta_slope": np.nan,
-                    "beta_intercept": np.nan,
-                    "beta_corr": np.nan,
-                    "sign_concordance": np.nan,
-                    "top_k": int(run_cfg.roundtrip_validation.top_k),
-                    "top_k_causal_count": 0,
-                    "top_k_causal_fraction": 0.0,
-                }
+            metrics = {
+                "run_name": str(row["run_name"]),
+                "replicate": replicate,
+                "architecture": architecture,
+                "cohort": cohort_name,
+                "engine": engine,
+                "n_assoc_variants": int(assoc.shape[0]),
+                "n_truth_variants": int(truth_weighted.shape[0]),
+                "n_overlap": 0,
+                "beta_slope": np.nan,
+                "beta_intercept": np.nan,
+                "beta_corr": np.nan,
+                "sign_concordance": np.nan,
+                "top_k": int(run_cfg.roundtrip_validation.top_k),
+                "top_k_causal_count": 0,
+                "top_k_causal_fraction": 0.0,
+            }
+            rows.append(metrics)
+            comparisons.append(
+                RoundTripComparison(
+                    run_name=str(row["run_name"]),
+                    replicate=replicate,
+                    architecture=architecture,
+                    cohort=cohort_name,
+                    engine=engine,
+                    assoc_path=assoc_path,
+                    assoc_df=assoc,
+                    truth_df=truth_weighted,
+                    merged_df=merged,
+                    top_df=assoc.sort_values("p_value", ascending=True).head(
+                        int(run_cfg.roundtrip_validation.top_k)
+                    ).copy(),
+                    metrics=metrics,
+                )
             )
             continue
 
-        merged["beta_hat_harmonized"] = merged["beta_hat"].astype(float)
-        allele_present = (
-            merged["gwas_effect_allele"].astype(str) != ""
-        ) & (merged["dosage_effect_allele"].astype(str) != "")
-        flip_mask = allele_present & (
-            merged["gwas_effect_allele"].astype(str).str.upper()
-            != merged["dosage_effect_allele"].astype(str).str.upper()
-        )
-        merged.loc[flip_mask, "beta_hat_harmonized"] *= -1.0
-
         slope, intercept, corr, sign = _linear_metrics(merged)
-        causal_set = set(
-            membership_df[
-                (membership_df["replicate"] == replicate)
-                & (membership_df["architecture"] == architecture)
-                & (membership_df["cohort"] == cohort_name)
-            ][run_cfg.causal_selection.variant_id_column]
-            .astype(str)
-            .tolist()
-        )
         top_k = int(run_cfg.roundtrip_validation.top_k)
         top = assoc.sort_values("p_value", ascending=True).head(top_k).copy()
-        top["is_causal"] = top["variant_id"].astype(str).isin(causal_set)
         top_causal = int(top["is_causal"].sum())
         top_frac = float(top_causal / max(1, top.shape[0]))
 
@@ -339,6 +476,21 @@ def build_roundtrip_report(
             "top_k_causal_fraction": top_frac,
         }
         rows.append(metrics)
+        comparisons.append(
+            RoundTripComparison(
+                run_name=str(row["run_name"]),
+                replicate=replicate,
+                architecture=architecture,
+                cohort=cohort_name,
+                engine=engine,
+                assoc_path=assoc_path,
+                assoc_df=assoc,
+                truth_df=truth_weighted,
+                merged_df=merged,
+                top_df=top,
+                metrics=metrics,
+            )
+        )
 
         if (
             run_cfg.roundtrip_validation.require_positive_slope
@@ -351,6 +503,21 @@ def build_roundtrip_report(
             )
 
     report_df = pd.DataFrame(rows)
+    return report_df, comparisons, failures
+
+
+def build_roundtrip_report(
+    *,
+    run_cfg: RunConfig,
+    run_dir: Path,
+    gwas_manifest_path: Path,
+) -> Path:
+    """Build GWAS-vs-truth validation report and enforce configured gates."""
+    report_df, _, failures = collect_roundtrip_details(
+        run_cfg=run_cfg,
+        run_dir=run_dir,
+        gwas_manifest_path=gwas_manifest_path,
+    )
     report_path = (
         Path(run_cfg.roundtrip_validation.report_path)
         if run_cfg.roundtrip_validation.report_path

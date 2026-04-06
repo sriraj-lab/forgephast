@@ -750,6 +750,35 @@ class RoundTripValidationConfig:
 
 
 @dataclass
+class RoundTripPlotConfig:
+    """Optional round-trip diagnostic plotting settings."""
+
+    enabled: bool = False
+    formats: List[str] = field(default_factory=lambda: ["png"])
+    dpi: int = 200
+    sample_group_file: Optional[str] = None
+    id_column: str = "IID"
+    group_column: str = "population"
+
+    def validate(self) -> None:
+        if not self.formats:
+            raise ValueError("roundtrip_plots.formats cannot be empty")
+        allowed = {"png", "pdf", "svg"}
+        bad = [fmt for fmt in self.formats if str(fmt).lower() not in allowed]
+        if bad:
+            raise ValueError(
+                f"roundtrip_plots.formats must be a subset of {sorted(allowed)}; got {bad}"
+            )
+        _check_positive(int(self.dpi), "roundtrip_plots.dpi")
+        _check_non_empty(self.id_column, "roundtrip_plots.id_column")
+        _check_non_empty(self.group_column, "roundtrip_plots.group_column")
+        if self.sample_group_file is not None and not Path(self.sample_group_file).exists():
+            raise FileNotFoundError(
+                f"roundtrip_plots.sample_group_file not found: {self.sample_group_file}"
+            )
+
+
+@dataclass
 class PathConfig:
     """Output and temporary path settings."""
 
@@ -787,6 +816,7 @@ __all__ = [
     "PhenotypeConfig",
     "Plink2EngineConfig",
     "RegenieEngineConfig",
+    "RoundTripPlotConfig",
     "RoundTripValidationConfig",
     "VarianceBudgetConfig",
 ]

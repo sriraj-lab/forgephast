@@ -308,26 +308,75 @@ def _run_plink2_pca(
     if approx:
         pca_args.append("approx")
 
-    cmd = [plink2_path, "--pfile", pgen_prefix, "--keep", str(keep_file)]
+    analysis_prefix = str(pgen_prefix)
+    cmd = [plink2_path, "--pfile", analysis_prefix, "--keep", str(keep_file)]
     prune_before_pca = bool(getattr(mode_cfg, "prune_before_pca", True))
     if prune_before_pca:
         prune_prefix = out_dir / "ld_prune"
-        prune_cmd = [plink2_path, "--pfile", pgen_prefix, "--keep", str(keep_file)]
-        if chromosomes:
-            prune_cmd.extend(["--chr", ",".join(str(int(c)) for c in chromosomes)])
-        prune_cmd.extend(
-            [
-                "--indep-pairwise",
-                f"{int(getattr(mode_cfg, 'prune_window_kb', 1000))}kb",
-                str(int(getattr(mode_cfg, "prune_step_variants", 50))),
-                str(float(getattr(mode_cfg, "prune_r2", 0.1))),
-            ]
-        )
-        if memory_mb is not None:
-            prune_cmd.extend(["--memory", str(int(memory_mb))])
-        prune_cmd.extend(["--out", str(prune_prefix)])
+        def _build_prune_cmd(prefix: str) -> list[str]:
+            prune_cmd_local = [plink2_path, "--pfile", prefix, "--keep", str(keep_file)]
+            if chromosomes:
+                prune_cmd_local.extend(["--chr", ",".join(str(int(c)) for c in chromosomes)])
+            # This path always uses a kilobase window, and PLINK2 requires the
+            # window increment to be 1 in that mode.
+            prune_cmd_local.extend(
+                [
+                    "--indep-pairwise",
+                    f"{int(getattr(mode_cfg, 'prune_window_kb', 1000))}kb",
+                    "1",
+                    str(float(getattr(mode_cfg, "prune_r2", 0.1))),
+                ]
+            )
+            if memory_mb is not None:
+                prune_cmd_local.extend(["--memory", str(int(memory_mb))])
+            prune_cmd_local.extend(["--out", str(prune_prefix)])
+            return prune_cmd_local
+
+        prune_cmd = _build_prune_cmd(analysis_prefix)
         logger.info("Computing LD prune set with PLINK2: %s", " ".join(prune_cmd))
         completed = subprocess.run(prune_cmd, capture_output=True, text=True)
+        duplicate_id_error = (
+            completed.returncode != 0
+            and "unique variant IDs" in f"{completed.stdout}\n{completed.stderr}"
+        )
+        if duplicate_id_error:
+            unique_prefix = out_dir / "global_pcs_unique_ids"
+            rename_cmd = [
+                plink2_path,
+                "--pfile",
+                analysis_prefix,
+                "--keep",
+                str(keep_file),
+                "--set-all-var-ids",
+                "@:#$r,$a",
+                "--new-id-max-allele-len",
+                "200",
+                "truncate",
+                "--make-pgen",
+                "--out",
+                str(unique_prefix),
+            ]
+            if chromosomes:
+                rename_cmd.extend(["--chr", ",".join(str(int(c)) for c in chromosomes)])
+            if memory_mb is not None:
+                rename_cmd.extend(["--memory", str(int(memory_mb))])
+            logger.info(
+                "Rewriting variant IDs for PLINK2 PCA compatibility: %s",
+                " ".join(rename_cmd),
+            )
+            rename_completed = subprocess.run(rename_cmd, capture_output=True, text=True)
+            if rename_completed.returncode != 0:
+                raise RuntimeError(
+                    "PLINK2 variant-ID rewrite failed\n"
+                    f"CMD: {' '.join(rename_cmd)}\n"
+                    f"STDOUT:\n{rename_completed.stdout}\n"
+                    f"STDERR:\n{rename_completed.stderr}"
+                )
+            analysis_prefix = str(unique_prefix)
+            cmd = [plink2_path, "--pfile", analysis_prefix, "--keep", str(keep_file)]
+            prune_cmd = _build_prune_cmd(analysis_prefix)
+            logger.info("Retrying LD prune set with unique variant IDs: %s", " ".join(prune_cmd))
+            completed = subprocess.run(prune_cmd, capture_output=True, text=True)
         if completed.returncode != 0:
             raise RuntimeError(
                 "PLINK2 LD pruning failed\n"

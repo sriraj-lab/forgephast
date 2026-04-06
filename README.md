@@ -258,6 +258,46 @@ causal_selection:
   annotation_sampling:
     enabled: true
     combine_rule: max
+
+## Round-trip diagnostic plots
+
+`forgephast phenotype` can now render a standard round-trip diagnostic set from existing GWAS outputs:
+
+- truth-vs-estimated effect scatter
+- Manhattan plot with true causals highlighted
+- QQ plot
+- top-k recovery curve
+- enrichment summary bar plot
+
+Optional group-stratified beta scatter is available when the user provides a sample-to-group TSV.
+
+Config:
+
+```yaml
+roundtrip_plots:
+  enabled: true
+  formats: [png]
+  dpi: 200
+  sample_group_file: path/to/sample_groups.tsv
+  id_column: IID
+  group_column: population
+```
+
+When `roundtrip_plots.enabled: true`, plots are emitted automatically after successful GWAS + round-trip validation.
+
+You can also rerender plots from an existing run without rerunning simulation or GWAS:
+
+```bash
+forgephast phenotype roundtrip-plots \
+  --config path/to/run.yaml \
+  --run-dir path/to/existing/run \
+  --gwas-manifest path/to/existing/run/gwas_manifest.tsv
+```
+
+Outputs are written under:
+
+- `<run_dir>/plots/roundtrip/`
+- `<run_dir>/roundtrip_plot_manifest.tsv`
     default_gene_window:
       enabled: true
       genome_build: GRCh38
@@ -421,6 +461,8 @@ So the practical mental model is:
   - `gwas.global_pcs.prune_window_kb`
   - `gwas.global_pcs.prune_step_variants`
   - `gwas.global_pcs.prune_r2`
+- When the prune window is specified in kilobases, `forgephast` emits the
+  PLINK2-compatible increment of `1` for `--indep-pairwise`.
 - Cache the final PCA result by:
   - merged PGEN prefix
   - kept sample set

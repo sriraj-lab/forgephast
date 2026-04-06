@@ -81,19 +81,34 @@ def _plink_memory_args(run_cfg: RunConfig) -> list[str]:
     return ["--memory", str(int(memory_mb))]
 
 
+def _keep_file_suffix(keep_file: str | Path | None) -> str:
+    """Return a deterministic suffix fragment for keep-specific filtered PGENs."""
+    if keep_file is None:
+        return ""
+    keep_str = str(keep_file).strip()
+    if not keep_str:
+        return ""
+    digest = hashlib.sha1(keep_str.encode("utf-8")).hexdigest()[:12]
+    return f".keep_{digest}"
+
+
 def _filter_zero_maf_pgen(
     prefix: str | Path,
     *,
     plink2_path: str,
     threads: int,
     memory_mb: int | None = None,
+    keep_file: str | Path | None = None,
 ) -> str:
     """Create a filtered PGEN with monomorphic variants removed."""
     input_prefix = Path(prefix)
-    if input_prefix.name.endswith(".maf_gt0"):
+    keep_suffix = _keep_file_suffix(keep_file)
+    if input_prefix.name.endswith(".maf_gt0") or (
+        keep_suffix and input_prefix.name.endswith(f".maf_gt0{keep_suffix}")
+    ):
         return str(input_prefix)
 
-    filtered_prefix = input_prefix.parent / f"{input_prefix.name}.maf_gt0"
+    filtered_prefix = input_prefix.parent / f"{input_prefix.name}.maf_gt0{keep_suffix}"
     if _pgen_triplet_exists(filtered_prefix):
         normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
         return str(filtered_prefix)
@@ -106,12 +121,18 @@ def _filter_zero_maf_pgen(
         plink2_path,
         "--pfile",
         str(input_prefix),
+    ]
+    if keep_file is not None and str(keep_file).strip():
+        cmd.extend(["--keep", str(keep_file)])
+    cmd.extend(
+        [
         "--maf",
         "1e-12",
         "--make-pgen",
         "--threads",
         str(max(1, int(threads))),
-    ]
+        ]
+    )
     if memory_mb is not None:
         cmd.extend(["--memory", str(int(memory_mb))])
     cmd.extend(["--out", str(tmp_prefix)])
@@ -169,22 +190,43 @@ def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.Da
         filtered_df["filtered_pgen_prefix"] = ""
 
     prefixes = filtered_df["pgen_prefix"].fillna("").astype(str).str.strip()
-    non_empty = sorted({prefix for prefix in prefixes.tolist() if prefix})
+    keep_files = (
+        filtered_df["keep_file"].fillna("").astype(str).str.strip()
+        if "keep_file" in filtered_df.columns
+        else pd.Series([""] * len(filtered_df), index=filtered_df.index, dtype="string")
+    )
+    non_empty = sorted(
+        {
+            (prefix, keep_file)
+            for prefix, keep_file in zip(prefixes.tolist(), keep_files.tolist(), strict=False)
+            if prefix
+        }
+    )
     if not non_empty:
         return filtered_df
 
     plink2_path = str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path)
     threads = max(1, int(run_cfg.gwas.plink2.threads))
     prefix_map = {
-        prefix: _filter_zero_maf_pgen(prefix, plink2_path=plink2_path, threads=threads)
-        for prefix in non_empty
+        (prefix, keep_file): _filter_zero_maf_pgen(
+            prefix,
+            plink2_path=plink2_path,
+            threads=threads,
+            keep_file=(keep_file or None),
+        )
+        for prefix, keep_file in non_empty
     }
 
-    filtered_df["filtered_pgen_prefix"] = prefixes.map(lambda prefix: prefix_map.get(prefix, prefix))
+    filtered_df["filtered_pgen_prefix"] = [
+        prefix_map.get((prefix, keep_file), prefix)
+        for prefix, keep_file in zip(prefixes.tolist(), keep_files.tolist(), strict=False)
+    ]
     changed = filtered_df["filtered_pgen_prefix"].astype(str) != prefixes
     filtered_df["pgen_prefix"] = filtered_df["filtered_pgen_prefix"]
     if changed.any() and "global_pcs_file" in filtered_df.columns:
         filtered_df.loc[changed, "global_pcs_file"] = ""
+    if changed.any() and "merged_covariates_file" in filtered_df.columns:
+        filtered_df.loc[changed, "merged_covariates_file"] = ""
     return filtered_df
 
 

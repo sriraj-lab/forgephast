@@ -130,10 +130,20 @@ def _population_jitter_covariance(
     evals = np.linalg.eigvalsh(delta_cov)
     min_eval = float(np.min(evals))
     if min_eval < -1e-8:
-        raise ValueError(
-            "Derived jitter covariance is not positive semidefinite; check correlation matrix "
-            f"and effect-scale settings (min eigenvalue={min_eval:.3e})."
-        )
+        # Auto-from-FST correlation geometry can land just below zero due to
+        # floating-point roundoff after subtracting the shared-base component.
+        # Repair only tiny violations; larger negatives still indicate a real
+        # incompatibility between the requested correlation and jitter scales.
+        if min_eval >= -1e-4:
+            delta_cov = delta_cov + np.eye(delta_cov.shape[0], dtype=float) * (-min_eval + 1e-10)
+            delta_cov = 0.5 * (delta_cov + delta_cov.T)
+            evals = np.linalg.eigvalsh(delta_cov)
+            min_eval = float(np.min(evals))
+        if min_eval < -1e-8:
+            raise ValueError(
+                "Derived jitter covariance is not positive semidefinite; check correlation matrix "
+                f"and effect-scale settings (min eigenvalue={min_eval:.3e})."
+            )
     return delta_cov
 
 
@@ -170,9 +180,7 @@ def _load_population_fst_matrix(effect_model: EffectModelConfig) -> np.ndarray:
         if pop_i == pop_j:
             continue
         if pop_i not in pop_to_idx or pop_j not in pop_to_idx:
-            raise ValueError(
-                f"population_fst_file contains unknown populations: ({pop_i}, {pop_j})"
-            )
+            continue
         fst = float(row[effect_model.population_fst_value_column])
         if not np.isfinite(fst) or fst < 0.0:
             raise ValueError(

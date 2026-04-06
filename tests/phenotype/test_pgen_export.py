@@ -10,6 +10,7 @@ import pandas as pd
 from forgephast.phenotype.config import RunConfig
 from forgephast.phenotype.data.pgen_export import (
     _normalize_fid_for_exported_pgen,
+    ensure_manifest_non_monomorphic_pgens,
     export_manifest_pgens,
 )
 
@@ -146,7 +147,7 @@ def test_export_manifest_pgens_updates_manifest(monkeypatch, tmp_path: Path) -> 
 
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
-    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None) -> str:  # noqa: ANN001
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None, keep_file=None) -> str:  # noqa: ANN001
         out_prefix = Path(f"{prefix}.maf_gt0")
         Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
         Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
@@ -204,7 +205,7 @@ def test_export_manifest_pgens_reuses_identical_exports_in_memory(
 
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
-    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None) -> str:  # noqa: ANN001
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None, keep_file=None) -> str:  # noqa: ANN001
         out_prefix = Path(f"{prefix}.maf_gt0")
         Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
         Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
@@ -225,6 +226,55 @@ def test_export_manifest_pgens_reuses_identical_exports_in_memory(
     export_manifest_pgens(cfg, manifest_path, runtime_cache=runtime_cache)
     assert len(fake.calls) == 1
     assert runtime_cache["cache_hits"]["pgen_export"] == 2
+
+
+def test_ensure_manifest_non_monomorphic_pgens_is_keep_specific(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cfg = RunConfig.from_dict(_payload(tmp_path))
+    pgen_prefix = tmp_path / "shared" / "rep1_c1"
+    pgen_prefix.parent.mkdir(parents=True, exist_ok=True)
+    for ext in (".pgen", ".pvar", ".psam"):
+        Path(f"{pgen_prefix}{ext}").write_text("", encoding="utf-8")
+    keep1 = tmp_path / "keep1.tsv"
+    keep2 = tmp_path / "keep2.tsv"
+    keep1.write_text("FID\tIID\ns1\ts1\n", encoding="utf-8")
+    keep2.write_text("FID\tIID\ns2\ts2\n", encoding="utf-8")
+
+    manifest = pd.DataFrame(
+        {
+            "run_name": [cfg.name, cfg.name],
+            "replicate": [1, 1],
+            "architecture": ["a1", "a1"],
+            "cohort": ["c1", "c2"],
+            "pgen_prefix": [str(pgen_prefix), str(pgen_prefix)],
+            "keep_file": [str(keep1), str(keep2)],
+            "global_pcs_file": ["foo.tsv", "bar.tsv"],
+            "merged_covariates_file": ["a.tsv", "b.tsv"],
+        }
+    )
+
+    calls: list[tuple[str, str | None]] = []
+
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None, keep_file=None) -> str:  # noqa: ANN001
+        calls.append((str(prefix), None if keep_file is None else str(keep_file)))
+        suffix = "k1" if str(keep_file) == str(keep1) else "k2"
+        out_prefix = Path(f"{prefix}.maf_gt0.{suffix}")
+        for ext in (".pgen", ".pvar", ".psam"):
+            Path(f"{out_prefix}{ext}").write_text("", encoding="utf-8")
+        return str(out_prefix)
+
+    monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
+
+    out = ensure_manifest_non_monomorphic_pgens(cfg, manifest)
+
+    assert calls == [(str(pgen_prefix), str(keep1)), (str(pgen_prefix), str(keep2))]
+    assert out.loc[0, "pgen_prefix"].endswith(".maf_gt0.k1")
+    assert out.loc[1, "pgen_prefix"].endswith(".maf_gt0.k2")
+    assert out.loc[0, "global_pcs_file"] == ""
+    assert out.loc[1, "global_pcs_file"] == ""
+    assert out.loc[0, "merged_covariates_file"] == ""
+    assert out.loc[1, "merged_covariates_file"] == ""
 
 
 def test_export_manifest_pgens_legacy_path_still_filters_merged_prefix(
@@ -263,7 +313,7 @@ def test_export_manifest_pgens_legacy_path_still_filters_merged_prefix(
     fake = _FakeAdapter()
     monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
 
-    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None) -> str:  # noqa: ANN001
+    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None, keep_file=None) -> str:  # noqa: ANN001
         out_prefix = Path(f"{prefix}.maf_gt0")
         Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
         Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")

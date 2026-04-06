@@ -135,6 +135,29 @@ class RegenieEngine(GwasEngine):
     def name(self) -> str:
         return "regenie"
 
+    @staticmethod
+    def _choose_primary_output(out_dir: Path) -> Path | None:
+        candidates = [
+            path
+            for path in sorted(out_dir.glob("step2*.regenie*"))
+            if path.exists() and path.stat().st_size > 0
+        ]
+        if not candidates:
+            return None
+
+        assoc_candidates = [
+            path
+            for path in candidates
+            if path.name.endswith(".regenie") or path.name.endswith(".regenie.gz")
+        ]
+        if assoc_candidates:
+            return assoc_candidates[0]
+
+        non_ydict = [path for path in candidates if not path.name.endswith(".Ydict")]
+        if non_ydict:
+            return non_ydict[0]
+        return candidates[0]
+
     def run(self, task: GwasTask, run_dir: Path, prepared_state: object | None = None) -> GwasResult:
         _ = prepared_state
         out_dir = run_dir / "regenie"
@@ -249,8 +272,7 @@ class RegenieEngine(GwasEngine):
         cmd2.extend(list(self.cfg.extra_args_step2))
         run_checked_command(cmd2, label="REGENIE step 2", logger=logger)
 
-        candidates = sorted(out_dir.glob("step2*.regenie*"))
-        primary = next((p for p in candidates if p.stat().st_size > 0), None)
+        primary = self._choose_primary_output(out_dir)
         if primary is None:
             raise RuntimeError(
                 f"REGENIE step 2 output missing/empty under {out_dir} (expected step2*.regenie*)"

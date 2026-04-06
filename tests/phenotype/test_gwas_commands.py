@@ -90,6 +90,7 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
         if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
             Path(f"{out_prefix}_pred.list").write_text("pred\n")
         else:
+            Path(f"{out_prefix}.regenie.Ydict").write_text("Y1 PHENO\n")
             Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
@@ -99,6 +100,7 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     result = engine.run(task, tmp_path / "run")
     assert result.engine == "regenie"
     assert Path(result.primary_output).exists()
+    assert result.primary_output.endswith("_PHENO.regenie")
     assert result.metadata["monitor_step1_log"].endswith("step1.log")
     assert result.metadata["monitor_step1_pred_list"].endswith("step1_pred.list")
     assert "step2*.regenie*" in result.metadata["monitor_step2_glob"]
@@ -271,6 +273,7 @@ def test_regenie_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path)
         if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
             Path(f"{out_prefix}_pred.list").write_text("pred\n")
         else:
+            Path(f"{out_prefix}.regenie.Ydict").write_text("Y1 PHENO\n")
             Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 

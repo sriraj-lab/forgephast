@@ -43,7 +43,7 @@ from .gwas.registry import available_engine_names, build_engines
 from .io.write_outputs import write_simulation_outputs
 from .phenotypes.simulate import run_simulation
 from .utils.logging import setup_logging
-from .validation import build_roundtrip_report
+from .validation import build_roundtrip_plots, build_roundtrip_report
 
 logger = logging.getLogger(__name__)
 
@@ -432,13 +432,20 @@ def _prepare_manifest_for_gwas(
         )
         logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
         manifest_df = pd.read_csv(current, sep="\t")
+    t_filter = time.perf_counter()
+    filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
+    if not filtered_manifest_df.equals(manifest_df):
+        current = current.parent / "run_manifest_pgen.tsv"
+        filtered_manifest_df.to_csv(current, sep="\t", index=False)
+        manifest_df = filtered_manifest_df
+        stage_rows.append(
+            {
+                "stage": "ensure_non_monomorphic_pgen",
+                "elapsed_seconds": float(time.perf_counter() - t_filter),
+            }
+        )
+        logger.info("PREP_STAGE_DONE run=%s stage=ensure_non_monomorphic_pgen", config.name)
     if config.gwas.global_pcs.canonical_mode() in {"plink2_pca", "precomputed"}:
-        if config.pgen_export.prep_mode == "legacy_whole_store":
-            filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
-            if not filtered_manifest_df.equals(manifest_df):
-                current = current.parent / "run_manifest_pgen.tsv"
-                filtered_manifest_df.to_csv(current, sep="\t", index=False)
-                manifest_df = filtered_manifest_df
         if _manifest_has_ready_global_pcs(manifest_df):
             logger.info("[prep] detected ready global PCs in manifest=%s; skipping PCA refresh", current)
         else:
@@ -483,6 +490,25 @@ def _run_roundtrip_validation(config: RunConfig, gwas_manifest_path: Path) -> Pa
     )
 
 
+def _run_roundtrip_plots(
+    config: RunConfig,
+    gwas_manifest_path: Path,
+    *,
+    run_dir: Path | None = None,
+    force: bool = False,
+) -> Path | None:
+    """Run optional or explicitly requested round-trip diagnostic plotting."""
+    if not force and not config.roundtrip_plots.enabled:
+        return None
+    if run_dir is None:
+        run_dir = Path(config.paths.output_root) / config.name
+    return build_roundtrip_plots(
+        run_cfg=config,
+        run_dir=run_dir,
+        gwas_manifest_path=gwas_manifest_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unified pipeline runner
 # ---------------------------------------------------------------------------
@@ -510,7 +536,7 @@ def _run_pipeline(
     Returns
     -------
     dict with keys: ``manifest_path``, ``prepared_manifest``, ``gwas_manifest``,
-    ``validation_report``, ``timing_rows``, ``timing_path``.
+    ``validation_report``, ``roundtrip_plot_manifest``, ``timing_rows``, ``timing_path``.
     """
     run_dir = Path(config.paths.output_root) / config.name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -545,6 +571,16 @@ def _run_pipeline(
         })
         if validation is not None:
             result["validation_report"] = validation
+
+        t1 = time.perf_counter()
+        plot_manifest = _run_roundtrip_plots(config, gwas_path)
+        timing_rows.append({
+            "stage": "roundtrip_plots",
+            "elapsed_seconds": float(time.perf_counter() - t1),
+            "enabled": bool(config.roundtrip_plots.enabled),
+        })
+        if plot_manifest is not None:
+            result["roundtrip_plot_manifest"] = plot_manifest
 
     result["timing_rows"] = timing_rows
     stage_label = "+".join(stages)
@@ -598,6 +634,7 @@ def _run_case(
         "prepared_manifest_path": str(result.get("prepared_manifest", "")),
         "gwas_manifest_path": str(result.get("gwas_manifest", "")),
         "validation_report": str(result.get("validation_report", "")),
+        "roundtrip_plot_manifest": str(result.get("roundtrip_plot_manifest", "")),
         "timing_file": str(result.get("timing_path", "")),
         "cache_hits": json.dumps(runtime_state.get("cache_hits", {}), sort_keys=True),
         "cache_misses": json.dumps(runtime_state.get("cache_misses", {}), sort_keys=True),
@@ -780,6 +817,34 @@ def _parse_args() -> argparse.Namespace:
         help="Optional GWAS engine filter (only for stage=full grids)",
     )
 
+    rt_plots = sub.add_parser("roundtrip-plots", help="Render round-trip plots from existing GWAS outputs")
+    rt_plots.add_argument("--config", required=True, help="Path to run config YAML")
+    rt_plots.add_argument(
+        "--gwas-manifest",
+        default=None,
+        help="Optional GWAS manifest path (default: {output_root}/{run_name}/gwas_manifest.tsv)",
+    )
+    rt_plots.add_argument(
+        "--run-dir",
+        default=None,
+        help="Optional run directory override (default: {output_root}/{run_name})",
+    )
+    rt_plots.add_argument(
+        "--sample-group-file",
+        default=None,
+        help="Optional TSV with sample-to-group assignments for group-stratified scatter plots",
+    )
+    rt_plots.add_argument(
+        "--id-column",
+        default=None,
+        help="Override the sample ID column name in --sample-group-file",
+    )
+    rt_plots.add_argument(
+        "--group-column",
+        default=None,
+        help="Override the grouping column name in --sample-group-file",
+    )
+
     return parser.parse_args()
 
 
@@ -839,12 +904,28 @@ def main() -> None:
         logger.info("FULL_TIMINGS %s", result["timing_path"])
         if result.get("validation_report") is not None:
             logger.info("FULL_VALIDATION_COMPLETED report=%s", result["validation_report"])
+        if result.get("roundtrip_plot_manifest") is not None:
+            logger.info("FULL_ROUNDTRIP_PLOTS_COMPLETED manifest=%s", result["roundtrip_plot_manifest"])
         logger.info(
             "FULL_COMPLETED manifest=%s prepared_manifest=%s gwas_summary=%s",
             result["manifest_path"],
             result["prepared_manifest"],
             result["gwas_manifest"],
         )
+        return
+
+    if args.command == "roundtrip-plots":
+        if args.sample_group_file:
+            config.roundtrip_plots.sample_group_file = str(args.sample_group_file)
+        if args.id_column:
+            config.roundtrip_plots.id_column = str(args.id_column)
+        if args.group_column:
+            config.roundtrip_plots.group_column = str(args.group_column)
+        config.roundtrip_plots.validate()
+        run_dir = Path(args.run_dir) if args.run_dir else Path(config.paths.output_root) / config.name
+        gwas_manifest = Path(args.gwas_manifest) if args.gwas_manifest else run_dir / "gwas_manifest.tsv"
+        out = _run_roundtrip_plots(config, gwas_manifest, run_dir=run_dir, force=True)
+        logger.info("ROUNDTRIP_PLOTS_COMPLETED manifest=%s", out)
         return
 
     raise ValueError(f"Unsupported command: {args.command}")

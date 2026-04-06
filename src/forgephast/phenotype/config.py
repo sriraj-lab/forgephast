@@ -30,6 +30,7 @@ from .config_schema import (
     PhenotypeConfig,
     Plink2EngineConfig,
     RegenieEngineConfig,
+    RoundTripPlotConfig,
     RoundTripValidationConfig,
     VarianceBudgetConfig,
 )
@@ -54,6 +55,7 @@ class RunConfig:
     pgen_export: PgenExportConfig = field(default_factory=PgenExportConfig)
     gwas: GwasConfig = field(default_factory=GwasConfig)
     roundtrip_validation: RoundTripValidationConfig = field(default_factory=RoundTripValidationConfig)
+    roundtrip_plots: RoundTripPlotConfig = field(default_factory=RoundTripPlotConfig)
     paths: PathConfig = field(default_factory=PathConfig)
     chromosomes: List[int] = field(default_factory=lambda: [1, 3, 4, 5, 6])
 
@@ -87,6 +89,7 @@ class RunConfig:
         self.pgen_export.validate()
         self.gwas.validate()
         self.roundtrip_validation.validate()
+        self.roundtrip_plots.validate()
 
         if self.genotype_input.hapstore.layout == "per_pop_per_chr":
             for cohort in self.cohorts:
@@ -205,6 +208,9 @@ class RunConfig:
         roundtrip_validation = RoundTripValidationConfig(
             **payload.get("roundtrip_validation", {})
         )
+        roundtrip_plots = RoundTripPlotConfig(
+            **payload.get("roundtrip_plots", {})
+        )
 
         paths = PathConfig(**payload["paths"])
 
@@ -224,6 +230,7 @@ class RunConfig:
             pgen_export=pgen_export,
             gwas=gwas,
             roundtrip_validation=roundtrip_validation,
+            roundtrip_plots=roundtrip_plots,
             paths=paths,
             chromosomes=payload.get("chromosomes", [1, 3, 4, 5, 6]),
         )

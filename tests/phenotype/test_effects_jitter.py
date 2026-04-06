@@ -8,6 +8,7 @@ import pytest
 
 from forgephast.phenotype.config import ArchitectureConfig, EffectModelConfig
 from forgephast.phenotype.effects.betas import (
+    _population_jitter_covariance,
     build_variant_scale_by_maf,
     resolve_effect_geometry,
     sample_population_specific_betas,
@@ -192,3 +193,21 @@ def test_auto_fst_mode_rejects_missing_pairs(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="missing pairwise FST entries"):
         resolve_effect_geometry(effect_cfg)
+
+
+def test_population_jitter_covariance_repairs_tiny_negative_eigenvalue() -> None:
+    corr = np.array(
+        [
+            [1.0, 0.9655667812123503, 0.908486463497592],
+            [0.9655667812123503, 1.0, 0.9809430709143145],
+            [0.908486463497592, 0.9809430709143145, 1.0],
+        ],
+        dtype=float,
+    )
+    cov = _population_jitter_covariance(
+        ["EUR", "AFR", "ADMIX"],
+        corr,
+        {"EUR": 0.05, "AFR": 0.05, "ADMIX": 0.05},
+        base_beta_sd=0.15,
+    )
+    assert float(np.min(np.linalg.eigvalsh(cov))) >= -1e-8

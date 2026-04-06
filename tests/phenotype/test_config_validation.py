@@ -213,6 +213,40 @@ def test_annotation_sampling_rejects_unsupported_genome_build() -> None:
         RunConfig.from_dict(payload)
 
 
+def test_roundtrip_plots_accepts_sample_group_file(tmp_path) -> None:
+    payload = _base_payload()
+    group_file = tmp_path / "groups.tsv"
+    group_file.write_text("IID\tpopulation\ns1\tEUR\ns2\tAFR\n", encoding="utf-8")
+    payload["roundtrip_plots"] = {
+        "enabled": True,
+        "formats": ["png", "pdf"],
+        "dpi": 150,
+        "sample_group_file": str(group_file),
+        "id_column": "IID",
+        "group_column": "population",
+    }
+    cfg = RunConfig.from_dict(payload)
+    assert cfg.roundtrip_plots.enabled is True
+    assert cfg.roundtrip_plots.formats == ["png", "pdf"]
+
+
+def test_roundtrip_plots_rejects_missing_group_file() -> None:
+    payload = _base_payload()
+    payload["roundtrip_plots"] = {
+        "enabled": True,
+        "sample_group_file": "/tmp/does_not_exist_groups.tsv",
+    }
+    with pytest.raises(FileNotFoundError, match="sample_group_file"):
+        RunConfig.from_dict(payload)
+
+
+def test_roundtrip_plots_rejects_invalid_format() -> None:
+    payload = _base_payload()
+    payload["roundtrip_plots"] = {"enabled": True, "formats": ["png", "jpg"]}
+    with pytest.raises(ValueError, match="roundtrip_plots.formats"):
+        RunConfig.from_dict(payload)
+
+
 def test_rejects_invalid_maf_scaling_mode() -> None:
     payload = _base_payload()
     payload["effect_model"]["maf_scaling_mode"] = "invalid"

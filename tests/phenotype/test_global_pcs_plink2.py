@@ -101,6 +101,62 @@ def test_run_plink2_pca_prunes_before_pca(monkeypatch) -> None:
         assert list(pcs.columns) == ["FID", "IID", "PC1"]
         assert len(calls) == 2
         assert "--indep-pairwise" in calls[0]
+        prune_idx = calls[0].index("--indep-pairwise")
+        assert calls[0][prune_idx + 1 : prune_idx + 4] == ["1000kb", "1", "0.1"]
         assert "--extract" in calls[1]
         assert "--memory" in calls[0]
         assert "--memory" in calls[1]
+
+
+def test_run_plink2_pca_rewrites_duplicate_variant_ids(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        psam = root / "cohort.psam"
+        psam.write_text("#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8")
+        calls = []
+
+        def fake_run(cmd, capture_output, text):  # noqa: ANN001
+            calls.append(list(cmd))
+            out_idx = cmd.index("--out") + 1
+            out_prefix = Path(cmd[out_idx])
+            if "--set-all-var-ids" in cmd:
+                for ext in (".pgen", ".pvar", ".psam"):
+                    Path(f"{out_prefix}{ext}").write_text("ok\n", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="renamed", stderr="")
+            if "--indep-pairwise" in cmd and cmd[cmd.index("--pfile") + 1].endswith("cohort"):
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="Error: --indep-pairwise requires unique variant IDs.",
+                )
+            if "--indep-pairwise" in cmd:
+                Path(f"{out_prefix}.prune.in").write_text("chr1:10:A:G\n", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="pruned", stderr="")
+            Path(f"{out_prefix}.eigenvec").write_text("s1 s1 0.5\ns2 s2 -0.5\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        monkeypatch.setattr("subprocess.run", fake_run)
+        pcs = _run_plink2_pca(
+            pgen_prefix=str(root / "cohort"),
+            plink2_path="plink2",
+            sample_ids=["s1", "s2"],
+            n_components=1,
+            out_dir=root / "pca",
+            mode_cfg=SimpleNamespace(
+                plink2_approx=True,
+                plink2_extra_args=[],
+                prune_before_pca=True,
+                prune_window_kb=1000,
+                prune_step_variants=50,
+                prune_r2=0.1,
+            ),
+            memory_mb=4096,
+            chromosomes=[1],
+        )
+
+        assert list(pcs.columns) == ["FID", "IID", "PC1"]
+        assert len(calls) == 4
+        assert "--set-all-var-ids" in calls[1]
+        assert calls[1][calls[1].index("--set-all-var-ids") + 1] == "@:#$r,$a"
+        assert calls[2][calls[2].index("--pfile") + 1].endswith("global_pcs_unique_ids")
+        assert calls[3][calls[3].index("--pfile") + 1].endswith("global_pcs_unique_ids")
