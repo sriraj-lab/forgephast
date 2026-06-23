@@ -22,6 +22,7 @@ from .global_pcs import compute_global_pcs_svd, normalize_psam_fid_column
 logger = logging.getLogger(__name__)
 
 _CHR_POS_RE = re.compile(r"^chr(?P<chrom>\d+):(?P<pos>\d+)$")
+_CONTIGUOUS_READ_SAMPLE_FRACTION = 0.5
 
 
 class HapStoreAdapter:
@@ -213,6 +214,9 @@ class HapStoreAdapter:
         mask = np.zeros(int(n_store_samples), dtype=bool)
         mask[np.asarray(sample_indices, dtype=np.int64)] = True
         selected_sorted = np.flatnonzero(mask)
+        use_contiguous_sample_read = (
+            int(selected_sorted.shape[0]) / max(1, int(n_store_samples))
+        ) > _CONTIGUOUS_READ_SAMPLE_FRACTION
 
         order = np.argsort(idx)
         idx_sorted = idx[order]
@@ -242,10 +246,16 @@ class HapStoreAdapter:
                 run_end = next_i
                 right = prospective_right
 
-            block = np.asarray(
-                store.genotypes(chrom, variant_slice=(left, right), sample_mask=mask),
-                dtype=np.uint8,
-            )
+            if use_contiguous_sample_read:
+                block = np.asarray(
+                    store.genotypes(chrom, variant_slice=(left, right), sample_mask=None),
+                    dtype=np.uint8,
+                )[selected_sorted, :]
+            else:
+                block = np.asarray(
+                    store.genotypes(chrom, variant_slice=(left, right), sample_mask=mask),
+                    dtype=np.uint8,
+                )
             cols = idx_sorted[run_start : run_end + 1] - left
             out_sorted[:, run_start : run_end + 1] = block[:, cols]
             run_start = run_end + 1
@@ -277,6 +287,12 @@ class HapStoreAdapter:
         mask = np.zeros(int(n_store_samples), dtype=bool)
         mask[np.asarray(sample_indices, dtype=np.int64)] = True
         selected_sorted = np.flatnonzero(mask)
+        use_contiguous_sample_read = (
+            int(selected_sorted.shape[0]) / max(1, int(n_store_samples))
+        ) > _CONTIGUOUS_READ_SAMPLE_FRACTION
+        selected_hap_sorted = np.empty(int(selected_sorted.shape[0]) * 2, dtype=np.int64)
+        selected_hap_sorted[0::2] = 2 * selected_sorted
+        selected_hap_sorted[1::2] = (2 * selected_sorted) + 1
 
         order = np.argsort(idx)
         idx_sorted = idx[order]
@@ -306,10 +322,16 @@ class HapStoreAdapter:
                 run_end = next_i
                 right = prospective_right
 
-            block = np.asarray(
-                store.haplotypes(chrom, variant_slice=(left, right), sample_mask=mask),
-                dtype=np.uint8,
-            )
+            if use_contiguous_sample_read:
+                block = np.asarray(
+                    store.haplotypes(chrom, variant_slice=(left, right), sample_mask=None),
+                    dtype=np.uint8,
+                )[selected_hap_sorted, :]
+            else:
+                block = np.asarray(
+                    store.haplotypes(chrom, variant_slice=(left, right), sample_mask=mask),
+                    dtype=np.uint8,
+                )
             if block.shape[0] != int(selected_sorted.shape[0]) * 2:
                 raise ValueError("Unexpected HapStore haplotype array shape")
             block = block.reshape(int(selected_sorted.shape[0]), 2, block.shape[1])

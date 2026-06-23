@@ -20,6 +20,8 @@ class FakeStore:
         self._alts = list(alts)
         self._genotypes = np.asarray(genotypes, dtype=np.uint8)
         self._haplotypes = self._build_haplotypes_from_genotypes(self._genotypes)
+        self.genotype_sample_masks: list[np.ndarray | None] = []
+        self.haplotype_sample_masks: list[np.ndarray | None] = []
 
     @staticmethod
     def _build_haplotypes_from_genotypes(genotypes: np.ndarray) -> np.ndarray:
@@ -45,6 +47,9 @@ class FakeStore:
         }
 
     def genotypes(self, chrom, variant_slice=None, sample_mask=None):
+        self.genotype_sample_masks.append(
+            None if sample_mask is None else np.asarray(sample_mask, dtype=bool).copy()
+        )
         start, end = variant_slice
         out = self._genotypes[:, int(start):int(end)]
         if sample_mask is not None:
@@ -52,6 +57,9 @@ class FakeStore:
         return np.asarray(out, dtype=np.uint8)
 
     def haplotypes(self, chrom, variant_slice=None, sample_mask=None):
+        self.haplotype_sample_masks.append(
+            None if sample_mask is None else np.asarray(sample_mask, dtype=bool).copy()
+        )
         start, end = variant_slice
         out = self._haplotypes[:, int(start):int(end)]
         if sample_mask is not None:
@@ -217,6 +225,52 @@ def test_export_genotypes_u8_matches_export_dosages(fake_adapter: HapStoreAdapte
     expected = dosage[["chr1:10", "chr1:30"]].to_numpy(dtype=np.float32, copy=False)
     expected[expected == np.float32(fake_adapter.missing_fill_value)] = 0.0
     assert np.array_equal(geno, expected.astype(np.uint8))
+
+
+def test_high_fraction_genotype_read_uses_contiguous_store_read(fake_adapter: HapStoreAdapter) -> None:
+    store = FakeStore(
+        sample_ids=["id1", "id2", "id3", "id4"],
+        positions=[10, 20],
+        refs=["A", "C"],
+        alts=["G", "T"],
+        genotypes=[[0, 1], [1, 2], [2, 0], [0, 2]],
+    )
+    _wire_fake_stores(fake_adapter, {("EUR", 1): store})
+
+    out = fake_adapter.export_genotypes_u8(
+        sample_ids=["id4", "id1", "id2"],
+        sample_populations=["EUR", "EUR", "EUR"],
+        variant_ids=["chr1:20", "chr1:10"],
+        out_dir=Path("/tmp"),
+    )
+
+    assert store.genotype_sample_masks == [None]
+    assert out.tolist() == [[2, 0], [1, 0], [2, 1]]
+
+
+def test_high_fraction_haplotype_read_uses_contiguous_store_read(fake_adapter: HapStoreAdapter) -> None:
+    store = FakeStore(
+        sample_ids=["id1", "id2", "id3", "id4"],
+        positions=[10, 20],
+        refs=["A", "C"],
+        alts=["G", "T"],
+        genotypes=[[0, 1], [1, 2], [2, 0], [0, 2]],
+    )
+    _wire_fake_stores(fake_adapter, {("EUR", 1): store})
+
+    hap = fake_adapter.export_haplotypes(
+        sample_ids=["id4", "id1", "id2"],
+        sample_populations=["EUR", "EUR", "EUR"],
+        variant_ids=["chr1:20", "chr1:10"],
+        out_dir=Path("/tmp"),
+    )
+
+    assert store.haplotype_sample_masks == [None]
+    assert hap.tolist() == [
+        [[1, 1], [0, 0]],
+        [[1, 0], [0, 0]],
+        [[1, 1], [1, 0]],
+    ]
 
 
 def test_export_dosages_single_store_ignores_sample_populations(tmp_path: Path) -> None:
