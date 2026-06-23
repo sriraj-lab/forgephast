@@ -12,6 +12,7 @@ from .config_schema import (
     AnnotationSamplingConfig,
     ArchitectureConfig,
     BackgroundGeneticConfig,
+    BinaryPhenotypeConfig,
     CausalSelectionConfig,
     CohortConfig,
     CovariateConfig,
@@ -174,7 +175,14 @@ class RunConfig:
         ]
         local_ancestry = LocalAncestryConfig(**local_ancestry_payload)
         covariates = CovariateConfig(**payload["covariates"])
-        phenotype = PhenotypeConfig(**payload.get("phenotype", {}))
+        phenotype_payload = dict(payload.get("phenotype", {}))
+        if phenotype_payload.get("trait_type") == "binary" and "continuous_only" not in phenotype_payload:
+            phenotype_payload["continuous_only"] = False
+        if phenotype_payload.get("continuous_only") is False and "trait_type" not in phenotype_payload:
+            phenotype_payload["trait_type"] = "binary"
+        binary_payload = dict(phenotype_payload.get("binary", {}))
+        phenotype_payload["binary"] = BinaryPhenotypeConfig(**binary_payload)
+        phenotype = PhenotypeConfig(**phenotype_payload)
 
         # Legacy fallback: derive variance_budget from phenotype.component_variance_targets
         # when no explicit variance_budget section is present in the config YAML.

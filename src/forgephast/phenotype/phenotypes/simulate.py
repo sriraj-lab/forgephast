@@ -114,6 +114,121 @@ def _scale_effects_detail_betas(effects_detail: pd.DataFrame, scale_factor: floa
     return scaled
 
 
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    """Numerically stable-enough sigmoid for phenotype probabilities."""
+    clipped = np.clip(np.asarray(values, dtype=float), -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-clipped))
+
+
+def _logit(probability: float) -> float:
+    p = float(probability)
+    if not 0.0 < p < 1.0:
+        raise ValueError("probability must be in (0, 1)")
+    return float(np.log(p) - np.log1p(-p))
+
+
+def _standardize_liability(liability: np.ndarray) -> np.ndarray:
+    values = np.asarray(liability, dtype=float)
+    sd = float(np.std(values))
+    if not np.isfinite(sd) or sd <= 0.0:
+        return np.zeros_like(values, dtype=float)
+    return (values - float(np.mean(values))) / sd
+
+
+def _calibrate_logistic_intercept(
+    standardized_liability: np.ndarray,
+    prevalence: float,
+    liability_logit_scale: float,
+) -> float:
+    """Solve alpha so mean(sigmoid(alpha + gamma * z_liability)) matches prevalence."""
+    z = np.asarray(standardized_liability, dtype=float)
+    if z.size == 0:
+        raise ValueError("standardized_liability cannot be empty")
+    target = float(prevalence)
+    gamma = float(liability_logit_scale)
+    if not 0.0 < target < 1.0:
+        raise ValueError("prevalence must be in (0, 1)")
+    if not np.isfinite(gamma) or gamma < 0.0:
+        raise ValueError("liability_logit_scale must be finite and >= 0")
+    if gamma == 0.0:
+        return _logit(target)
+
+    center = _logit(target)
+    max_abs_z = float(np.max(np.abs(z))) if z.size else 0.0
+    lo = min(center - (abs(gamma) * max_abs_z) - 10.0, -80.0)
+    hi = max(center + (abs(gamma) * max_abs_z) + 10.0, 80.0)
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        mean_probability = float(np.mean(_sigmoid(mid + gamma * z)))
+        if mean_probability < target:
+            lo = mid
+        else:
+            hi = mid
+    return float((lo + hi) / 2.0)
+
+
+def _binary_phenotype_from_liability(
+    *,
+    liability: np.ndarray,
+    sample_populations: List[str],
+    prevalence: float,
+    liability_logit_scale: float,
+    prevalence_by_population: Dict[str, float],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Draw binary labels from calibrated logistic probabilities over standardized liability."""
+    values = np.asarray(liability, dtype=float)
+    z = _standardize_liability(values)
+    populations = np.asarray(sample_populations, dtype=object)
+    if populations.shape[0] != values.shape[0]:
+        raise ValueError("sample_populations length must match liability length")
+
+    labels = np.zeros(values.shape[0], dtype=np.int8)
+    probabilities = np.zeros(values.shape[0], dtype=float)
+    alpha_by_population: Dict[str, float] = {}
+    prevalence_target_by_population: Dict[str, float] = {}
+
+    if prevalence_by_population:
+        groups = {
+            str(pop): np.where(populations.astype(str) == str(pop))[0]
+            for pop in sorted({str(pop) for pop in sample_populations})
+        }
+    else:
+        groups = {"__cohort__": np.arange(values.shape[0], dtype=np.int64)}
+
+    for group, row_idx in groups.items():
+        if row_idx.size == 0:
+            continue
+        target = float(prevalence_by_population.get(group, prevalence))
+        alpha = _calibrate_logistic_intercept(
+            standardized_liability=z[row_idx],
+            prevalence=target,
+            liability_logit_scale=liability_logit_scale,
+        )
+        probabilities[row_idx] = _sigmoid(alpha + float(liability_logit_scale) * z[row_idx])
+        alpha_by_population[group] = float(alpha)
+        prevalence_target_by_population[group] = float(target)
+
+    labels[:] = rng.binomial(n=1, p=probabilities, size=probabilities.shape[0]).astype(np.int8)
+    n_cases = int(labels.sum())
+    n_total = int(labels.shape[0])
+    summary: Dict[str, Any] = {
+        "binary_prevalence_target": float(prevalence),
+        "binary_liability_logit_scale": float(liability_logit_scale),
+        "binary_alpha": float(alpha_by_population.get("__cohort__", float("nan"))),
+        "binary_alpha_by_population": json.dumps(alpha_by_population, sort_keys=True),
+        "binary_prevalence_target_by_population": json.dumps(
+            prevalence_target_by_population,
+            sort_keys=True,
+        ),
+        "binary_case_count": n_cases,
+        "binary_control_count": n_total - n_cases,
+        "binary_realized_prevalence": float(n_cases / n_total) if n_total else float("nan"),
+        "binary_mean_predicted_probability": float(np.mean(probabilities)) if n_total else float("nan"),
+    }
+    return labels, probabilities, summary
+
+
 def _required_source_populations(
     *,
     sample_populations: List[str],
@@ -1191,7 +1306,28 @@ def run_simulation(
                             )
 
                 genetic = genetic_fixed + genetic_bg
-                phenotype = genetic + covariate + residual
+                liability = genetic + covariate + residual
+                phenotype: np.ndarray = liability
+                binary_probability: np.ndarray | None = None
+                binary_summary: Dict[str, Any] = {}
+                trait_type = str(run_cfg.phenotype.trait_type)
+                if trait_type == "binary":
+                    binary_rng = np.random.default_rng(
+                        int(run_cfg.phenotype.binary.random_seed)
+                        + 1000 * int(replicate)
+                        + _stable_string_seed(architecture.name)
+                        + _stable_string_seed(cohort.name)
+                    )
+                    phenotype, binary_probability, binary_summary = _binary_phenotype_from_liability(
+                        liability=liability,
+                        sample_populations=sample_populations,
+                        prevalence=float(run_cfg.phenotype.binary.prevalence),
+                        liability_logit_scale=float(run_cfg.phenotype.binary.liability_logit_scale),
+                        prevalence_by_population=dict(
+                            run_cfg.phenotype.binary.prevalence_by_population
+                        ),
+                        rng=binary_rng,
+                    )
                 _timed(
                     "simulate.scale_and_combine",
                     t_scale,
@@ -1201,18 +1337,20 @@ def run_simulation(
                     n_samples=int(len(sample_ids)),
                 )
 
-                phenotype_df = pd.DataFrame(
-                    {
-                        "FID": sample_ids,
-                        "IID": sample_ids,
-                        run_cfg.phenotype.phenotype_column: phenotype,
-                        "GENETIC_FIXED_COMPONENT": genetic_fixed,
-                        "GENETIC_BG_COMPONENT": genetic_bg,
-                        "GENETIC_COMPONENT": genetic,
-                        "COVARIATE_COMPONENT": covariate,
-                        "RESIDUAL_COMPONENT": residual,
-                    }
-                )
+                phenotype_payload: Dict[str, Any] = {
+                    "FID": sample_ids,
+                    "IID": sample_ids,
+                    run_cfg.phenotype.phenotype_column: phenotype,
+                    "GENETIC_FIXED_COMPONENT": genetic_fixed,
+                    "GENETIC_BG_COMPONENT": genetic_bg,
+                    "GENETIC_COMPONENT": genetic,
+                    "COVARIATE_COMPONENT": covariate,
+                    "RESIDUAL_COMPONENT": residual,
+                }
+                if trait_type == "binary":
+                    phenotype_payload["LIABILITY"] = liability
+                    phenotype_payload["BINARY_PROBABILITY"] = binary_probability
+                phenotype_df = pd.DataFrame(phenotype_payload)
 
                 effects_out = effects_detail.copy()
                 effects_out["dosage_effect_allele"] = (
@@ -1234,6 +1372,7 @@ def run_simulation(
                         "plugin": architecture.plugin,
                         "pgen_prefix": cohort.genotype_prefix_override or "",
                         "sample_ids_file": cohort.sample_ids_file,
+                        "trait_type": trait_type,
                         "phenotype_df": phenotype_df,
                         "covariate_df": cov_out.covariate_table,
                         "pcs_df": pcs_df,
@@ -1248,7 +1387,9 @@ def run_simulation(
                             "covariate": float(np.var(covariate)),
                             "residual": float(np.var(residual)),
                             "phenotype": float(np.var(phenotype)),
+                            "liability": float(np.var(liability)),
                         },
+                        "binary_summary": dict(binary_summary),
                         "genetic_fixed_beta_scale_factor": float(genetic_fixed_beta_scale_factor),
                         "realized_fixed_by_population": dict(realized_fixed_by_population),
                         "tightness_summary": dict(bucketed_pool.tightness_summary),

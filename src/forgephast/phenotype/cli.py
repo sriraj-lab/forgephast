@@ -232,6 +232,12 @@ def _manifest_to_tasks(manifest_df: pd.DataFrame, chromosomes: List[int]) -> Lis
             raise ValueError(
                 "run manifest row has empty pgen_prefix. For HapStore input, run export stage first."
             )
+        trait_type_value = row.get("trait_type", "quantitative")
+        trait_type = (
+            "quantitative"
+            if pd.isna(trait_type_value) or not str(trait_type_value).strip()
+            else str(trait_type_value)
+        )
         tasks.append(
             GwasTask(
                 run_name=str(row["run_name"]),
@@ -245,6 +251,7 @@ def _manifest_to_tasks(manifest_df: pd.DataFrame, chromosomes: List[int]) -> Lis
                 global_pcs_file=str(row["global_pcs_file"]),
                 output_dir=str(row["output_dir"]),
                 merged_covariates_file=str(row.get("merged_covariates_file", "")),
+                trait_type=trait_type,
                 chromosomes=list(chromosomes),
             )
         )
@@ -341,6 +348,7 @@ def _run_gwas(
                 "architecture": task.architecture,
                 "cohort": task.cohort,
                 "engine": engine_name,
+                "trait_type": task.trait_type,
                 "status": "success",
                 "output_dir": str(result.output_dir),
                 "primary_output": str(result.primary_output),
@@ -364,6 +372,7 @@ def _run_gwas(
                 "architecture": task.architecture,
                 "cohort": task.cohort,
                 "engine": engine_name,
+                "trait_type": task.trait_type,
                 "status": "failed",
                 "output_dir": str(task_out_dir),
                 "primary_output": "",

@@ -26,6 +26,7 @@ class GwasTask:
     global_pcs_file: str
     output_dir: str
     merged_covariates_file: str = ""
+    trait_type: str = "quantitative"
     chromosomes: List[int] | None = None
 
 

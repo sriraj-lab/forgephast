@@ -632,10 +632,40 @@ class CovariateConfig:
 
 
 @dataclass
+class BinaryPhenotypeConfig:
+    """Binary phenotype transform applied to the final continuous liability."""
+
+    prevalence: float = 0.1
+    liability_logit_scale: float = 1.0
+    random_seed: int = 42
+    prevalence_by_population: Dict[str, float] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not 0.0 < float(self.prevalence) < 1.0:
+            raise ValueError("phenotype.binary.prevalence must be in (0, 1)")
+        if not np.isfinite(float(self.liability_logit_scale)):
+            raise ValueError("phenotype.binary.liability_logit_scale must be finite")
+        _check_non_negative(
+            float(self.liability_logit_scale),
+            "phenotype.binary.liability_logit_scale",
+        )
+        for population, prevalence in self.prevalence_by_population.items():
+            _check_non_empty(
+                str(population),
+                "phenotype.binary.prevalence_by_population population",
+            )
+            if not 0.0 < float(prevalence) < 1.0:
+                raise ValueError(
+                    "phenotype.binary.prevalence_by_population values must be in (0, 1)"
+                )
+
+
+@dataclass
 class PhenotypeConfig:
     """Phenotype simulation settings."""
 
     continuous_only: bool = True
+    trait_type: str = "quantitative"
     n_replicates: int = 10
     phenotype_column: str = "PHENO"
     component_variance_targets: Dict[str, float] = field(
@@ -646,10 +676,20 @@ class PhenotypeConfig:
         }
     )
     random_seed: int = 42
+    binary: BinaryPhenotypeConfig = field(default_factory=BinaryPhenotypeConfig)
 
     def validate(self) -> None:
-        if not self.continuous_only:
-            raise ValueError("phase 1 supports only continuous phenotypes")
+        _check_one_of(
+            str(self.trait_type),
+            {"quantitative", "binary"},
+            "phenotype.trait_type",
+        )
+        if not isinstance(self.continuous_only, bool):
+            raise ValueError("phenotype.continuous_only must be a boolean")
+        if self.continuous_only and self.trait_type == "binary":
+            raise ValueError(
+                "phenotype.continuous_only=true is incompatible with phenotype.trait_type=binary"
+            )
         _check_positive(self.n_replicates, "phenotype.n_replicates")
         required = {"genetic", "covariate", "residual"}
         if set(self.component_variance_targets.keys()) != required:
@@ -661,6 +701,7 @@ class PhenotypeConfig:
             raise ValueError("phenotype component variance targets must be non-negative")
         total = vals["genetic"] + vals["covariate"] + vals["residual"]
         _check_positive(total, "phenotype component variance targets sum")
+        self.binary.validate()
 
 
 @dataclass

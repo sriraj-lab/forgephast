@@ -9,9 +9,11 @@ import numpy as np
 import pytest
 
 from forgephast.phenotype.phenotypes.simulate import (
-    _scale_effects_detail_betas,
+    _binary_phenotype_from_liability,
+    _calibrate_logistic_intercept,
     _resolve_cohort_component_targets,
     _resolve_population_h2_targets,
+    _scale_effects_detail_betas,
     _scale_component_to_shared_population_variance,
     _scale_component_to_variance,
 )
@@ -189,6 +191,42 @@ def test_resolve_population_h2_targets_rejects_h2_jitter() -> None:
             replicate=1,
             population_order=["EUR", "AFR"],
         )
+
+
+def test_logistic_intercept_calibration_hits_target_prevalence() -> None:
+    liability = np.linspace(-3.0, 3.0, 1001)
+    z = (liability - liability.mean()) / liability.std()
+
+    alpha = _calibrate_logistic_intercept(
+        standardized_liability=z,
+        prevalence=0.2,
+        liability_logit_scale=1.25,
+    )
+    probabilities = 1.0 / (1.0 + np.exp(-(alpha + 1.25 * z)))
+
+    assert float(probabilities.mean()) == pytest.approx(0.2, abs=1e-10)
+
+
+def test_binary_phenotype_from_liability_supports_population_prevalence() -> None:
+    liability = np.linspace(-2.0, 2.0, 200)
+    sample_populations = ["EUR"] * 100 + ["AFR"] * 100
+    rng = np.random.default_rng(17)
+
+    labels, probabilities, summary = _binary_phenotype_from_liability(
+        liability=liability,
+        sample_populations=sample_populations,
+        prevalence=0.1,
+        liability_logit_scale=1.0,
+        prevalence_by_population={"AFR": 0.3},
+        rng=rng,
+    )
+
+    assert set(labels.tolist()) <= {0, 1}
+    assert probabilities[:100].mean() == pytest.approx(0.1, abs=1e-10)
+    assert probabilities[100:].mean() == pytest.approx(0.3, abs=1e-10)
+    assert summary["binary_case_count"] + summary["binary_control_count"] == 200
+    assert '"AFR"' in summary["binary_alpha_by_population"]
+    assert '"EUR"' in summary["binary_alpha_by_population"]
 
 
 def test_multi_population_cohort_uses_jittered_betas_without_rescaling() -> None:

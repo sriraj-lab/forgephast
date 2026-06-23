@@ -73,6 +73,30 @@ def test_plink2_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert "--chr" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--chr") + 1] == "1,3"
     assert "--covar-variance-standardize" in captured["cmd"]
+    assert "--1" not in captured["cmd"]
+
+
+def test_plink2_engine_uses_binary_zero_one_flag(monkeypatch, tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+    task = GwasTask(**{**task.__dict__, "trait_type": "binary"})
+    captured = {}
+
+    def fake_run(cmd, capture_output, text):
+        captured["cmd"] = list(cmd)
+        out_idx = cmd.index("--out") + 1
+        out_prefix = Path(cmd[out_idx])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        (out_prefix.parent / "assoc.PHENO1.glm.logistic.hybrid").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    engine = Plink2Engine(Plink2EngineConfig(path="plink2", threads=1))
+    result = engine.run(task, tmp_path / "run")
+
+    assert result.engine == "plink2"
+    assert "--1" in captured["cmd"]
+    assert Path(result.primary_output).exists()
 
 
 def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
@@ -107,6 +131,35 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert calls["n"] == 2
     assert all("--chrList" in cmd for cmd in commands)
     assert all(cmd[cmd.index("--chrList") + 1] == "1,3" for cmd in commands)
+    assert all("--qt" in cmd for cmd in commands)
+    assert all("--bt" not in cmd for cmd in commands)
+
+
+def test_regenie_engine_uses_binary_trait_flag(monkeypatch, tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+    task = GwasTask(**{**task.__dict__, "trait_type": "binary"})
+    commands = []
+
+    def fake_run(cmd, capture_output, text):
+        commands.append(list(cmd))
+        out_idx = cmd.index("--out") + 1
+        out_prefix = Path(cmd[out_idx])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
+            Path(f"{out_prefix}_pred.list").write_text("pred\n")
+        else:
+            Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    engine = RegenieEngine(RegenieEngineConfig(path="regenie", threads=1))
+    result = engine.run(task, tmp_path / "run")
+
+    assert result.engine == "regenie"
+    assert len(commands) == 2
+    assert all("--bt" in cmd for cmd in commands)
+    assert all("--qt" not in cmd for cmd in commands)
 
 
 def test_merge_covariates_for_gwas_coerces_id_types(tmp_path: Path) -> None:

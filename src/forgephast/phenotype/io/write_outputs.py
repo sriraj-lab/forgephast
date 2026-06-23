@@ -67,6 +67,8 @@ def write_simulation_outputs(
         effect_geometry = rec.get("effect_geometry", {})
         realized_fixed_by_population = rec.get("realized_fixed_by_population", {}) or {}
         tightness_summary = rec.get("tightness_summary", {}) or {}
+        trait_type = str(rec.get("trait_type", "quantitative"))
+        binary_summary = rec.get("binary_summary", {}) or {}
 
         realized_h2_fixed_by_population_json = json.dumps(
             {str(k): float(v) for k, v in realized_fixed_by_population.items()},
@@ -96,6 +98,7 @@ def write_simulation_outputs(
                 "replicate": replicate,
                 "architecture": architecture,
                 "cohort": cohort,
+                "trait_type": trait_type,
                 "genetic_fixed_beta_scale_factor": rec.get("genetic_fixed_beta_scale_factor", 1.0),
                 "base_h2_fixed": targets.get("base_h2_fixed", targets.get("genetic_fixed", 0.0)),
                 "resolved_h2_fixed": targets.get("resolved_h2_fixed", targets.get("genetic_fixed", 0.0)),
@@ -137,7 +140,23 @@ def write_simulation_outputs(
                 "realized_var_covariate": realized.get("covariate", 0.0),
                 "realized_var_residual": realized.get("residual", 0.0),
                 "realized_var_phenotype": realized.get("phenotype", 0.0),
+                "realized_var_liability": realized.get("liability", realized.get("phenotype", 0.0)),
                 "realized_h2_fixed_by_population": realized_h2_fixed_by_population_json,
+                "binary_prevalence_target": binary_summary.get("binary_prevalence_target", float("nan")),
+                "binary_liability_logit_scale": binary_summary.get("binary_liability_logit_scale", float("nan")),
+                "binary_alpha": binary_summary.get("binary_alpha", float("nan")),
+                "binary_alpha_by_population": binary_summary.get("binary_alpha_by_population", "{}"),
+                "binary_prevalence_target_by_population": binary_summary.get(
+                    "binary_prevalence_target_by_population",
+                    "{}",
+                ),
+                "binary_case_count": binary_summary.get("binary_case_count", 0),
+                "binary_control_count": binary_summary.get("binary_control_count", 0),
+                "binary_realized_prevalence": binary_summary.get("binary_realized_prevalence", float("nan")),
+                "binary_mean_predicted_probability": binary_summary.get(
+                    "binary_mean_predicted_probability",
+                    float("nan"),
+                ),
                 "shift_tightness_tier": shift_tightness_tier,
                 "shift_tightness_fold_change_cap": shift_tightness_fold_change_cap,
                 "shift_tightness_fold_change_max_kept": shift_tightness_fold_change_max_kept,
@@ -154,6 +173,7 @@ def write_simulation_outputs(
                 "architecture": architecture,
                 "cohort": cohort,
                 "genetic_fixed_beta_scale_factor": rec.get("genetic_fixed_beta_scale_factor", 1.0),
+                "trait_type": trait_type,
                 "plugin": rec["plugin"],
                 "pgen_prefix": rec["pgen_prefix"],
                 "sample_ids_file": rec["sample_ids_file"],
@@ -198,6 +218,21 @@ def write_simulation_outputs(
                 "target_var_covariate": targets.get("covariate", 0.0),
                 "target_var_residual": targets.get("residual", 0.0),
                 "realized_h2_fixed_by_population": realized_h2_fixed_by_population_json,
+                "binary_prevalence_target": binary_summary.get("binary_prevalence_target", float("nan")),
+                "binary_liability_logit_scale": binary_summary.get("binary_liability_logit_scale", float("nan")),
+                "binary_alpha": binary_summary.get("binary_alpha", float("nan")),
+                "binary_alpha_by_population": binary_summary.get("binary_alpha_by_population", "{}"),
+                "binary_prevalence_target_by_population": binary_summary.get(
+                    "binary_prevalence_target_by_population",
+                    "{}",
+                ),
+                "binary_case_count": binary_summary.get("binary_case_count", 0),
+                "binary_control_count": binary_summary.get("binary_control_count", 0),
+                "binary_realized_prevalence": binary_summary.get("binary_realized_prevalence", float("nan")),
+                "binary_mean_predicted_probability": binary_summary.get(
+                    "binary_mean_predicted_probability",
+                    float("nan"),
+                ),
                 "shift_tightness_tier": shift_tightness_tier,
                 "shift_tightness_fold_change_cap": shift_tightness_fold_change_cap,
                 "shift_tightness_fold_change_max_kept": shift_tightness_fold_change_max_kept,

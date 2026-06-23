@@ -70,6 +70,8 @@ class Plink2Engine(GwasEngine):
         ]
         if task.chromosomes:
             cmd.extend(["--chr", ",".join(str(chrom) for chrom in task.chromosomes)])
+        if str(task.trait_type) == "binary":
+            cmd.append("--1")
         glm_modifiers = ["hide-covar"]
         if not covar_cols:
             glm_modifiers.append("allow-no-covars")
@@ -190,6 +192,7 @@ class RegenieEngine(GwasEngine):
             step1_pred,
             step2_glob,
         )
+        trait_flag = "--bt" if str(task.trait_type) == "binary" else "--qt"
         cmd1 = [
             self.cfg.path,
             "--step",
@@ -202,7 +205,7 @@ class RegenieEngine(GwasEngine):
             task.phenotype_file,
             "--phenoCol",
             "PHENO",
-            "--qt",
+            trait_flag,
         ]
         if covar_cols:
             cmd1.extend(
@@ -246,7 +249,7 @@ class RegenieEngine(GwasEngine):
             "PHENO",
             "--pred",
             str(pred_list),
-            "--qt",
+            trait_flag,
         ]
         if covar_cols:
             cmd2.extend(

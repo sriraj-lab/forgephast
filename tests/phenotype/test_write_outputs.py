@@ -16,6 +16,7 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
         "plugin": "polygenic_no_pleiotropy",
         "pgen_prefix": "",
         "sample_ids_file": "/tmp/samples.txt",
+        "trait_type": "binary",
         "phenotype_df": pd.DataFrame(
             {"FID": ["s1"], "IID": ["s1"], "PHENO": [0.1]}
         ),
@@ -60,6 +61,18 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
             "covariate": 0.14,
             "residual": 0.49,
             "phenotype": 0.99,
+            "liability": 1.00,
+        },
+        "binary_summary": {
+            "binary_prevalence_target": 0.20,
+            "binary_liability_logit_scale": 1.5,
+            "binary_alpha": -1.25,
+            "binary_alpha_by_population": '{"__cohort__": -1.25}',
+            "binary_prevalence_target_by_population": '{"__cohort__": 0.2}',
+            "binary_case_count": 1,
+            "binary_control_count": 4,
+            "binary_realized_prevalence": 0.2,
+            "binary_mean_predicted_probability": 0.2,
         },
         "genetic_fixed_beta_scale_factor": 0.42,
         "effect_geometry": {
@@ -87,6 +100,15 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     assert float(component_df.loc[0, "h2_jitter_delta"]) == -0.05
     assert bool(component_df.loc[0, "h2_jitter_clipped"]) is False
     assert component_df.loc[0, "target_mode"] == "single_population"
+    assert component_df.loc[0, "trait_type"] == "binary"
+    assert manifest_df.loc[0, "trait_type"] == "binary"
+    assert float(component_df.loc[0, "realized_var_liability"]) == 1.00
+    assert float(component_df.loc[0, "binary_prevalence_target"]) == 0.20
+    assert float(manifest_df.loc[0, "binary_liability_logit_scale"]) == 1.5
+    assert component_df.loc[0, "binary_alpha_by_population"] == '{"__cohort__": -1.25}'
+    assert int(manifest_df.loc[0, "binary_case_count"]) == 1
+    assert int(manifest_df.loc[0, "binary_control_count"]) == 4
+    assert float(manifest_df.loc[0, "binary_realized_prevalence"]) == 0.2
     assert component_df.loc[0, "resolved_h2_fixed_by_population"] == '{"AFR": 0.28, "EUR": 0.25}'
     assert component_df.loc[0, "resolved_h2_bg_by_population"] == '{"AFR": 0.1, "EUR": 0.1}'
     assert component_df.loc[0, "resolved_covariate_by_population"] == '{"AFR": 0.15, "EUR": 0.15}'

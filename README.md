@@ -239,6 +239,37 @@ Auditable outputs now include:
 - `h2_jitter_clipped_by_population`
 - `shift_tightness_*` columns (see "Cross-population MAF tightness" below)
 
+### Binary phenotypes from continuous liability
+
+`forgephast phenotype` can optionally convert the final continuous liability into a binary 0/1 case-control phenotype:
+
+```yaml
+phenotype:
+  trait_type: binary
+  n_replicates: 1
+  binary:
+    prevalence: 0.1
+    liability_logit_scale: 1.0
+    random_seed: 42
+    prevalence_by_population:
+      AFR: 0.12
+```
+
+The transform standardizes the final liability within the target cohort, solves an intercept `alpha` so the mean predicted probability matches the configured prevalence, then draws labels from:
+
+- `Pr(Y=1) = sigmoid(alpha + liability_logit_scale * z_liability)`
+
+When `prevalence_by_population` is provided, `liability_logit_scale` is shared and one intercept is solved per observed population, falling back to `binary.prevalence` for populations not listed.
+
+Binary phenotype outputs keep:
+
+- `PHENO` as 0/1 labels (`0=control`, `1=case`)
+- `LIABILITY` as the pre-binary continuous liability
+- `BINARY_PROBABILITY` as the calibrated draw probability
+- binary summary columns in `truth/component_summary.tsv` and `run_manifest.tsv`, including case/control counts, realized prevalence, `binary_alpha`, and `binary_alpha_by_population`
+
+For GWAS, REGENIE switches from `--qt` to `--bt` when `trait_type=binary`; PLINK2 adds `--1` so the 0/1 labels are interpreted as control/case status. Round-trip beta-slope validation remains quantitative-effect oriented; binary GWAS effects are on the log-odds scale and should be interpreted separately.
+
 ### Migration note: `beta_scale` column
 
 The `beta_scale` column emitted on `truth/effect_sizes.tsv` was produced by the

@@ -100,6 +100,49 @@ def test_valid_config_builds() -> None:
     assert cfg.causal_selection.effect_scale_maf_column == "maf_eur"
 
 
+def test_binary_phenotype_config_builds_with_narrow_contract() -> None:
+    payload = _base_payload()
+    payload["phenotype"] = {
+        "trait_type": "binary",
+        "n_replicates": 1,
+        "binary": {
+            "prevalence": 0.2,
+            "liability_logit_scale": 1.5,
+            "prevalence_by_population": {"AFR": 0.25},
+        },
+    }
+
+    cfg = RunConfig.from_dict(payload)
+
+    assert cfg.phenotype.trait_type == "binary"
+    assert cfg.phenotype.continuous_only is False
+    assert cfg.phenotype.binary.prevalence == 0.2
+    assert cfg.phenotype.binary.liability_logit_scale == 1.5
+    assert cfg.phenotype.binary.prevalence_by_population == {"AFR": 0.25}
+
+
+def test_binary_phenotype_rejects_contradictory_continuous_only() -> None:
+    payload = _base_payload()
+    payload["phenotype"] = {
+        "trait_type": "binary",
+        "continuous_only": True,
+        "n_replicates": 1,
+    }
+    with pytest.raises(ValueError, match="continuous_only=true"):
+        RunConfig.from_dict(payload)
+
+
+def test_binary_phenotype_rejects_invalid_prevalence() -> None:
+    payload = _base_payload()
+    payload["phenotype"] = {
+        "trait_type": "binary",
+        "n_replicates": 1,
+        "binary": {"prevalence": 1.0},
+    }
+    with pytest.raises(ValueError, match="phenotype.binary.prevalence"):
+        RunConfig.from_dict(payload)
+
+
 def test_config_accepts_explicit_bucket_and_effect_scale_maf_columns() -> None:
     payload = _base_payload()
     payload["causal_selection"]["maf_bucket_column"] = "maf_pooled"
