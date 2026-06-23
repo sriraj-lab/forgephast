@@ -322,6 +322,53 @@ def _linear_metrics(merged: pd.DataFrame) -> Tuple[float, float, float, float]:
     return float(slope), float(intercept), corr, sign
 
 
+def _component_summary_lookup(truth_dir: Path) -> Dict[tuple[int, str, str], pd.Series]:
+    """Load component_summary rows keyed by replicate x architecture x cohort."""
+    path = truth_dir / "component_summary.tsv"
+    if not path.exists():
+        return {}
+    frame = pd.read_csv(path, sep="\t")
+    required = {"replicate", "architecture", "cohort"}
+    if not required.issubset(frame.columns):
+        return {}
+    out: Dict[tuple[int, str, str], pd.Series] = {}
+    for _, row in frame.iterrows():
+        key = (int(row["replicate"]), str(row["architecture"]), str(row["cohort"]))
+        out[key] = row
+    return out
+
+
+def _float_from_row(row: pd.Series | None, column: str, fallback: float) -> float:
+    if row is None or column not in row:
+        return float(fallback)
+    value = pd.to_numeric(pd.Series([row[column]]), errors="coerce").iloc[0]
+    if pd.isna(value):
+        return float(fallback)
+    return float(value)
+
+
+def _binary_truth_scale_metadata(
+    *,
+    component_row: pd.Series | None,
+    run_cfg: RunConfig,
+) -> Dict[str, float | str]:
+    """Resolve liability-beta -> expected log-odds scale for binary validation."""
+    gamma = _float_from_row(
+        component_row,
+        "binary_liability_logit_scale",
+        float(run_cfg.phenotype.binary.liability_logit_scale),
+    )
+    liability_var = _float_from_row(component_row, "realized_var_liability", 1.0)
+    liability_sd = float(np.sqrt(liability_var)) if liability_var > 0.0 else float("nan")
+    scale = float(gamma / liability_sd) if np.isfinite(liability_sd) and liability_sd > 0.0 else float("nan")
+    return {
+        "binary_validation_scale": scale,
+        "binary_liability_logit_scale": float(gamma),
+        "binary_liability_sd": liability_sd,
+        "binary_validation_target": "log_odds_approx",
+    }
+
+
 def _resolve_truth_dir(run_dir: Path) -> Path:
     truth_dir = run_dir / "truth"
     if truth_dir.exists():
@@ -355,6 +402,7 @@ def collect_roundtrip_details(
 
     truth_df = pd.read_csv(truth_path, sep="\t")
     membership_df = pd.read_csv(membership_path, sep="\t")
+    component_lookup = _component_summary_lookup(truth_dir)
 
     cohort_cfg = {cohort.name: cohort for cohort in run_cfg.cohorts}
     default_pop = run_cfg.effect_model.population_order[0]
@@ -369,29 +417,6 @@ def collect_roundtrip_details(
         cohort_name = str(row["cohort"])
         engine = str(row["engine"])
         trait_type = str(row.get("trait_type", "quantitative"))
-        if trait_type == "binary":
-            rows.append(
-                {
-                    "run_name": str(row["run_name"]),
-                    "replicate": replicate,
-                    "architecture": architecture,
-                    "cohort": cohort_name,
-                    "engine": engine,
-                    "trait_type": trait_type,
-                    "validation_status": "skipped_binary_trait",
-                    "n_assoc_variants": 0,
-                    "n_truth_variants": 0,
-                    "n_overlap": 0,
-                    "beta_slope": np.nan,
-                    "beta_intercept": np.nan,
-                    "beta_corr": np.nan,
-                    "sign_concordance": np.nan,
-                    "top_k": int(run_cfg.roundtrip_validation.top_k),
-                    "top_k_causal_count": 0,
-                    "top_k_causal_fraction": np.nan,
-                }
-            )
-            continue
         assoc_path = _resolve_assoc_output_path(engine, Path(str(row["primary_output"])))
         if not assoc_path.exists():
             raise FileNotFoundError(f"GWAS primary output missing: {assoc_path}")
@@ -412,6 +437,20 @@ def collect_roundtrip_details(
             pop_weights=pop_weights_cache[cohort_name],
             default_population=default_pop,
         )
+        validation_status = "validated"
+        scale_metadata: Dict[str, Any] = {}
+        if trait_type == "binary":
+            validation_status = "validated_binary_log_odds"
+            scale_metadata = _binary_truth_scale_metadata(
+                component_row=component_lookup.get((replicate, architecture, cohort_name)),
+                run_cfg=run_cfg,
+            )
+            truth_weighted = truth_weighted.copy()
+            truth_weighted["beta_true_liability"] = truth_weighted["beta_true"]
+            truth_weighted["beta_true"] = (
+                truth_weighted["beta_true"].astype(float)
+                * float(scale_metadata["binary_validation_scale"])
+            )
         membership_subset = _membership_subset(
             membership_df=membership_df,
             replicate=replicate,
@@ -446,7 +485,7 @@ def collect_roundtrip_details(
                 "cohort": cohort_name,
                 "engine": engine,
                 "trait_type": trait_type,
-                "validation_status": "no_overlap",
+                "validation_status": f"{validation_status}_no_overlap",
                 "n_assoc_variants": int(assoc.shape[0]),
                 "n_truth_variants": int(truth_weighted.shape[0]),
                 "n_overlap": 0,
@@ -458,6 +497,7 @@ def collect_roundtrip_details(
                 "top_k_causal_count": 0,
                 "top_k_causal_fraction": 0.0,
             }
+            metrics.update(scale_metadata)
             rows.append(metrics)
             comparisons.append(
                 RoundTripComparison(
@@ -491,7 +531,7 @@ def collect_roundtrip_details(
             "cohort": cohort_name,
             "engine": engine,
             "trait_type": trait_type,
-            "validation_status": "validated",
+            "validation_status": validation_status,
             "n_assoc_variants": int(assoc.shape[0]),
             "n_truth_variants": int(truth_weighted.shape[0]),
             "n_overlap": int(merged.shape[0]),
@@ -503,6 +543,7 @@ def collect_roundtrip_details(
             "top_k_causal_count": top_causal,
             "top_k_causal_fraction": top_frac,
         }
+        metrics.update(scale_metadata)
         rows.append(metrics)
         comparisons.append(
             RoundTripComparison(

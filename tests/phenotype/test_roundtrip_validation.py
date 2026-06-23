@@ -161,30 +161,55 @@ def test_build_roundtrip_report_harmonizes_allele_and_computes_metrics(tmp_path:
     assert int(report.loc[0, "top_k_causal_count"]) == 2
 
 
-def test_build_roundtrip_report_skips_binary_trait_slope_validation(tmp_path: Path) -> None:
+def test_build_roundtrip_report_validates_binary_trait_on_log_odds_scale(tmp_path: Path) -> None:
     cfg = RunConfig.from_dict(_base_payload(tmp_path))
     run_dir = Path(cfg.paths.output_root) / cfg.name
     truth_dir = run_dir / "truth"
     truth_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(
         {
-            "variant_id": ["chr1:10"],
-            "population": ["EUR"],
-            "beta": [0.5],
-            "dosage_effect_allele": ["A"],
-            "architecture": ["a1"],
-            "cohort": ["c1"],
-            "replicate": [1],
+            "variant_id": ["chr1:10", "chr1:20", "chr1:10", "chr1:20"],
+            "population": ["EUR", "EUR", "AFR", "AFR"],
+            "beta": [0.4, -0.2, 0.4, -0.2],
+            "dosage_effect_allele": ["A", "G", "A", "G"],
+            "architecture": ["a1", "a1", "a1", "a1"],
+            "cohort": ["c1", "c1", "c1", "c1"],
+            "replicate": [1, 1, 1, 1],
         }
     ).to_csv(truth_dir / "effect_sizes.tsv", sep="\t", index=False)
     pd.DataFrame(
         {
-            "causal_id": ["chr1:10"],
+            "causal_id": ["chr1:10", "chr1:20"],
+            "replicate": [1, 1],
+            "architecture": ["a1", "a1"],
+            "cohort": ["c1", "c1"],
+        }
+    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        {
+            "run_name": [cfg.name],
             "replicate": [1],
             "architecture": ["a1"],
             "cohort": ["c1"],
+            "trait_type": ["binary"],
+            "realized_var_liability": [4.0],
+            "binary_liability_logit_scale": [1.5],
         }
-    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+    ).to_csv(truth_dir / "component_summary.tsv", sep="\t", index=False)
+
+    # Expected binary truth is liability_beta * gamma / sd(liability):
+    # chr1:10 = 0.4 * 1.5 / 2 = 0.3
+    # chr1:20 = -0.2 * 1.5 / 2 = -0.15, then allele-harmonized from A back to G.
+    assoc_path = run_dir / "step2_PHENO.regenie"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "ID": ["chr1:10", "chr1:20", "chr1:30"],
+            "A1": ["A", "A", "T"],
+            "BETA": [0.30, 0.15, 0.01],
+            "P": [1e-9, 2e-8, 0.9],
+        }
+    ).to_csv(assoc_path, sep="\t", index=False)
 
     gwas_manifest = pd.DataFrame(
         {
@@ -195,7 +220,7 @@ def test_build_roundtrip_report_skips_binary_trait_slope_validation(tmp_path: Pa
             "engine": ["regenie"],
             "trait_type": ["binary"],
             "status": ["success"],
-            "primary_output": [str(run_dir / "missing_binary_assoc.regenie")],
+            "primary_output": [str(assoc_path)],
         }
     )
     gwas_manifest_path = run_dir / "gwas_manifest.tsv"
@@ -209,8 +234,12 @@ def test_build_roundtrip_report_skips_binary_trait_slope_validation(tmp_path: Pa
 
     report = pd.read_csv(report_path, sep="\t")
     assert report.loc[0, "trait_type"] == "binary"
-    assert report.loc[0, "validation_status"] == "skipped_binary_trait"
-    assert pd.isna(report.loc[0, "beta_slope"])
+    assert report.loc[0, "validation_status"] == "validated_binary_log_odds"
+    assert float(report.loc[0, "binary_validation_scale"]) == 0.75
+    assert float(report.loc[0, "binary_liability_logit_scale"]) == 1.5
+    assert float(report.loc[0, "binary_liability_sd"]) == 2.0
+    assert abs(float(report.loc[0, "beta_slope"]) - 1.0) < 1e-12
+    assert int(report.loc[0, "top_k_causal_count"]) == 2
 
 
 def test_population_weights_expand_admix_from_local_ancestry_tracts(tmp_path: Path) -> None:
