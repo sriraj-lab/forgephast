@@ -4,6 +4,20 @@ FORGEPHAST combines population amplification and phenotype simulation workflows 
 
 ## Amplifier donor input contract
 
+### Donor selector weights
+
+`populations[].selector_weights` sets the desired aggregate sampling mass for metadata groups inside a mosaic donor pool. These are group-level mixture weights, not per-individual weights.
+
+If group `B` represents fraction `f_B` of the selected donor individuals but is assigned selector weight `w_B`, then:
+
+- `w_B > f_B` upsamples each `B` donor relative to unweighted donor sampling.
+- `w_B < f_B` downsamples each `B` donor relative to unweighted donor sampling.
+- `w_B = f_B` is equivalent to unweighted sampling for that group.
+
+For example, if a donor pool contains `80` group-`A` individuals and `20` group-`B` individuals, unweighted sampling gives `f_A=0.8` and `f_B=0.2`. Setting `selector_weights: {A: 0.6, B: 0.4}` makes each `B` individual more likely to be copied than each `A` individual because the smaller `B` pool receives `40%` of the total donor sampling mass.
+
+Internally, each donor in group `g` receives weight `w_g / n_g`, and that diploid donor weight is split evenly across its two haplotypes for tract-start and switch-point copying. Use `selector_weights` only when that intentional up/down-sampling is part of the simulation design.
+
 ## Amplifier simulation contract
 
 Amplifier now has one simulation path: the shard-pool engine.
@@ -12,6 +26,16 @@ Amplifier now has one simulation path: the shard-pool engine.
 - `n_shards=1` preserves the old single-shard behavior, but still runs through the same shard-pool implementation and returns the same output artifacts.
 - The separate public `simulate-pool` command/API no longer exists.
 - Runtime defaults for shard count, worker count, threads-per-task, and task start method live under `simulation.n_shards`, `simulation.task_workers`, `simulation.threads_per_task`, and `simulation.task_start_method`.
+
+### Publication TODO: `msprime_tracts` shard parallelism
+
+Current limitation:
+
+- if any simulated population uses `engine: msprime_tracts`, amplifier currently switches to a shard-sequential fallback path
+- in that branch, `simulation.task_workers` does not provide shard-level parallelism; shards run one at a time
+- do not interpret current `msprime_tracts` runtime as evidence of working shard-pool scale-out
+
+This is acceptable for ongoing internal repair work, but it needs to be fixed or explicitly redesigned before publication.
 
 Amplifier now reads donor panels at runtime from HapStore only.
 
@@ -198,20 +222,83 @@ This auto mode is explicit:
 
 Behavior:
 
-- jitter applies only to `h2_fixed`
+- jitter applies only to the per-population `h2_fixed` *target* used for reporting and for background/covariate/residual scaling
 - one deterministic draw is sampled per source population for each `replicate x architecture`
 - if baseline `h2_fixed <= 0`, no jitter is applied
-- the resolved `h2_fixed` is clipped to the remaining variance budget after `h2_bg` and covariates
-- homogeneous single-population cohorts use their population-specific resolved target directly
-- admixed cohorts do not get an admixed-specific target `h2`; they inherit the already-scaled source-population betas
-- residual variance is recomputed from the realized inherited fixed-effect variance plus the configured background and covariate targets
+- the resolved `h2_fixed` target is clipped to the remaining variance budget after `h2_bg` and covariates
+- targets no longer drive fixed-effect β rescaling: each population's realized `GENETIC_FIXED_COMPONENT` variance is a free output reflecting the causal-variant MAF structure and the configured shift/jitter β geometry
+- as a consequence, the jittered per-pop h² *target* will NOT be reproduced in `realized_h2_fixed_by_population`; the two columns intentionally report different things
+
+Target mode:
+
+- single-population cohorts (or cohorts with exactly one non-`ADMIX` source population) resolve a concrete cohort-level target and report `target_mode: single_population`
+- multi-population cohorts (e.g. `EUR + AFR`, or `EUR + AFR + ADMIX`) report `target_mode: free_per_population` and set cohort-level `genetic_fixed` / `resolved_h2_fixed` / `residual` to `NaN`; each population's realized fixed-effect variance appears in the new `realized_h2_fixed_by_population` JSON column instead
+- the legacy `inherited_source_betas` mode has been removed; configs that relied on it will now run as `free_per_population` and report biologically free per-population h²
 
 Auditable outputs now include:
 
-- `target_mode` in `truth/component_summary.tsv` and `run_manifest.tsv`
-- `resolved_h2_fixed_by_population`
+- `target_mode` in `truth/component_summary.tsv` and `run_manifest.tsv` (values: `single_population` or `free_per_population`)
+- `resolved_h2_fixed_by_population` — per-population TARGET (informational only, no longer drives β rescaling)
+- `realized_h2_fixed_by_population` — per-population ACTUAL variance of `GENETIC_FIXED_COMPONENT` (new)
 - `h2_jitter_delta_by_population`
 - `h2_jitter_clipped_by_population`
+- `shift_tightness_*` columns (see "Cross-population MAF tightness" below)
+
+### Migration note: `beta_scale` column
+
+The `beta_scale` column emitted on `truth/effect_sizes.tsv` was produced by the
+deprecated per-population β rescaling step. With that step removed, the column
+is no longer written. Consumers should switch to `effect_scale`, the
+MAF-based scaling column still emitted by `sample_population_specific_betas`.
+
+### Cross-population MAF tightness
+
+`forgephast phenotype` can filter the causal pool by how tightly paired populations' MAFs agree,
+using the max-over-pairs fold change `max(maf_i, maf_j) / min(maf_i, maf_j)`:
+
+```yaml
+causal_selection:
+  ...
+  tightness_filter:
+    tier: moderate            # tight | moderate | extreme | off
+    fold_change_cap: null     # optional numeric override of tier
+    maf_floor: 1.0e-4         # clamp applied before division to handle zero MAF
+```
+
+Tiers map to caps:
+
+- `tight`: fold change `<= 2.0`
+- `moderate`: fold change `<= 8.0`
+- `extreme` (default): fold change `<= 300.0`
+- `off`: no cap (no filtering, no reporting)
+
+A custom `fold_change_cap` (must be finite and `>= 1.0`) overrides the tier cap.
+MAFs are clipped to `maf_floor` before the ratio is computed, so zero (or
+near-zero) MAFs in one population produce a well-defined (large) fold change
+rather than dividing by zero.
+
+The filter runs early in `load_causal_pool` — on the broadest pool, before
+bucket assignment — so tier changes can be compared on an equal footing.
+Surviving variants' per-pair quantiles (50/75/90/99/max) are reported in
+`shift_tightness_fold_change_quantiles_json` on both `component_summary.tsv`
+and `run_manifest.tsv`, along with `shift_tightness_tier`,
+`shift_tightness_fold_change_cap`, `shift_tightness_fold_change_max_kept`,
+`shift_tightness_pre_filter_count`, and `shift_tightness_post_filter_count`.
+
+## Phenotype performance TODO
+
+The current phenotype runtime exposes useful I/O and chunking knobs:
+
+- `genotype_input.hapstore.io_threads`
+- `local_ancestry.chunk_n_samples`
+- `local_ancestry.chunk_n_variants`
+- grid-level `parallel_runs`
+
+But the dominant single-case hotspot for large local-ancestry phenotypes is still the core fixed-effect computation in `polygenic_no_pleiotropy`, which is chunked but not yet truly parallelized across CPU workers.
+
+Future optimization work for that path is intentionally deferred until after the PRS bakeoff phenotype release is stabilized. The detailed engineering plan is tracked in the thesis vault note:
+
+- `03 Plans/2026/2026-04-10 ForgePhast Phenotype Parallelization Plan`
 
 ## Annotation-weighted causal sampling
 
