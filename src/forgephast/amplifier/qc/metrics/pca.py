@@ -99,7 +99,7 @@ def _randomized_svd_compat(
         return u[:, :k], s[:k], vt[:k], "numpy_svd_fallback"
 
 
-def _impute_center_scale(
+def _center_scale(
     g: np.ndarray,
     *,
     mean: np.ndarray,
@@ -108,11 +108,9 @@ def _impute_center_scale(
     x = np.asarray(g, dtype=np.float64)
     if x.ndim != 2:
         raise ValueError(f"genotypes must be 2D, got shape={x.shape}")
+    if np.any(~np.isfinite(x)):
+        raise ValueError("PCA genotypes must be finite after missing-variant filtering")
     out = x.copy()
-    missing = ~np.isfinite(out)
-    if np.any(missing):
-        col_idx = np.where(missing)[1]
-        out[missing] = mean[col_idx]
     out -= mean
     out /= scale
     return out
@@ -193,7 +191,15 @@ def compute_pca_auc_metrics(
     with np.errstate(divide="ignore", invalid="ignore"):
         p = ac / an
     maf = np.minimum(p, 1.0 - p)
-    valid = np.isfinite(p) & np.isfinite(maf) & (an >= 4.0) & (maf >= float(config.qc.pca_min_maf)) & (maf <= 0.5)
+    complete = np.all(np.isfinite(donor_g_all), axis=0) & np.all(np.isfinite(synth_g_all), axis=0)
+    valid = (
+        complete
+        & np.isfinite(p)
+        & np.isfinite(maf)
+        & (an >= 4.0)
+        & (maf >= float(config.qc.pca_min_maf))
+        & (maf <= 0.5)
+    )
     if np.count_nonzero(valid) < 2:
         payload.update({"status": "no_variants_after_filter", "n_variants": int(np.count_nonzero(valid))})
         payload["auc_by_pair"] = []
@@ -213,8 +219,8 @@ def compute_pca_auc_metrics(
     donor_g_f = donor_g_all[:, valid][:, keep_scale]
     synth_g_f = synth_g_all[:, valid][:, keep_scale]
 
-    x_donor = _impute_center_scale(donor_g_f, mean=mean, scale=scale)
-    x_synth = _impute_center_scale(synth_g_f, mean=mean, scale=scale)
+    x_donor = _center_scale(donor_g_f, mean=mean, scale=scale)
+    x_synth = _center_scale(synth_g_f, mean=mean, scale=scale)
 
     requested_components = int(config.qc.pca_n_components)
     n_components = min(requested_components, x_donor.shape[0] - 1, x_donor.shape[1])

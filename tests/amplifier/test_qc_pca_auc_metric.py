@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from forgephast.amplifier.qc.metrics.pca import _auc_from_scores, _randomized_svd_compat, _standardize_scores
+from forgephast.amplifier.qc.metrics.pca import _auc_from_scores, _center_scale, _randomized_svd_compat, _standardize_scores
 
 
 def test_pca_auc_is_deterministic_under_fixed_seed():
@@ -25,3 +25,12 @@ def test_pca_auc_is_deterministic_under_fixed_seed():
     auc2 = _run()
     assert auc2 == pytest.approx(auc1)
     assert 0.5 <= auc1 <= 1.0
+
+
+def test_center_scale_rejects_missing_genotypes():
+    g = np.asarray([[0.0, 1.0], [np.nan, 2.0]], dtype=np.float64)
+    mean = np.asarray([0.0, 1.0], dtype=np.float64)
+    scale = np.asarray([1.0, 1.0], dtype=np.float64)
+
+    with pytest.raises(ValueError, match="finite"):
+        _center_scale(g, mean=mean, scale=scale)
