@@ -96,6 +96,40 @@ def test_valid_config_builds() -> None:
     assert cfg.name == "unit_test"
     assert cfg.pgen_export.prep_mode == "per_chrom_plink_merge"
     assert cfg.gwas.global_pcs.prune_before_pca is True
+    assert cfg.causal_selection.maf_bucket_column == "maf_eur"
+    assert cfg.causal_selection.effect_scale_maf_column == "maf_eur"
+
+
+def test_config_accepts_explicit_bucket_and_effect_scale_maf_columns() -> None:
+    payload = _base_payload()
+    payload["causal_selection"]["maf_bucket_column"] = "maf_pooled"
+    payload["causal_selection"]["effect_scale_maf_column"] = "maf_pooled"
+    cfg = RunConfig.from_dict(payload)
+    assert cfg.causal_selection.maf_bucket_column == "maf_pooled"
+    assert cfg.causal_selection.effect_scale_maf_column == "maf_pooled"
+
+
+def test_config_accepts_tightness_maf_columns_by_group() -> None:
+    payload = _base_payload()
+    payload["causal_selection"]["tightness_maf_columns_by_group"] = {
+        "EUR": "maf_eur",
+        "AFR_GULF": "maf_afr_gulf",
+        "AFR_EAST": "maf_afr_east",
+        "AFR_WEST": "maf_afr_west",
+    }
+    cfg = RunConfig.from_dict(payload)
+    assert cfg.causal_selection.maf_columns_by_population == {"EUR": "maf_eur", "AFR": "maf_afr"}
+    assert cfg.causal_selection.tightness_maf_columns() == {
+        "EUR": "maf_eur",
+        "AFR_GULF": "maf_afr_gulf",
+        "AFR_EAST": "maf_afr_east",
+        "AFR_WEST": "maf_afr_west",
+    }
+
+
+def test_config_tightness_maf_columns_fallback_to_population_map() -> None:
+    cfg = RunConfig.from_dict(_base_payload())
+    assert cfg.causal_selection.tightness_maf_columns() == {"EUR": "maf_eur", "AFR": "maf_afr"}
 
 
 def test_effect_model_accepts_metapopulation_jitter_placeholder() -> None:

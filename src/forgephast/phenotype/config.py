@@ -17,6 +17,7 @@ from .config_schema import (
     CovariateConfig,
     CustomAnnotationConfig,
     DefaultGeneWindowConfig,
+    DonorMixtureFallbackConfig,
     EffectModelConfig,
     GenotypeInputConfig,
     GlobalPCConfig,
@@ -32,6 +33,7 @@ from .config_schema import (
     RegenieEngineConfig,
     RoundTripPlotConfig,
     RoundTripValidationConfig,
+    TightnessFilterConfig,
     VarianceBudgetConfig,
 )
 
@@ -155,6 +157,8 @@ class RunConfig:
             for item in annotation_sampling_payload.get("custom_annotations", [])
         ]
         causal_payload["annotation_sampling"] = AnnotationSamplingConfig(**annotation_sampling_payload)
+        tightness_filter_payload = dict(causal_payload.get("tightness_filter", {}))
+        causal_payload["tightness_filter"] = TightnessFilterConfig(**tightness_filter_payload)
         causal_selection = CausalSelectionConfig(**causal_payload)
 
         effect_payload = dict(payload.get("effect_model", {}))
@@ -163,7 +167,12 @@ class RunConfig:
             for item in effect_payload.get("metapopulation_jitter", [])
         ]
         effect_model = EffectModelConfig(**effect_payload)
-        local_ancestry = LocalAncestryConfig(**payload.get("local_ancestry", {}))
+        local_ancestry_payload = dict(payload.get("local_ancestry", {}))
+        local_ancestry_payload["donor_mixture_fallbacks"] = [
+            DonorMixtureFallbackConfig(**item)
+            for item in local_ancestry_payload.get("donor_mixture_fallbacks", [])
+        ]
+        local_ancestry = LocalAncestryConfig(**local_ancestry_payload)
         covariates = CovariateConfig(**payload["covariates"])
         phenotype = PhenotypeConfig(**payload.get("phenotype", {}))
 

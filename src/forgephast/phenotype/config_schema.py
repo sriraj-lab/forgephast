@@ -301,6 +301,68 @@ class AnnotationSamplingConfig:
             )
 
 
+_TIGHTNESS_TIER_TO_CAP: Dict[str, float] = {
+    "tight": 2.0,
+    "moderate": 8.0,
+    "extreme": 300.0,
+    "off": float("inf"),
+}
+
+
+@dataclass
+class TightnessFilterConfig:
+    """Per-pair MAF fold-change filter for cross-population causal selection.
+
+    The filter drops variants whose max-over-pairs ``max(maf_i, maf_j) / min(maf_i, maf_j)``
+    exceeds the resolved cap. A floor is applied to MAFs before the ratio is
+    computed so that zero (or near-zero) MAFs do not produce division-by-zero.
+
+    Tiers:
+        - ``tight``: fold-change cap 2.0
+        - ``moderate``: fold-change cap 8.0
+        - ``extreme``: fold-change cap 300.0 (default)
+        - ``off``: no cap (no filtering, no quantile reporting either)
+
+    ``fold_change_cap`` may be set to override the tier cap with a numeric value.
+    """
+
+    tier: str = "extreme"
+    fold_change_cap: Optional[float] = None
+    maf_floor: float = 1e-4
+
+    def validate(self) -> None:
+        _check_one_of(
+            self.tier,
+            set(_TIGHTNESS_TIER_TO_CAP.keys()),
+            "causal_selection.tightness_filter.tier",
+        )
+        if self.fold_change_cap is not None:
+            cap = float(self.fold_change_cap)
+            if not np.isfinite(cap):
+                raise ValueError(
+                    "causal_selection.tightness_filter.fold_change_cap must be finite"
+                )
+            if cap < 1.0:
+                raise ValueError(
+                    "causal_selection.tightness_filter.fold_change_cap must be >= 1.0"
+                )
+        if not (0.0 < float(self.maf_floor) < 0.5):
+            raise ValueError(
+                "causal_selection.tightness_filter.maf_floor must be in (0.0, 0.5)"
+            )
+
+    def resolved_cap(self) -> float:
+        if self.fold_change_cap is not None:
+            return float(self.fold_change_cap)
+        return _TIGHTNESS_TIER_TO_CAP[self.tier]
+
+    def label(self) -> str:
+        """Human-readable label for reporting — tier name or custom cap."""
+        if self.fold_change_cap is not None:
+            return f"custom:cap={float(self.fold_change_cap):g}"
+        return self.tier
+
+
 @dataclass
 class CausalSelectionConfig:
     """Causal pool and MAF bucket selection settings."""
@@ -308,9 +370,13 @@ class CausalSelectionConfig:
     source_pairs_file: str
     variant_id_column: str = "causal_id"
     maf_columns_by_population: Dict[str, str] = field(default_factory=dict)
+    tightness_maf_columns_by_group: Dict[str, str] = field(default_factory=dict)
     anchor_population: Optional[str] = None
+    maf_bucket_column: Optional[str] = None
+    effect_scale_maf_column: Optional[str] = None
     maf_buckets: List[MafBucketConfig] = field(default_factory=list)
     annotation_sampling: AnnotationSamplingConfig = field(default_factory=AnnotationSamplingConfig)
+    tightness_filter: TightnessFilterConfig = field(default_factory=TightnessFilterConfig)
     random_seed: int = 42
 
     def validate(self) -> None:
@@ -318,12 +384,25 @@ class CausalSelectionConfig:
         _check_non_empty(self.variant_id_column, "causal_selection.variant_id_column")
         if not self.maf_columns_by_population:
             raise ValueError("causal_selection.maf_columns_by_population cannot be empty")
+        for group, column in self.tightness_maf_columns_by_group.items():
+            _check_non_empty(group, "causal_selection.tightness_maf_columns_by_group key")
+            _check_non_empty(column, "causal_selection.tightness_maf_columns_by_group value")
         if self.anchor_population is None:
             self.anchor_population = next(iter(self.maf_columns_by_population.keys()))
         if self.anchor_population not in self.maf_columns_by_population:
             raise ValueError(
                 "causal_selection.anchor_population must exist in maf_columns_by_population"
             )
+        anchor_maf_col = self.maf_columns_by_population[self.anchor_population]
+        if self.maf_bucket_column is None:
+            self.maf_bucket_column = anchor_maf_col
+        _check_non_empty(self.maf_bucket_column, "causal_selection.maf_bucket_column")
+        if self.effect_scale_maf_column is None:
+            self.effect_scale_maf_column = str(self.maf_bucket_column)
+        _check_non_empty(
+            self.effect_scale_maf_column,
+            "causal_selection.effect_scale_maf_column",
+        )
         if not self.maf_buckets:
             raise ValueError("causal_selection.maf_buckets cannot be empty")
         for bucket in self.maf_buckets:
@@ -337,6 +416,13 @@ class CausalSelectionConfig:
                     f"and {right.name} ({right.maf_min}-{right.maf_max})"
                 )
         self.annotation_sampling.validate()
+        self.tightness_filter.validate()
+
+    def tightness_maf_columns(self) -> Dict[str, str]:
+        """Return the MAF columns used by tightness filtering."""
+        if self.tightness_maf_columns_by_group:
+            return dict(self.tightness_maf_columns_by_group)
+        return dict(self.maf_columns_by_population)
 
 
 @dataclass
@@ -468,6 +554,26 @@ class EffectModelConfig:
 
 
 @dataclass
+class DonorMixtureFallbackConfig:
+    sample_id_prefix: str
+    source_population: str
+    beta_weights: Dict[str, float] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        _check_non_empty(self.sample_id_prefix, "local_ancestry.donor_mixture_fallbacks[].sample_id_prefix")
+        _check_non_empty(self.source_population, "local_ancestry.donor_mixture_fallbacks[].source_population")
+        if not self.beta_weights:
+            raise ValueError("local_ancestry.donor_mixture_fallbacks[].beta_weights cannot be empty")
+        total = 0.0
+        for population, weight in self.beta_weights.items():
+            _check_non_empty(population, "local_ancestry.donor_mixture_fallbacks[].beta_weights population")
+            _check_non_negative(float(weight), "local_ancestry.donor_mixture_fallbacks[].beta_weights value")
+            total += float(weight)
+        if total <= 0.0:
+            raise ValueError("local_ancestry.donor_mixture_fallbacks[].beta_weights must sum to > 0")
+
+
+@dataclass
 class LocalAncestryConfig:
     """Local ancestry truth integration for admixed cohorts."""
 
@@ -476,6 +582,7 @@ class LocalAncestryConfig:
     mode: str = "tracts_tsv"
     ancestry_order: List[str] = field(default_factory=list)
     label_map: Dict[str, str] = field(default_factory=dict)
+    donor_mixture_fallbacks: List[DonorMixtureFallbackConfig] = field(default_factory=list)
     chunk_n_samples: int = 5000
     chunk_n_variants: int = 2000
 
@@ -494,6 +601,8 @@ class LocalAncestryConfig:
         for key, value in self.label_map.items():
             if not str(key) or not str(value):
                 raise ValueError("local_ancestry.label_map keys/values cannot be empty")
+        for item in self.donor_mixture_fallbacks:
+            item.validate()
         _check_positive(int(self.chunk_n_samples), "local_ancestry.chunk_n_samples")
         _check_positive(int(self.chunk_n_variants), "local_ancestry.chunk_n_variants")
 
@@ -818,5 +927,6 @@ __all__ = [
     "RegenieEngineConfig",
     "RoundTripPlotConfig",
     "RoundTripValidationConfig",
+    "TightnessFilterConfig",
     "VarianceBudgetConfig",
 ]

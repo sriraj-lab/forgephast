@@ -65,6 +65,30 @@ def write_simulation_outputs(
         targets = rec["component_targets"]
         realized = rec.get("component_realized", {})
         effect_geometry = rec.get("effect_geometry", {})
+        realized_fixed_by_population = rec.get("realized_fixed_by_population", {}) or {}
+        tightness_summary = rec.get("tightness_summary", {}) or {}
+
+        realized_h2_fixed_by_population_json = json.dumps(
+            {str(k): float(v) for k, v in realized_fixed_by_population.items()},
+            sort_keys=True,
+        )
+        shift_tightness_tier = str(tightness_summary.get("tier", "extreme"))
+        shift_tightness_fold_change_cap = float(
+            tightness_summary.get("fold_change_cap", float("inf"))
+        )
+        shift_tightness_fold_change_max_kept = float(
+            tightness_summary.get("fold_change_max_kept", float("nan"))
+        )
+        shift_tightness_fold_change_quantiles_json = json.dumps(
+            tightness_summary.get("per_pair_quantiles", {}) or {},
+            sort_keys=True,
+        )
+        shift_tightness_pre_filter_count = int(
+            tightness_summary.get("pre_filter_count", 0)
+        )
+        shift_tightness_post_filter_count = int(
+            tightness_summary.get("post_filter_count", 0)
+        )
 
         component_rows.append(
             {
@@ -72,6 +96,7 @@ def write_simulation_outputs(
                 "replicate": replicate,
                 "architecture": architecture,
                 "cohort": cohort,
+                "genetic_fixed_beta_scale_factor": rec.get("genetic_fixed_beta_scale_factor", 1.0),
                 "base_h2_fixed": targets.get("base_h2_fixed", targets.get("genetic_fixed", 0.0)),
                 "resolved_h2_fixed": targets.get("resolved_h2_fixed", targets.get("genetic_fixed", 0.0)),
                 "h2_jitter_delta": targets.get("h2_jitter_delta", 0.0),
@@ -79,6 +104,18 @@ def write_simulation_outputs(
                 "target_mode": targets.get("target_mode", "single_population"),
                 "resolved_h2_fixed_by_population": targets.get(
                     "resolved_h2_fixed_by_population_json",
+                    "{}",
+                ),
+                "resolved_h2_bg_by_population": targets.get(
+                    "resolved_h2_bg_by_population_json",
+                    "{}",
+                ),
+                "resolved_covariate_by_population": targets.get(
+                    "resolved_covariate_by_population_json",
+                    "{}",
+                ),
+                "resolved_residual_by_population": targets.get(
+                    "resolved_residual_by_population_json",
                     "{}",
                 ),
                 "h2_jitter_delta_by_population": targets.get(
@@ -100,6 +137,13 @@ def write_simulation_outputs(
                 "realized_var_covariate": realized.get("covariate", 0.0),
                 "realized_var_residual": realized.get("residual", 0.0),
                 "realized_var_phenotype": realized.get("phenotype", 0.0),
+                "realized_h2_fixed_by_population": realized_h2_fixed_by_population_json,
+                "shift_tightness_tier": shift_tightness_tier,
+                "shift_tightness_fold_change_cap": shift_tightness_fold_change_cap,
+                "shift_tightness_fold_change_max_kept": shift_tightness_fold_change_max_kept,
+                "shift_tightness_fold_change_quantiles_json": shift_tightness_fold_change_quantiles_json,
+                "shift_tightness_pre_filter_count": shift_tightness_pre_filter_count,
+                "shift_tightness_post_filter_count": shift_tightness_post_filter_count,
             }
         )
 
@@ -109,6 +153,7 @@ def write_simulation_outputs(
                 "replicate": replicate,
                 "architecture": architecture,
                 "cohort": cohort,
+                "genetic_fixed_beta_scale_factor": rec.get("genetic_fixed_beta_scale_factor", 1.0),
                 "plugin": rec["plugin"],
                 "pgen_prefix": rec["pgen_prefix"],
                 "sample_ids_file": rec["sample_ids_file"],
@@ -127,6 +172,18 @@ def write_simulation_outputs(
                     "resolved_h2_fixed_by_population_json",
                     "{}",
                 ),
+                "resolved_h2_bg_by_population": targets.get(
+                    "resolved_h2_bg_by_population_json",
+                    "{}",
+                ),
+                "resolved_covariate_by_population": targets.get(
+                    "resolved_covariate_by_population_json",
+                    "{}",
+                ),
+                "resolved_residual_by_population": targets.get(
+                    "resolved_residual_by_population_json",
+                    "{}",
+                ),
                 "h2_jitter_delta_by_population": targets.get(
                     "h2_jitter_delta_by_population_json",
                     "{}",
@@ -140,6 +197,13 @@ def write_simulation_outputs(
                 "target_var_genetic_total": targets.get("genetic_total", 0.0),
                 "target_var_covariate": targets.get("covariate", 0.0),
                 "target_var_residual": targets.get("residual", 0.0),
+                "realized_h2_fixed_by_population": realized_h2_fixed_by_population_json,
+                "shift_tightness_tier": shift_tightness_tier,
+                "shift_tightness_fold_change_cap": shift_tightness_fold_change_cap,
+                "shift_tightness_fold_change_max_kept": shift_tightness_fold_change_max_kept,
+                "shift_tightness_fold_change_quantiles_json": shift_tightness_fold_change_quantiles_json,
+                "shift_tightness_pre_filter_count": shift_tightness_pre_filter_count,
+                "shift_tightness_post_filter_count": shift_tightness_post_filter_count,
             }
         )
         geometry_key = (replicate, architecture)

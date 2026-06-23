@@ -37,6 +37,12 @@ def _stable_string_seed(value: str) -> int:
     return sum((idx + 1) * ord(ch) for idx, ch in enumerate(value))
 
 
+def _sample_id_prefix(sample_id: str) -> str:
+    token = str(sample_id).strip()
+    prefix, sep, _ = token.rpartition("_syn")
+    return prefix if sep else token
+
+
 def _scale_component_to_variance(component: np.ndarray, target_variance: float) -> np.ndarray:
     """Scale a component vector to desired variance; returns zeros when impossible."""
     if target_variance <= 0:
@@ -47,6 +53,47 @@ def _scale_component_to_variance(component: np.ndarray, target_variance: float) 
     return component * np.sqrt(target_variance / observed)
 
 
+def _scale_component_to_shared_population_variance(
+    component: np.ndarray,
+    sample_populations: List[str],
+    target_variance: float,
+) -> np.ndarray:
+    """Scale component within each observed population to the same target variance."""
+    values = np.asarray(component, dtype=float)
+    populations = np.asarray(sample_populations, dtype=object)
+    scaled = np.zeros_like(values, dtype=float)
+    for pop in sorted({str(pop) for pop in sample_populations}):
+        row_idx = np.where(populations == pop)[0]
+        if row_idx.size == 0:
+            continue
+        scaled[row_idx] = _scale_component_to_variance(values[row_idx], target_variance)
+    return scaled
+
+
+def _scale_component_to_population_variance_map(
+    component: np.ndarray,
+    sample_populations: List[str],
+    target_variance_by_population: Dict[str, float],
+    fallback_target_variance: float | None = None,
+) -> np.ndarray:
+    """Scale component within each observed population to its resolved target variance."""
+    values = np.asarray(component, dtype=float)
+    populations = np.asarray(sample_populations, dtype=object)
+    scaled = np.zeros_like(values, dtype=float)
+    for pop in sorted({str(pop) for pop in sample_populations}):
+        row_idx = np.where(populations == pop)[0]
+        if row_idx.size == 0:
+            continue
+        if pop in target_variance_by_population:
+            target = float(target_variance_by_population[pop])
+        elif fallback_target_variance is not None:
+            target = float(fallback_target_variance)
+        else:
+            raise ValueError(f"Missing resolved target variance for population={pop}")
+        scaled[row_idx] = _scale_component_to_variance(values[row_idx], target)
+    return scaled
+
+
 def _scale_factor_to_variance(component: np.ndarray, target_variance: float) -> float:
     """Return multiplicative scale factor applied by _scale_component_to_variance."""
     if target_variance <= 0:
@@ -55,6 +102,16 @@ def _scale_factor_to_variance(component: np.ndarray, target_variance: float) -> 
     if observed <= 0:
         return 0.0
     return float(np.sqrt(float(target_variance) / observed))
+
+
+def _scale_effects_detail_betas(effects_detail: pd.DataFrame, scale_factor: float) -> pd.DataFrame:
+    """Apply one pooled post-h2 scale factor to persisted beta columns."""
+    scaled = effects_detail.copy()
+    for column in ("beta_base", "beta_delta", "beta"):
+        if column not in scaled.columns:
+            continue
+        scaled[column] = pd.to_numeric(scaled[column], errors="coerce") * float(scale_factor)
+    return scaled
 
 
 def _required_source_populations(
@@ -71,48 +128,13 @@ def _required_source_populations(
     return sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"})
 
 
-def _update_population_beta_scales(
-    *,
-    sample_populations: List[str],
-    genetic_raw: np.ndarray,
-    required_populations: List[str],
-    population_targets: Dict[str, Any],
-    scale_cache: Dict[str, float],
-) -> List[str]:
-    """Infer any missing source-population beta scales from observed raw components."""
-    populations = np.asarray(sample_populations, dtype=object)
-    for pop in required_populations:
-        if pop in scale_cache:
-            continue
-        row_idx = np.where(populations == pop)[0]
-        if row_idx.size == 0:
-            continue
-        scale_cache[pop] = _scale_factor_to_variance(
-            genetic_raw[row_idx],
-            float(population_targets["resolved_h2_fixed_by_population"][pop]),
-        )
-    return [pop for pop in required_populations if pop not in scale_cache]
-
-
-def _apply_population_beta_scales(
-    beta_df: pd.DataFrame,
-    scale_cache: Dict[str, float],
-) -> pd.DataFrame:
-    """Apply resolved source-population scales to per-population beta rows."""
-    scaled = beta_df.copy()
-    beta_scales = scaled["population"].astype(str).map(scale_cache).fillna(1.0).astype(float)
-    for col in ("beta", "beta_base", "beta_delta"):
-        if col in scaled.columns:
-            scaled[col] = pd.to_numeric(scaled[col], errors="coerce") * beta_scales
-    scaled["beta_scale"] = beta_scales
-    return scaled
-
-
 def _resolve_population_h2_targets(
     run_cfg: RunConfig,
     architecture_name: str,
     architecture_params: Dict[str, float],
     replicate: int,
+    population_order: List[str],
+    observed_population_order: List[str] | None = None,
 ) -> Dict[str, Any]:
     """Resolve per-population fixed-heritability targets for one replicate x architecture."""
     base_h2_fixed = float(run_cfg.variance_budget.h2_fixed)
@@ -129,7 +151,18 @@ def _resolve_population_h2_targets(
     delta_by_population: Dict[str, float] = {}
     clipped_by_population: Dict[str, bool] = {}
     jitter_enabled = float(run_cfg.variance_budget.h2_jitter_sd) > 0.0 and float(base_h2_fixed) > 0.0
-    for pop in run_cfg.effect_model.population_order:
+    resolved_bg_by_population: Dict[str, float] = {}
+    resolved_covariate_by_population: Dict[str, float] = {}
+    resolved_residual_by_population: Dict[str, float] = {}
+    shared_bg = float(run_cfg.variance_budget.h2_bg)
+    shared_covariate = float(
+        run_cfg.covariates.target_variance
+        if run_cfg.covariates.target_variance is not None
+        else run_cfg.variance_budget.covariate
+    )
+    if observed_population_order is None:
+        observed_population_order = list(population_order)
+    for pop in population_order:
         delta = 0.0
         clipped = False
         if jitter_enabled:
@@ -146,18 +179,21 @@ def _resolve_population_h2_targets(
         resolved_by_population[pop] = resolved
         delta_by_population[pop] = float(delta)
         clipped_by_population[pop] = bool(clipped)
+        resolved_bg_by_population[pop] = shared_bg
+        resolved_residual_by_population[pop] = max(0.0, 1.0 - resolved - shared_bg - shared_covariate)
+    for pop in observed_population_order:
+        resolved_covariate_by_population[str(pop)] = shared_covariate
 
     return {
         "base_h2_fixed": float(base_h2_fixed),
         "resolved_h2_fixed_by_population": resolved_by_population,
+        "resolved_h2_bg_by_population": resolved_bg_by_population,
+        "resolved_covariate_by_population": resolved_covariate_by_population,
+        "resolved_residual_by_population": resolved_residual_by_population,
         "h2_jitter_delta_by_population": delta_by_population,
         "h2_jitter_clipped_by_population": clipped_by_population,
-        "genetic_bg": float(run_cfg.variance_budget.h2_bg),
-        "covariate": float(
-            run_cfg.covariates.target_variance
-            if run_cfg.covariates.target_variance is not None
-            else run_cfg.variance_budget.covariate
-        ),
+        "genetic_bg": shared_bg,
+        "covariate": shared_covariate,
         "residual_baseline": float(run_cfg.variance_budget.residual),
         "strict_sum_to_one": bool(run_cfg.variance_budget.strict_sum_to_one),
         "h2_jitter_enabled": bool(jitter_enabled),
@@ -167,44 +203,85 @@ def _resolve_population_h2_targets(
 def _resolve_cohort_component_targets(
     population_targets: Dict[str, Any],
     cohort_populations: List[str],
-    realized_genetic_fixed_variance: float,
 ) -> Dict[str, Any]:
-    """Resolve cohort-level reporting targets under population-inherited beta scaling."""
+    """Resolve cohort-level reporting targets.
+
+    Single-population cohorts resolve a concrete cohort-level target that
+    matches the (single) population's h² target.  Multi-population cohorts
+    use ``target_mode="free_per_population"``: genetic_fixed is rescaled
+    *pooled* to ``base_h2_fixed`` (a single scalar preserving per-population
+    variance ratios), while each population's bg/covariate/residual is
+    scaled to its per-population target.  No per-population β rescaling is
+    applied.
+    """
+    resolved_h2_bg_by_population = dict(
+        population_targets.get(
+            "resolved_h2_bg_by_population",
+            {
+                str(pop): float(population_targets["genetic_bg"])
+                for pop in population_targets["resolved_h2_fixed_by_population"].keys()
+            },
+        )
+    )
+    resolved_covariate_by_population = dict(
+        population_targets.get(
+            "resolved_covariate_by_population",
+            {
+                str(pop): float(population_targets["covariate"])
+                for pop in population_targets["resolved_h2_fixed_by_population"].keys()
+            },
+        )
+    )
+    resolved_residual_by_population = dict(
+        population_targets.get(
+            "resolved_residual_by_population",
+            {
+                str(pop): max(
+                    0.0,
+                    1.0
+                    - float(population_targets["resolved_h2_fixed_by_population"][pop])
+                    - float(resolved_h2_bg_by_population[pop])
+                    - float(resolved_covariate_by_population[pop]),
+                )
+                for pop in population_targets["resolved_h2_fixed_by_population"].keys()
+            },
+        )
+    )
     non_admix = sorted({str(pop) for pop in cohort_populations if str(pop).upper() != "ADMIX"})
     has_single_source = len(non_admix) == 1
-    target_fixed = float("nan")
+    # For multi-pop, use base_h2_fixed as the cohort-level pooled target
+    # (genetic_fixed is rescaled pooled to this value, preserving per-pop
+    # ratios).  For single-pop, the population's resolved target is used.
+    target_fixed = float(population_targets["base_h2_fixed"])
     resolved_h2_fixed = float("nan")
     h2_jitter_delta = float("nan")
     h2_jitter_clipped = False
-    target_mode = "inherited_source_betas"
+    target_mode = "free_per_population"
     if has_single_source:
         pop = non_admix[0]
         target_fixed = float(population_targets["resolved_h2_fixed_by_population"][pop])
+        target_genetic_bg = float(resolved_h2_bg_by_population[pop])
+        target_covariate = float(resolved_covariate_by_population[pop])
+        target_residual = float(resolved_residual_by_population[pop])
         resolved_h2_fixed = target_fixed
         h2_jitter_delta = float(population_targets["h2_jitter_delta_by_population"][pop])
         h2_jitter_clipped = bool(population_targets["h2_jitter_clipped_by_population"][pop])
         target_mode = "single_population"
+    else:
+        target_genetic_bg = float(population_targets["genetic_bg"])
+        target_covariate = float(population_targets["covariate"])
+        target_residual = float("nan")
 
-    residual_target = (
-        1.0
-        - float(realized_genetic_fixed_variance)
-        - float(population_targets["genetic_bg"])
-        - float(population_targets["covariate"])
-    )
-    if residual_target < -1e-10 and bool(population_targets["strict_sum_to_one"]):
-        raise ValueError(
-            "Resolved residual variance is negative after inherited source-beta scaling "
-            f"(genetic_fixed={realized_genetic_fixed_variance}, "
-            f"genetic_bg={population_targets['genetic_bg']}, covariate={population_targets['covariate']})"
-        )
-    residual_target = max(0.0, float(residual_target))
+    residual_target = float("nan")
+    if has_single_source:
+        residual_target = float(target_residual)
     return {
         "genetic_fixed": target_fixed,
-        "genetic_bg": float(population_targets["genetic_bg"]),
-        "covariate": float(population_targets["covariate"]),
+        "genetic_bg": float(target_genetic_bg),
+        "covariate": float(target_covariate),
         "residual": residual_target,
         "genetic_total": (
-            target_fixed + float(population_targets["genetic_bg"])
+            target_fixed + float(target_genetic_bg)
             if np.isfinite(target_fixed)
             else float("nan")
         ),
@@ -215,6 +292,18 @@ def _resolve_cohort_component_targets(
         "target_mode": target_mode,
         "resolved_h2_fixed_by_population_json": json.dumps(
             population_targets["resolved_h2_fixed_by_population"],
+            sort_keys=True,
+        ),
+        "resolved_h2_bg_by_population_json": json.dumps(
+            resolved_h2_bg_by_population,
+            sort_keys=True,
+        ),
+        "resolved_covariate_by_population_json": json.dumps(
+            resolved_covariate_by_population,
+            sort_keys=True,
+        ),
+        "resolved_residual_by_population_json": json.dumps(
+            resolved_residual_by_population,
             sort_keys=True,
         ),
         "h2_jitter_delta_by_population_json": json.dumps(
@@ -450,10 +539,12 @@ def run_simulation(
 
     variant_col = run_cfg.causal_selection.variant_id_column
     default_population = run_cfg.effect_model.population_order[0]
-    anchor_population = run_cfg.causal_selection.anchor_population
-    if anchor_population is None:
-        anchor_population = next(iter(run_cfg.causal_selection.maf_columns_by_population.keys()))
-    anchor_maf_col = run_cfg.causal_selection.maf_columns_by_population[anchor_population]
+    effect_scale_maf_col = run_cfg.causal_selection.effect_scale_maf_column
+    if effect_scale_maf_col is None:
+        anchor_population = run_cfg.causal_selection.anchor_population
+        if anchor_population is None:
+            anchor_population = next(iter(run_cfg.causal_selection.maf_columns_by_population.keys()))
+        effect_scale_maf_col = run_cfg.causal_selection.maf_columns_by_population[anchor_population]
     if runtime_cache is None:
         kinship_cache: Dict[str, np.ndarray] = {}
         tracts_cache: Dict[tuple[str, int, str], dict] = {}
@@ -461,7 +552,6 @@ def run_simulation(
         sample_pops_cache: Dict[str, List[str]] = {}
         genotype_cache: dict[str, dict[str, Any]] = {}
         effect_geometry_cache: Dict[str, Dict[str, object]] = {}
-        population_beta_scale_cache: Dict[str, Dict[str, float]] = {}
         max_cache_bytes: int | None = None
     else:
         kinship_cache = runtime_cache.setdefault("simulate_kinship_cache", {})
@@ -470,7 +560,6 @@ def run_simulation(
         sample_pops_cache = runtime_cache.setdefault("simulate_sample_pops_cache", {})
         genotype_cache = runtime_cache.setdefault("simulate_genotype_cache", {})
         effect_geometry_cache = runtime_cache.setdefault("simulate_effect_geometry_cache", {})
-        population_beta_scale_cache = runtime_cache.setdefault("simulate_population_beta_scale_cache", {})
         max_cache_bytes = runtime_cache.get("max_cache_bytes")
         if max_cache_bytes is not None:
             max_cache_bytes = int(max_cache_bytes)
@@ -532,7 +621,7 @@ def run_simulation(
         variant_scale_by_id = build_variant_scale_by_maf(
             membership_df=membership,
             variant_id_column=variant_col,
-            maf_column=anchor_maf_col,
+            maf_column=effect_scale_maf_col,
             effect_model=run_cfg.effect_model,
         )
         _timed("simulate.variant_scale_by_maf", t_membership, replicate=int(replicate))
@@ -572,20 +661,26 @@ def run_simulation(
                 cached = genotype_cache[genotype_cache_key]
                 sample_frame = cached["sample_frame"]
                 genotype_matrix = cached.get("genotype_matrix")
-                admix_indices = cached.get("admix_indices")
-                admix_sample_ids = cached.get("admix_sample_ids")
+                truth_admix_indices = cached.get("truth_admix_indices")
+                truth_admix_sample_ids = cached.get("truth_admix_sample_ids")
                 admix_haplotypes = cached.get("admix_haplotypes")
                 admix_local_ancestry_codes = cached.get("admix_local_ancestry_codes")
+                donor_fallback_indices = cached.get("donor_fallback_indices")
+                donor_fallback_sample_ids = cached.get("donor_fallback_sample_ids")
+                donor_fallback_sample_pops = cached.get("donor_fallback_sample_pops")
                 la_genotypes_by_population = cached.get("la_genotypes_by_population", {})
                 dosage_effect_allele = dict(cached["dosage_effect_allele"])
             else:
                 _bump("simulate_genotype", False)
                 sample_frame = _sample_frame(sample_ids)
                 genotype_matrix = None
-                admix_indices = None
-                admix_sample_ids = None
+                truth_admix_indices = None
+                truth_admix_sample_ids = None
                 admix_haplotypes = None
                 admix_local_ancestry_codes = None
+                donor_fallback_indices = None
+                donor_fallback_sample_ids = None
+                donor_fallback_sample_pops = None
                 la_genotypes_by_population: dict[str, np.ndarray] = {}
 
                 if la_enabled:
@@ -594,15 +689,38 @@ def run_simulation(
                     ancestry_order = list(run_cfg.local_ancestry.ancestry_order)
                     ancestry_to_index = {a: i for i, a in enumerate(ancestry_order)}
 
-                    admix_indices = [i for i, p in enumerate(sample_populations) if str(p).upper() == "ADMIX"]
-                    admix_sample_ids = [sample_ids[i] for i in admix_indices]
-                    admix_sample_pops = [sample_populations[i] for i in admix_indices]
+                    fallback_rules_by_prefix = {
+                        str(rule.sample_id_prefix): {
+                            str(pop): float(weight)
+                            for pop, weight in rule.beta_weights.items()
+                        }
+                        for rule in run_cfg.local_ancestry.donor_mixture_fallbacks
+                    }
+                    truth_admix_indices = []
+                    truth_admix_sample_ids = []
+                    truth_admix_sample_pops = []
+                    donor_fallback_indices = []
+                    donor_fallback_sample_ids = []
+                    donor_fallback_sample_pops = []
+                    for idx, population in enumerate(sample_populations):
+                        if str(population).upper() != "ADMIX":
+                            continue
+                        sample_id = str(sample_ids[idx])
+                        sample_population = str(sample_populations[idx])
+                        if _sample_id_prefix(sample_id) in fallback_rules_by_prefix:
+                            donor_fallback_indices.append(int(idx))
+                            donor_fallback_sample_ids.append(sample_id)
+                            donor_fallback_sample_pops.append(sample_population)
+                        else:
+                            truth_admix_indices.append(int(idx))
+                            truth_admix_sample_ids.append(sample_id)
+                            truth_admix_sample_pops.append(sample_population)
 
-                    if admix_sample_ids:
+                    if truth_admix_sample_ids:
                         t_hap = time.perf_counter()
                         admix_haplotypes = adapter.export_haplotypes(
-                            sample_ids=admix_sample_ids,
-                            sample_populations=admix_sample_pops,
+                            sample_ids=truth_admix_sample_ids,
+                            sample_populations=truth_admix_sample_pops,
                             variant_ids=variant_ids,
                             out_dir=cohort_tmp,
                             chromosomes=run_cfg.chromosomes,
@@ -612,16 +730,16 @@ def run_simulation(
                             t_hap,
                             replicate=int(replicate),
                             cohort=str(cohort.name),
-                            n_samples=int(len(admix_sample_ids)),
+                            n_samples=int(len(truth_admix_sample_ids)),
                             n_variants=int(len(variant_ids)),
                         )
-                        if admix_haplotypes.shape != (len(admix_sample_ids), len(variant_ids), 2):
+                        if admix_haplotypes.shape != (len(truth_admix_sample_ids), len(variant_ids), 2):
                             raise ValueError(
                                 f"Unexpected ADMIX haplotype array shape: {admix_haplotypes.shape} "
-                                f"(expected {(len(admix_sample_ids), len(variant_ids), 2)})"
+                                f"(expected {(len(truth_admix_sample_ids), len(variant_ids), 2)})"
                             )
                         admix_local_ancestry_codes = np.full(
-                            (len(admix_sample_ids), len(variant_ids), 2),
+                            (len(truth_admix_sample_ids), len(variant_ids), 2),
                             -1,
                             dtype=np.int8,
                         )
@@ -643,7 +761,7 @@ def run_simulation(
                                 t_load = time.perf_counter()
                                 tracts_by_sample_hap = load_tracts_tsv_gz(
                                     tracts_path,
-                                    sample_ids=admix_sample_ids,
+                                    sample_ids=truth_admix_sample_ids,
                                     label_map=dict(run_cfg.local_ancestry.label_map),
                                 )
                                 tracts_cache[cache_key] = tracts_by_sample_hap
@@ -653,12 +771,12 @@ def run_simulation(
                                     replicate=int(replicate),
                                     cohort=str(cohort.name),
                                     chrom=int(chrom),
-                                    n_admix_samples=int(len(admix_sample_ids)),
+                                    n_admix_samples=int(len(truth_admix_sample_ids)),
                                 )
 
                             t_rast = time.perf_counter()
                             codes_subset = rasterize_tracts_to_variant_ancestry(
-                                sample_ids=admix_sample_ids,
+                                sample_ids=truth_admix_sample_ids,
                                 tracts_by_sample_hap=tracts_by_sample_hap,
                                 variant_positions_bp=positions_bp,
                                 ancestry_to_index=ancestry_to_index,
@@ -671,7 +789,7 @@ def run_simulation(
                                 replicate=int(replicate),
                                 cohort=str(cohort.name),
                                 chrom=int(chrom),
-                                n_admix_samples=int(len(admix_sample_ids)),
+                                n_admix_samples=int(len(truth_admix_sample_ids)),
                                 n_variants=int(len(positions_bp)),
                             )
                             admix_local_ancestry_codes[:, idx_for_chrom, :] = codes_subset.astype(
@@ -708,10 +826,13 @@ def run_simulation(
                 cache_entry = {
                     "sample_frame": sample_frame,
                     "genotype_matrix": genotype_matrix,
-                    "admix_indices": list(admix_indices) if admix_indices is not None else None,
-                    "admix_sample_ids": list(admix_sample_ids) if admix_sample_ids is not None else None,
+                    "truth_admix_indices": list(truth_admix_indices) if truth_admix_indices is not None else None,
+                    "truth_admix_sample_ids": list(truth_admix_sample_ids) if truth_admix_sample_ids is not None else None,
                     "admix_haplotypes": admix_haplotypes,
                     "admix_local_ancestry_codes": admix_local_ancestry_codes,
+                    "donor_fallback_indices": list(donor_fallback_indices) if donor_fallback_indices is not None else None,
+                    "donor_fallback_sample_ids": list(donor_fallback_sample_ids) if donor_fallback_sample_ids is not None else None,
+                    "donor_fallback_sample_pops": list(donor_fallback_sample_pops) if donor_fallback_sample_pops is not None else None,
                     "la_genotypes_by_population": la_genotypes_by_population,
                     "dosage_effect_allele": dict(dosage_effect_allele),
                 }
@@ -792,9 +913,9 @@ def run_simulation(
                     architecture_name=architecture.name,
                     architecture_params=architecture.params,
                     replicate=replicate,
+                    population_order=sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"}),
+                    observed_population_order=sorted({str(pop) for pop in sample_populations}),
                 )
-                scale_cache_key = f"{replicate}|{architecture.name}"
-                resolved_beta_scales = population_beta_scale_cache.setdefault(scale_cache_key, {})
                 required_pops = _required_source_populations(
                     sample_populations=sample_populations,
                     la_enabled=la_enabled,
@@ -804,6 +925,13 @@ def run_simulation(
                 def _compute_fixed_component_with_betas(
                     beta_df_for_compute: pd.DataFrame,
                 ) -> tuple[np.ndarray, pd.DataFrame]:
+                    fallback_rules_by_prefix = {
+                        str(rule.sample_id_prefix): {
+                            str(pop): float(weight)
+                            for pop, weight in rule.beta_weights.items()
+                        }
+                        for rule in run_cfg.local_ancestry.donor_mixture_fallbacks
+                    }
                     if la_enabled:
                         # Local ancestry computation:
                         # - homogeneous EUR/AFR: unphased genotypes are sufficient (ancestry constant)
@@ -855,14 +983,18 @@ def run_simulation(
                             betas = beta_pivot.loc[variant_ids, pop_label].to_numpy(dtype=np.float32)
                             genetic_component[row_idx] = geno_u8.astype(np.float32, copy=False) @ betas
 
-                        if admix_indices:
-                            if admix_haplotypes is None or admix_local_ancestry_codes is None or admix_sample_ids is None:
+                        if truth_admix_indices:
+                            if (
+                                admix_haplotypes is None
+                                or admix_local_ancestry_codes is None
+                                or truth_admix_sample_ids is None
+                            ):
                                 raise ValueError("Missing ADMIX haplotypes/codes for local ancestry simulation")
-                            admix_idx_arr = np.asarray(admix_indices, dtype=np.int64)
+                            admix_idx_arr = np.asarray(truth_admix_indices, dtype=np.int64)
                             la_input = ArchitectureInput(
-                                sample_ids=list(admix_sample_ids),
-                                sample_populations=["ADMIX"] * len(admix_sample_ids),
-                                dosage_df=_sample_frame(list(admix_sample_ids)),
+                                sample_ids=list(truth_admix_sample_ids),
+                                sample_populations=["ADMIX"] * len(truth_admix_sample_ids),
+                                dosage_df=_sample_frame(list(truth_admix_sample_ids)),
                                 haplotypes=admix_haplotypes,
                                 local_ancestry_codes=admix_local_ancestry_codes,
                                 ancestry_order=list(run_cfg.local_ancestry.ancestry_order),
@@ -874,6 +1006,51 @@ def run_simulation(
                                 variant_id_column=variant_col,
                             )
                             genetic_component[admix_idx_arr] = plugin._compute_local_ancestry_genetic_component(la_input)  # type: ignore[attr-defined]
+
+                        if donor_fallback_indices:
+                            if donor_fallback_sample_ids is None or donor_fallback_sample_pops is None:
+                                raise ValueError("Missing donor-mixture fallback sample metadata")
+                            geno_key = "__admix_donor_mixture_fallback__"
+                            if geno_key in la_genotypes_by_population:
+                                donor_geno_u8 = la_genotypes_by_population[geno_key]
+                            else:
+                                t_geno = time.perf_counter()
+                                donor_geno_u8 = adapter.export_genotypes_u8(
+                                    sample_ids=list(donor_fallback_sample_ids),
+                                    sample_populations=list(donor_fallback_sample_pops),
+                                    variant_ids=variant_ids,
+                                    out_dir=cohort_tmp,
+                                    chromosomes=run_cfg.chromosomes,
+                                )
+                                _timed(
+                                    "simulate.export_genotypes_u8",
+                                    t_geno,
+                                    replicate=int(replicate),
+                                    cohort=str(cohort.name),
+                                    population="ADMIX_DONOR_FALLBACK",
+                                    n_samples=int(len(donor_fallback_sample_ids)),
+                                    n_variants=int(len(variant_ids)),
+                                )
+                                la_genotypes_by_population[geno_key] = donor_geno_u8
+                            donor_idx_arr = np.asarray(donor_fallback_indices, dtype=np.int64)
+                            donor_prefixes = np.asarray(
+                                [_sample_id_prefix(sample_id) for sample_id in donor_fallback_sample_ids],
+                                dtype=object,
+                            )
+                            for sample_prefix, beta_weights in fallback_rules_by_prefix.items():
+                                local_rows = np.where(donor_prefixes == sample_prefix)[0].astype(np.int64)
+                                if int(local_rows.size) == 0:
+                                    continue
+                                betas = np.zeros(len(variant_ids), dtype=np.float32)
+                                for population, weight in beta_weights.items():
+                                    if population not in beta_pivot.columns:
+                                        raise ValueError(
+                                            f"Missing beta population column for donor-mixture fallback pop={population}"
+                                        )
+                                    betas += float(weight) * beta_pivot.loc[variant_ids, population].to_numpy(dtype=np.float32)
+                                genetic_component[donor_idx_arr[local_rows]] = (
+                                    donor_geno_u8[local_rows, :].astype(np.float32, copy=False) @ betas
+                                )
 
                         effects_detail = membership[
                             [variant_col, "maf_bucket", "membership_type", "replicate"]
@@ -905,24 +1082,27 @@ def run_simulation(
                     )
 
                 t_fixed = time.perf_counter()
-                if any(pop not in resolved_beta_scales for pop in required_pops):
-                    provisional_raw, _ = _compute_fixed_component_with_betas(beta_df)
-                    missing_after_update = _update_population_beta_scales(
-                        sample_populations=sample_populations,
-                        genetic_raw=provisional_raw,
-                        required_populations=required_pops,
-                        population_targets=population_targets,
-                        scale_cache=resolved_beta_scales,
-                    )
-                    if missing_after_update:
-                        raise ValueError(
-                            "Could not resolve source-population h2 scales before inherited-beta simulation; "
-                            f"missing populations={missing_after_update} cohort={cohort.name} "
-                            f"architecture={architecture.name} replicate={replicate}"
-                        )
+                # Compute the fixed component from jittered per-population betas.
+                # No per-population β rescaling is applied — per-population variance
+                # ratios are a free output of the MAF structure and jitter model.
+                genetic_fixed_raw, effects_detail = _compute_fixed_component_with_betas(beta_df)
 
-                scaled_beta_df = _apply_population_beta_scales(beta_df, resolved_beta_scales)
-                genetic_fixed, effects_detail = _compute_fixed_component_with_betas(scaled_beta_df)
+                # Anchor the pooled genetic fixed-effect variance to the
+                # architecture-level h² target.  A single scalar is applied to
+                # the entire vector, preserving per-population variance ratios
+                # while giving realistic absolute h².
+                _target_h2_fixed = float(population_targets["base_h2_fixed"])
+                genetic_fixed = genetic_fixed_raw
+                genetic_fixed_beta_scale_factor = 1.0
+                if np.isfinite(_target_h2_fixed) and _target_h2_fixed > 0:
+                    genetic_fixed_beta_scale_factor = _scale_factor_to_variance(
+                        genetic_fixed_raw, _target_h2_fixed
+                    )
+                    genetic_fixed = genetic_fixed_raw * genetic_fixed_beta_scale_factor
+                    effects_detail = _scale_effects_detail_betas(
+                        effects_detail, genetic_fixed_beta_scale_factor
+                    )
+
                 _timed(
                     "simulate.compute_genetic_fixed",
                     t_fixed,
@@ -932,6 +1112,17 @@ def run_simulation(
                     n_samples=int(len(sample_ids)),
                     n_variants=int(len(variant_ids)),
                 )
+
+                # Per-population realized fixed-effect variance after pooled
+                # rescaling. Ratios reflect the causal MAF structure; absolute
+                # values are anchored to the target h².
+                populations_for_realized = np.asarray(sample_populations, dtype=object)
+                realized_fixed_by_population: Dict[str, float] = {}
+                for pop in sorted({str(pop) for pop in sample_populations}):
+                    row_idx = np.where(populations_for_realized == pop)[0]
+                    if row_idx.size == 0:
+                        continue
+                    realized_fixed_by_population[pop] = float(np.var(genetic_fixed[row_idx]))
                 bg_seed = (
                     run_cfg.background_genetic.seed
                     + 2000 * replicate
@@ -964,12 +1155,44 @@ def run_simulation(
                 targets = _resolve_cohort_component_targets(
                     population_targets=population_targets,
                     cohort_populations=sample_populations,
-                    realized_genetic_fixed_variance=float(np.var(genetic_fixed)),
                 )
 
-                genetic_bg = _scale_component_to_variance(genetic_bg_raw, targets["genetic_bg"])
-                covariate = _scale_component_to_variance(cov_out.contribution, targets["covariate"])
-                residual = _scale_component_to_variance(residual_raw, targets["residual"])
+                non_admix_source_pops = sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"})
+                has_single_source = len(non_admix_source_pops) == 1
+                if has_single_source:
+                    genetic_bg = _scale_component_to_variance(genetic_bg_raw, targets["genetic_bg"])
+                    covariate = _scale_component_to_variance(cov_out.contribution, targets["covariate"])
+                    residual = _scale_component_to_variance(residual_raw, targets["residual"])
+                else:
+                    populations_arr = np.asarray(sample_populations, dtype=object)
+                    genetic_bg = np.zeros(len(sample_ids), dtype=float)
+                    covariate = np.zeros(len(sample_ids), dtype=float)
+                    residual = np.zeros(len(sample_ids), dtype=float)
+                    for pop in sorted({str(pop) for pop in sample_populations}):
+                        row_idx = np.where(populations_arr == pop)[0]
+                        if row_idx.size == 0:
+                            continue
+                        if pop in population_targets["resolved_h2_bg_by_population"]:
+                            genetic_bg[row_idx] = _scale_component_to_variance(
+                                genetic_bg_raw[row_idx],
+                                float(population_targets["resolved_h2_bg_by_population"][pop]),
+                            )
+                        else:
+                            genetic_bg[row_idx] = genetic_bg_raw[row_idx]
+                        covariate[row_idx] = _scale_component_to_variance(
+                            cov_out.contribution[row_idx],
+                            float(population_targets["resolved_covariate_by_population"].get(pop, targets["covariate"])),
+                        )
+                        if pop in population_targets["resolved_residual_by_population"]:
+                            residual[row_idx] = _scale_component_to_variance(
+                                residual_raw[row_idx],
+                                float(population_targets["resolved_residual_by_population"][pop]),
+                            )
+                        else:
+                            residual[row_idx] = _scale_component_to_variance(
+                                residual_raw[row_idx],
+                                float(population_targets["residual_baseline"]),
+                            )
 
                 genetic = genetic_fixed + genetic_bg
                 phenotype = genetic + covariate + residual
@@ -1030,6 +1253,9 @@ def run_simulation(
                             "residual": float(np.var(residual)),
                             "phenotype": float(np.var(phenotype)),
                         },
+                        "genetic_fixed_beta_scale_factor": float(genetic_fixed_beta_scale_factor),
+                        "realized_fixed_by_population": dict(realized_fixed_by_population),
+                        "tightness_summary": dict(bucketed_pool.tightness_summary),
                         "effect_geometry": effect_geometry,
                     }
                 )

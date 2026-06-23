@@ -42,6 +42,9 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
             "h2_jitter_clipped": False,
             "target_mode": "single_population",
             "resolved_h2_fixed_by_population_json": '{"AFR": 0.28, "EUR": 0.25}',
+            "resolved_h2_bg_by_population_json": '{"AFR": 0.1, "EUR": 0.1}',
+            "resolved_covariate_by_population_json": '{"AFR": 0.15, "EUR": 0.15}',
+            "resolved_residual_by_population_json": '{"AFR": 0.47, "EUR": 0.5}',
             "h2_jitter_delta_by_population_json": '{"AFR": -0.02, "EUR": -0.05}',
             "h2_jitter_clipped_by_population_json": '{"AFR": false, "EUR": false}',
             "genetic_fixed": 0.25,
@@ -58,6 +61,7 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
             "residual": 0.49,
             "phenotype": 0.99,
         },
+        "genetic_fixed_beta_scale_factor": 0.42,
         "effect_geometry": {
             "population_corr_mode": "auto_from_fst",
             "base_jitter_sd": 0.2,
@@ -78,15 +82,138 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     )
 
     assert float(component_df.loc[0, "base_h2_fixed"]) == 0.30
+    assert float(component_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.42
     assert float(component_df.loc[0, "resolved_h2_fixed"]) == 0.25
     assert float(component_df.loc[0, "h2_jitter_delta"]) == -0.05
     assert bool(component_df.loc[0, "h2_jitter_clipped"]) is False
     assert component_df.loc[0, "target_mode"] == "single_population"
     assert component_df.loc[0, "resolved_h2_fixed_by_population"] == '{"AFR": 0.28, "EUR": 0.25}'
+    assert component_df.loc[0, "resolved_h2_bg_by_population"] == '{"AFR": 0.1, "EUR": 0.1}'
+    assert component_df.loc[0, "resolved_covariate_by_population"] == '{"AFR": 0.15, "EUR": 0.15}'
+    assert component_df.loc[0, "resolved_residual_by_population"] == '{"AFR": 0.47, "EUR": 0.5}'
     assert float(manifest_df.loc[0, "resolved_h2_fixed"]) == 0.25
+    assert float(manifest_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.42
     assert manifest_df.loc[0, "target_mode"] == "single_population"
     assert geometry_df.loc[0, "population_corr_mode"] == "auto_from_fst"
     assert geometry_df.loc[0, "resolved_jitter_sd_by_population"] == '{"AFR": 0.3, "EUR": 0.2}'
     assert int(membership_summary_df.loc[0, "selected_causal_count"]) == 2
     assert int(membership_summary_df.loc[0, "annotation_hit_count"]) == 1
     assert float(membership_summary_df.loc[0, "annotation_hit_fraction"]) == 0.5
+
+
+def test_write_simulation_outputs_free_per_population_realized_h2_and_tightness(
+    tmp_path,
+) -> None:
+    output_root = tmp_path / "outputs"
+    record = {
+        "replicate": 2,
+        "architecture": "arch2",
+        "cohort": "cohort_multi",
+        "plugin": "polygenic_no_pleiotropy",
+        "pgen_prefix": "",
+        "sample_ids_file": "/tmp/samples.txt",
+        "phenotype_df": pd.DataFrame(
+            {"FID": ["s1", "s2"], "IID": ["s1", "s2"], "PHENO": [0.1, -0.2]}
+        ),
+        "covariate_df": pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}),
+        "pcs_df": pd.DataFrame({"FID": ["s1", "s2"], "IID": ["s1", "s2"]}),
+        "coefficients_df": pd.DataFrame({"covariate": ["age"], "beta": [0.2]}),
+        "membership_df": pd.DataFrame(
+            {
+                "variant_id": ["v1"],
+                "replicate": [2],
+                "architecture": ["arch2"],
+                "cohort": ["cohort_multi"],
+                "maf_bucket": ["rare"],
+                "annotation_hit": [False],
+                "annotation_labels": [""],
+                "sampling_weight": [1.0],
+            }
+        ),
+        "effects_df": pd.DataFrame({"variant_id": ["v1"], "beta": [0.3]}),
+        "component_targets": {
+            "base_h2_fixed": 0.30,
+            "resolved_h2_fixed": float("nan"),
+            "h2_jitter_delta": float("nan"),
+            "h2_jitter_clipped": False,
+            "target_mode": "free_per_population",
+            "resolved_h2_fixed_by_population_json": '{"AFR": 0.33, "EUR": 0.28}',
+            "resolved_h2_bg_by_population_json": '{"AFR": 0.1, "EUR": 0.1}',
+            "resolved_covariate_by_population_json": '{"AFR": 0.15, "EUR": 0.15}',
+            "resolved_residual_by_population_json": '{"AFR": 0.42, "EUR": 0.47}',
+            "h2_jitter_delta_by_population_json": '{"AFR": 0.03, "EUR": -0.02}',
+            "h2_jitter_clipped_by_population_json": '{"AFR": false, "EUR": false}',
+            "genetic_fixed": float("nan"),
+            "genetic_bg": 0.10,
+            "genetic_total": float("nan"),
+            "covariate": 0.15,
+            "residual": float("nan"),
+        },
+        "component_realized": {
+            "genetic_fixed": 0.21,
+            "genetic_bg": 0.09,
+            "genetic_total": 0.30,
+            "covariate": 0.14,
+            "residual": 0.40,
+            "phenotype": 0.84,
+        },
+        "genetic_fixed_beta_scale_factor": 0.75,
+        "realized_fixed_by_population": {"EUR": 0.18, "AFR": 0.24},
+        "tightness_summary": {
+            "tier": "moderate",
+            "fold_change_cap": 5.0,
+            "maf_floor": 1e-4,
+            "pre_filter_count": 10,
+            "post_filter_count": 7,
+            "dropped": 3,
+            "fold_change_max_kept": 4.75,
+            "per_pair_quantiles": {
+                "EUR|AFR": {
+                    "q50": 1.5,
+                    "q75": 3.0,
+                    "q90": 4.0,
+                    "q99": 4.7,
+                    "max": 4.75,
+                }
+            },
+        },
+        "effect_geometry": {
+            "population_corr_mode": "manual",
+            "base_jitter_sd": 0.1,
+            "resolved_jitter_sd_by_population": {"EUR": 0.1, "AFR": 0.1},
+            "population_fst_file": "",
+            "fst_corr_transform": "",
+            "fst_corr_lambda": 0.0,
+            "population_corr_matrix_json": "[[1.0,0.8],[0.8,1.0]]",
+        },
+    }
+
+    manifest_df = write_simulation_outputs("run_multi", output_root, [record])
+    component_df = pd.read_csv(
+        output_root / "run_multi" / "truth" / "component_summary.tsv", sep="\t"
+    )
+
+    assert component_df.loc[0, "target_mode"] == "free_per_population"
+    assert manifest_df.loc[0, "target_mode"] == "free_per_population"
+    assert float(component_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.75
+    assert float(manifest_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.75
+    # realized per-pop h2 is serialized with sorted keys
+    assert (
+        component_df.loc[0, "realized_h2_fixed_by_population"]
+        == '{"AFR": 0.24, "EUR": 0.18}'
+    )
+    assert (
+        manifest_df.loc[0, "realized_h2_fixed_by_population"]
+        == '{"AFR": 0.24, "EUR": 0.18}'
+    )
+    assert component_df.loc[0, "shift_tightness_tier"] == "moderate"
+    assert float(component_df.loc[0, "shift_tightness_fold_change_cap"]) == 5.0
+    assert float(component_df.loc[0, "shift_tightness_fold_change_max_kept"]) == 4.75
+    assert int(component_df.loc[0, "shift_tightness_pre_filter_count"]) == 10
+    assert int(component_df.loc[0, "shift_tightness_post_filter_count"]) == 7
+    # Quantiles JSON should round-trip
+    import json as _json
+
+    quantiles = _json.loads(component_df.loc[0, "shift_tightness_fold_change_quantiles_json"])
+    assert "EUR|AFR" in quantiles
+    assert quantiles["EUR|AFR"]["max"] == 4.75
