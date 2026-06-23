@@ -140,6 +140,11 @@ def _resolve_population_h2_targets(
     base_h2_fixed = float(run_cfg.variance_budget.h2_fixed)
     if "h2" in architecture_params:
         base_h2_fixed = float(architecture_params["h2"])
+    if not np.isclose(float(run_cfg.variance_budget.h2_jitter_sd), 0.0, atol=1e-12):
+        raise ValueError(
+            "variance_budget.h2_jitter_sd is disabled; set it to 0.0 and use "
+            "effect_model jitter settings for effect-size heterogeneity"
+        )
     max_fixed = max(
         0.0,
         1.0
@@ -150,7 +155,7 @@ def _resolve_population_h2_targets(
     resolved_by_population: Dict[str, float] = {}
     delta_by_population: Dict[str, float] = {}
     clipped_by_population: Dict[str, bool] = {}
-    jitter_enabled = float(run_cfg.variance_budget.h2_jitter_sd) > 0.0 and float(base_h2_fixed) > 0.0
+    jitter_enabled = False
     resolved_bg_by_population: Dict[str, float] = {}
     resolved_covariate_by_population: Dict[str, float] = {}
     resolved_residual_by_population: Dict[str, float] = {}
@@ -165,15 +170,6 @@ def _resolve_population_h2_targets(
     for pop in population_order:
         delta = 0.0
         clipped = False
-        if jitter_enabled:
-            jitter_seed = (
-                int(run_cfg.variance_budget.h2_jitter_seed)
-                + 1000 * int(replicate)
-                + _stable_string_seed(architecture_name)
-                + _stable_string_seed(pop)
-            )
-            rng = np.random.default_rng(jitter_seed)
-            delta = float(rng.normal(0.0, float(run_cfg.variance_budget.h2_jitter_sd)))
         resolved = float(np.clip(base_h2_fixed + delta, 0.0, max_fixed))
         clipped = not np.isclose(resolved, base_h2_fixed + delta, atol=1e-12)
         resolved_by_population[pop] = resolved

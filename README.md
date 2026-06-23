@@ -177,11 +177,11 @@ Even if every pairwise bound passes, the full matrix can still be invalid.
 
 ### Important note about heritability
 
-These geometry parameters control whether the cross-pop beta construction is valid. Final fixed-effect heritability is now resolved on the source-population axis, not by a single cohort-wide post hoc rescale.
+These geometry parameters control whether the cross-pop beta construction is valid. Final fixed-effect heritability is anchored by one pooled fixed-effect scale factor while preserving per-population realized variance differences.
 
-`forgephast phenotype` first samples one resolved `h2_fixed` target per source population for each `replicate x architecture`, then calibrates source-population betas to those targets. Homogeneous single-population cohorts use their source population's resolved target directly. Admixed cohorts do not get a separate target `h2`; they inherit the already-scaled source-population betas through local ancestry.
+`forgephast phenotype` uses `variance_budget.h2_fixed` or `architectures[].params.h2` as the pooled fixed-effect target. Per-population realized fixed-effect variance is reported as an output, not forced to match separate per-population h2 targets.
 
-So changing `sigma_beta`, jitter settings, or the FST-derived correlation affects the geometry of sampled effects, while `variance_budget.h2_fixed` and `variance_budget.h2_jitter_*` control the resolved source-population fixed-effect targets.
+So changing `sigma_beta`, effect-size jitter settings, or the FST-derived correlation affects the geometry of sampled effects, while `variance_budget.h2_fixed` controls the pooled fixed-effect target.
 
 ### Auto population correlation from donor FST
 
@@ -213,21 +213,16 @@ This auto mode is explicit:
 
 `effect_model.base_jitter_sd` provides the default per-population jitter floor for populations not explicitly listed in `effect_model.jitter_sd_by_population`.
 
-### `h2_fixed` jitter
+### `h2_fixed` target reporting
 
-`forgephast phenotype` can also jitter the fixed genetic variance target on the source-population axis:
-
-- `variance_budget.h2_jitter_sd`
-- `variance_budget.h2_jitter_seed`
+`variance_budget.h2_jitter_sd` is disabled and must remain `0.0`. Use `effect_model.base_jitter_sd` and `effect_model.jitter_sd_by_population` for cross-population effect-size heterogeneity.
 
 Behavior:
 
-- jitter applies only to the per-population `h2_fixed` *target* used for reporting and for background/covariate/residual scaling
-- one deterministic draw is sampled per source population for each `replicate x architecture`
-- if baseline `h2_fixed <= 0`, no jitter is applied
-- the resolved `h2_fixed` target is clipped to the remaining variance budget after `h2_bg` and covariates
-- targets no longer drive fixed-effect β rescaling: each population's realized `GENETIC_FIXED_COMPONENT` variance is a free output reflecting the causal-variant MAF structure and the configured shift/jitter β geometry
-- as a consequence, the jittered per-pop h² *target* will NOT be reproduced in `realized_h2_fixed_by_population`; the two columns intentionally report different things
+- `h2_fixed` is interpreted as the pooled fixed-effect target.
+- Per-population fixed-effect h2 is a realized output reflecting causal-variant MAF structure and the configured beta geometry.
+- `resolved_h2_fixed_by_population` remains informational and mirrors the non-jittered target for configured source populations.
+- `h2_jitter_delta_by_population` and `h2_jitter_clipped_by_population` remain in outputs for schema compatibility, but are zero/false under the supported config contract.
 
 Target mode:
 

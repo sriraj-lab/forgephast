@@ -338,6 +338,13 @@ def test_rejects_invalid_variance_budget_sum_when_strict() -> None:
         RunConfig.from_dict(payload)
 
 
+def test_rejects_h2_jitter_sd() -> None:
+    payload = _base_payload()
+    payload["variance_budget"]["h2_jitter_sd"] = 0.05
+    with pytest.raises(ValueError, match="h2_jitter_sd is disabled"):
+        RunConfig.from_dict(payload)
+
+
 def test_removed_global_pcs_compute_mode_raises() -> None:
     payload = _base_payload()
     payload["gwas"]["global_pcs"]["mode"] = "compute"

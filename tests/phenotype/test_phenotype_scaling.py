@@ -6,6 +6,7 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from forgephast.phenotype.phenotypes.simulate import (
     _scale_effects_detail_betas,
@@ -165,7 +166,7 @@ def test_resolve_population_h2_targets_excludes_admix_from_genetic_and_residual_
     assert abs(targets["residual_baseline"] - 0.50) < 1e-12
 
 
-def test_population_h2_jitter_is_deterministic_per_population() -> None:
+def test_resolve_population_h2_targets_rejects_h2_jitter() -> None:
     run_cfg = SimpleNamespace(
         variance_budget=SimpleNamespace(
             h2_fixed=0.25,
@@ -180,54 +181,14 @@ def test_population_h2_jitter_is_deterministic_per_population() -> None:
         effect_model=SimpleNamespace(population_order=["EUR", "AFR"]),
     )
 
-    t1 = _resolve_population_h2_targets(run_cfg, "arch1", architecture_params={}, replicate=1, population_order=["EUR", "AFR"])
-    t2 = _resolve_population_h2_targets(run_cfg, "arch1", architecture_params={}, replicate=1, population_order=["EUR", "AFR"])
-    t3 = _resolve_population_h2_targets(run_cfg, "arch1", architecture_params={}, replicate=2, population_order=["EUR", "AFR"])
-
-    assert t1["resolved_h2_fixed_by_population"] == t2["resolved_h2_fixed_by_population"]
-    assert t1["h2_jitter_delta_by_population"] == t2["h2_jitter_delta_by_population"]
-    assert t1["resolved_h2_fixed_by_population"]["EUR"] != t1["resolved_h2_fixed_by_population"]["AFR"]
-    assert t1["resolved_h2_fixed_by_population"] != t3["resolved_h2_fixed_by_population"]
-
-
-def test_population_h2_jitter_does_not_move_null_runs() -> None:
-    run_cfg = SimpleNamespace(
-        variance_budget=SimpleNamespace(
-            h2_fixed=0.0,
-            h2_bg=0.05,
-            covariate=0.20,
-            residual=0.75,
-            h2_jitter_sd=0.10,
-            h2_jitter_seed=17,
-            strict_sum_to_one=True,
-        ),
-        covariates=SimpleNamespace(target_variance=None),
-        effect_model=SimpleNamespace(population_order=["EUR", "AFR"]),
-    )
-
-    targets = _resolve_population_h2_targets(run_cfg, "arch1", architecture_params={}, replicate=1, population_order=["EUR", "AFR"])
-    assert targets["resolved_h2_fixed_by_population"] == {"EUR": 0.0, "AFR": 0.0}
-    assert targets["h2_jitter_delta_by_population"] == {"EUR": 0.0, "AFR": 0.0}
-
-
-def test_population_h2_jitter_clips_to_available_budget() -> None:
-    run_cfg = SimpleNamespace(
-        variance_budget=SimpleNamespace(
-            h2_fixed=0.95,
-            h2_bg=0.10,
-            covariate=0.10,
-            residual=0.0,
-            h2_jitter_sd=0.20,
-            h2_jitter_seed=1,
-            strict_sum_to_one=True,
-        ),
-        covariates=SimpleNamespace(target_variance=None),
-        effect_model=SimpleNamespace(population_order=["EUR", "AFR"]),
-    )
-
-    targets = _resolve_population_h2_targets(run_cfg, "arch1", architecture_params={}, replicate=1, population_order=["EUR", "AFR"])
-    assert targets["resolved_h2_fixed_by_population"] == {"EUR": 0.80, "AFR": 0.80}
-    assert targets["h2_jitter_clipped_by_population"] == {"EUR": True, "AFR": True}
+    with pytest.raises(ValueError, match="h2_jitter_sd is disabled"):
+        _resolve_population_h2_targets(
+            run_cfg,
+            "arch1",
+            architecture_params={},
+            replicate=1,
+            population_order=["EUR", "AFR"],
+        )
 
 
 def test_multi_population_cohort_uses_jittered_betas_without_rescaling() -> None:

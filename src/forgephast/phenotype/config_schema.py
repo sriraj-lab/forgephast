@@ -684,6 +684,13 @@ class VarianceBudgetConfig:
         ]:
             _check_non_negative(val, f"variance_budget.{name}")
         _check_non_negative(self.h2_jitter_sd, "variance_budget.h2_jitter_sd")
+        if not np.isclose(float(self.h2_jitter_sd), 0.0, atol=1e-12):
+            raise ValueError(
+                "variance_budget.h2_jitter_sd is disabled because per-population "
+                "h2 target jitter is not part of the supported phenotype contract; "
+                "set it to 0.0 and use effect_model jitter settings for effect-size "
+                "heterogeneity"
+            )
         total = float(self.h2_fixed + self.h2_bg + self.covariate + self.residual)
         if self.strict_sum_to_one:
             if not np.isclose(total, 1.0, atol=1e-6):
