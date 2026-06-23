@@ -268,7 +268,7 @@ Binary phenotype outputs keep:
 - `BINARY_PROBABILITY` as the calibrated draw probability
 - binary summary columns in `truth/component_summary.tsv` and `run_manifest.tsv`, including case/control counts, realized prevalence, `binary_alpha`, and `binary_alpha_by_population`
 
-For GWAS, REGENIE switches from `--qt` to `--bt` when `trait_type=binary`; PLINK2 adds `--1` so the 0/1 labels are interpreted as control/case status. Round-trip beta-slope validation remains quantitative-effect oriented; binary GWAS effects are on the log-odds scale and should be interpreted separately.
+For GWAS, REGENIE switches from `--qt` to `--bt` when `trait_type=binary`; PLINK2 adds `--1` so the 0/1 labels are interpreted as control/case status. Round-trip beta-slope validation remains quantitative-effect oriented and skips binary rows with `validation_status=skipped_binary_trait`; binary GWAS effects are on the log-odds scale and should be interpreted separately.
 
 ### Migration note: `beta_scale` column
 

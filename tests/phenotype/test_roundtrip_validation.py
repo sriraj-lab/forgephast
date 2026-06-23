@@ -161,6 +161,58 @@ def test_build_roundtrip_report_harmonizes_allele_and_computes_metrics(tmp_path:
     assert int(report.loc[0, "top_k_causal_count"]) == 2
 
 
+def test_build_roundtrip_report_skips_binary_trait_slope_validation(tmp_path: Path) -> None:
+    cfg = RunConfig.from_dict(_base_payload(tmp_path))
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    truth_dir = run_dir / "truth"
+    truth_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "variant_id": ["chr1:10"],
+            "population": ["EUR"],
+            "beta": [0.5],
+            "dosage_effect_allele": ["A"],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "replicate": [1],
+        }
+    ).to_csv(truth_dir / "effect_sizes.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        {
+            "causal_id": ["chr1:10"],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+        }
+    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+
+    gwas_manifest = pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "engine": ["regenie"],
+            "trait_type": ["binary"],
+            "status": ["success"],
+            "primary_output": [str(run_dir / "missing_binary_assoc.regenie")],
+        }
+    )
+    gwas_manifest_path = run_dir / "gwas_manifest.tsv"
+    gwas_manifest.to_csv(gwas_manifest_path, sep="\t", index=False)
+
+    report_path = build_roundtrip_report(
+        run_cfg=cfg,
+        run_dir=run_dir,
+        gwas_manifest_path=gwas_manifest_path,
+    )
+
+    report = pd.read_csv(report_path, sep="\t")
+    assert report.loc[0, "trait_type"] == "binary"
+    assert report.loc[0, "validation_status"] == "skipped_binary_trait"
+    assert pd.isna(report.loc[0, "beta_slope"])
+
+
 def test_population_weights_expand_admix_from_local_ancestry_tracts(tmp_path: Path) -> None:
     payload = _base_payload(tmp_path)
     sample_ids = tmp_path / "samples_admix.txt"

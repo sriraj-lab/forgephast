@@ -368,6 +368,30 @@ def collect_roundtrip_details(
         architecture = str(row["architecture"])
         cohort_name = str(row["cohort"])
         engine = str(row["engine"])
+        trait_type = str(row.get("trait_type", "quantitative"))
+        if trait_type == "binary":
+            rows.append(
+                {
+                    "run_name": str(row["run_name"]),
+                    "replicate": replicate,
+                    "architecture": architecture,
+                    "cohort": cohort_name,
+                    "engine": engine,
+                    "trait_type": trait_type,
+                    "validation_status": "skipped_binary_trait",
+                    "n_assoc_variants": 0,
+                    "n_truth_variants": 0,
+                    "n_overlap": 0,
+                    "beta_slope": np.nan,
+                    "beta_intercept": np.nan,
+                    "beta_corr": np.nan,
+                    "sign_concordance": np.nan,
+                    "top_k": int(run_cfg.roundtrip_validation.top_k),
+                    "top_k_causal_count": 0,
+                    "top_k_causal_fraction": np.nan,
+                }
+            )
+            continue
         assoc_path = _resolve_assoc_output_path(engine, Path(str(row["primary_output"])))
         if not assoc_path.exists():
             raise FileNotFoundError(f"GWAS primary output missing: {assoc_path}")
@@ -421,6 +445,8 @@ def collect_roundtrip_details(
                 "architecture": architecture,
                 "cohort": cohort_name,
                 "engine": engine,
+                "trait_type": trait_type,
+                "validation_status": "no_overlap",
                 "n_assoc_variants": int(assoc.shape[0]),
                 "n_truth_variants": int(truth_weighted.shape[0]),
                 "n_overlap": 0,
@@ -464,6 +490,8 @@ def collect_roundtrip_details(
             "architecture": architecture,
             "cohort": cohort_name,
             "engine": engine,
+            "trait_type": trait_type,
+            "validation_status": "validated",
             "n_assoc_variants": int(assoc.shape[0]),
             "n_truth_variants": int(truth_weighted.shape[0]),
             "n_overlap": int(merged.shape[0]),
