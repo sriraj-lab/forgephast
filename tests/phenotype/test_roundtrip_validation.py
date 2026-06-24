@@ -155,10 +155,14 @@ def test_build_roundtrip_report_harmonizes_allele_and_computes_metrics(tmp_path:
         gwas_manifest_path=gwas_manifest_path,
     )
     assert report_path.exists()
+    detail_path = report_path.with_name("roundtrip_validation_details.tsv")
+    assert detail_path.exists()
     report = pd.read_csv(report_path, sep="\t")
     assert report.shape[0] == 1
     assert float(report.loc[0, "beta_slope"]) > 0.0
     assert int(report.loc[0, "top_k_causal_count"]) == 2
+    details = pd.read_csv(detail_path, sep="\t")
+    assert "expected_liability_beta" in details.columns
 
 
 def test_build_roundtrip_report_validates_binary_trait_on_log_odds_scale(tmp_path: Path) -> None:
@@ -240,6 +244,14 @@ def test_build_roundtrip_report_validates_binary_trait_on_log_odds_scale(tmp_pat
     assert float(report.loc[0, "binary_liability_sd"]) == 2.0
     assert abs(float(report.loc[0, "beta_slope"]) - 1.0) < 1e-12
     assert int(report.loc[0, "top_k_causal_count"]) == 2
+    details = pd.read_csv(report_path.with_name("roundtrip_validation_details.tsv"), sep="\t")
+    detail_by_id = details.set_index("variant_id")
+    assert "expected_log_odds_beta" in details.columns
+    assert "beta_true_liability" in details.columns
+    assert float(detail_by_id.loc["chr1:10", "beta_true_liability"]) == 0.4
+    assert float(detail_by_id.loc["chr1:10", "expected_log_odds_beta"]) == 0.3
+    assert float(detail_by_id.loc["chr1:20", "beta_true_liability"]) == -0.2
+    assert float(detail_by_id.loc["chr1:20", "expected_log_odds_beta"]) == -0.15
 
 
 def test_population_weights_expand_admix_from_local_ancestry_tracts(tmp_path: Path) -> None:

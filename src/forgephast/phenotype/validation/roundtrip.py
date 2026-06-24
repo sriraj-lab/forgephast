@@ -369,6 +369,71 @@ def _binary_truth_scale_metadata(
     }
 
 
+def _roundtrip_details_path(report_path: Path) -> Path:
+    """Resolve the per-variant detail path next to the summary report."""
+    if report_path.name.endswith(".tsv"):
+        return report_path.with_name(f"{report_path.stem}_details.tsv")
+    return report_path.with_name(f"{report_path.name}_details.tsv")
+
+
+def _write_roundtrip_details(
+    *,
+    comparisons: list[RoundTripComparison],
+    details_path: Path,
+) -> None:
+    """Write per-variant observed-vs-expected beta details for each comparison."""
+    frames: list[pd.DataFrame] = []
+    for comparison in comparisons:
+        detail = comparison.merged_df.copy()
+        if detail.empty:
+            continue
+        metrics = dict(comparison.metrics)
+        detail.insert(0, "run_name", comparison.run_name)
+        detail.insert(1, "replicate", int(comparison.replicate))
+        detail.insert(2, "architecture", comparison.architecture)
+        detail.insert(3, "cohort", comparison.cohort)
+        detail.insert(4, "engine", comparison.engine)
+        detail.insert(5, "trait_type", str(metrics.get("trait_type", "")))
+        detail.insert(6, "validation_status", str(metrics.get("validation_status", "")))
+        detail["assoc_path"] = str(comparison.assoc_path)
+        if str(metrics.get("trait_type", "")) == "binary":
+            if "expected_log_odds_beta" not in detail.columns:
+                detail["expected_log_odds_beta"] = detail["beta_true"]
+            if "binary_validation_scale" not in detail.columns:
+                detail["binary_validation_scale"] = metrics.get("binary_validation_scale", np.nan)
+        else:
+            if "expected_liability_beta" not in detail.columns:
+                detail["expected_liability_beta"] = detail["beta_true"]
+        frames.append(detail)
+
+    details_path.parent.mkdir(parents=True, exist_ok=True)
+    if frames:
+        pd.concat(frames, ignore_index=True, sort=False).to_csv(
+            details_path,
+            sep="\t",
+            index=False,
+        )
+    else:
+        pd.DataFrame(
+            columns=[
+                "run_name",
+                "replicate",
+                "architecture",
+                "cohort",
+                "engine",
+                "trait_type",
+                "validation_status",
+                "variant_id",
+                "beta_hat",
+                "beta_hat_harmonized",
+                "beta_true",
+                "expected_log_odds_beta",
+                "expected_liability_beta",
+            ]
+        ).to_csv(details_path, sep="\t", index=False)
+    logger.info("[validate] wrote round-trip details: %s", details_path)
+
+
 def _resolve_truth_dir(run_dir: Path) -> Path:
     truth_dir = run_dir / "truth"
     if truth_dir.exists():
@@ -447,9 +512,13 @@ def collect_roundtrip_details(
             )
             truth_weighted = truth_weighted.copy()
             truth_weighted["beta_true_liability"] = truth_weighted["beta_true"]
-            truth_weighted["beta_true"] = (
+            truth_weighted["expected_log_odds_beta"] = (
                 truth_weighted["beta_true"].astype(float)
                 * float(scale_metadata["binary_validation_scale"])
+            )
+            truth_weighted["beta_true"] = truth_weighted["expected_log_odds_beta"]
+            truth_weighted["binary_validation_scale"] = float(
+                scale_metadata["binary_validation_scale"]
             )
         membership_subset = _membership_subset(
             membership_df=membership_df,
@@ -582,7 +651,7 @@ def build_roundtrip_report(
     gwas_manifest_path: Path,
 ) -> Path:
     """Build GWAS-vs-truth validation report and enforce configured gates."""
-    report_df, _, failures = collect_roundtrip_details(
+    report_df, comparisons, failures = collect_roundtrip_details(
         run_cfg=run_cfg,
         run_dir=run_dir,
         gwas_manifest_path=gwas_manifest_path,
@@ -595,6 +664,10 @@ def build_roundtrip_report(
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_df.to_csv(report_path, sep="\t", index=False)
     logger.info("[validate] wrote round-trip report: %s", report_path)
+    _write_roundtrip_details(
+        comparisons=comparisons,
+        details_path=_roundtrip_details_path(report_path),
+    )
 
     if failures:
         raise RuntimeError(
