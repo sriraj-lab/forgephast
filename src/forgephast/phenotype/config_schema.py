@@ -639,6 +639,7 @@ class BinaryPhenotypeConfig:
     liability_logit_scale: float = 1.0
     random_seed: int = 42
     prevalence_by_population: Dict[str, float] = field(default_factory=dict)
+    alpha_by_population: Dict[str, float] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not 0.0 < float(self.prevalence) < 1.0:
@@ -658,6 +659,18 @@ class BinaryPhenotypeConfig:
                 raise ValueError(
                     "phenotype.binary.prevalence_by_population values must be in (0, 1)"
                 )
+        for population, alpha in self.alpha_by_population.items():
+            _check_non_empty(
+                str(population),
+                "phenotype.binary.alpha_by_population population",
+            )
+            if not np.isfinite(float(alpha)):
+                raise ValueError("phenotype.binary.alpha_by_population values must be finite")
+        if self.prevalence_by_population and self.alpha_by_population:
+            raise ValueError(
+                "phenotype.binary.prevalence_by_population and "
+                "phenotype.binary.alpha_by_population are alternative source-alpha inputs"
+            )
 
 
 @dataclass

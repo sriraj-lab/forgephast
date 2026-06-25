@@ -119,6 +119,39 @@ def test_binary_phenotype_config_builds_with_narrow_contract() -> None:
     assert cfg.phenotype.binary.prevalence == 0.2
     assert cfg.phenotype.binary.liability_logit_scale == 1.5
     assert cfg.phenotype.binary.prevalence_by_population == {"AFR": 0.25}
+    assert cfg.phenotype.binary.alpha_by_population == {}
+
+
+def test_binary_phenotype_config_supports_explicit_source_alpha() -> None:
+    payload = _base_payload()
+    payload["phenotype"] = {
+        "trait_type": "binary",
+        "n_replicates": 1,
+        "binary": {
+            "prevalence": 0.2,
+            "liability_logit_scale": 1.5,
+            "alpha_by_population": {"EUR": -2.0, "AFR": -0.5},
+        },
+    }
+
+    cfg = RunConfig.from_dict(payload)
+
+    assert cfg.phenotype.binary.alpha_by_population == {"EUR": -2.0, "AFR": -0.5}
+
+
+def test_binary_phenotype_rejects_mixed_prevalence_and_alpha_maps() -> None:
+    payload = _base_payload()
+    payload["phenotype"] = {
+        "trait_type": "binary",
+        "n_replicates": 1,
+        "binary": {
+            "prevalence_by_population": {"EUR": 0.2},
+            "alpha_by_population": {"EUR": -1.0},
+        },
+    }
+
+    with pytest.raises(ValueError, match="alternative source-alpha inputs"):
+        RunConfig.from_dict(payload)
 
 
 def test_binary_phenotype_rejects_contradictory_continuous_only() -> None:

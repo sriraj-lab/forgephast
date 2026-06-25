@@ -252,6 +252,7 @@ phenotype:
     liability_logit_scale: 1.0
     random_seed: 42
     prevalence_by_population:
+      EUR: 0.10
       AFR: 0.12
 ```
 
@@ -259,13 +260,31 @@ The transform standardizes the final liability within the target cohort, solves 
 
 - `Pr(Y=1) = sigmoid(alpha + liability_logit_scale * z_liability)`
 
-When `prevalence_by_population` is provided, `liability_logit_scale` is shared and one intercept is solved per observed population, falling back to `binary.prevalence` for populations not listed.
+When `prevalence_by_population` is provided, `liability_logit_scale` is shared and one intercept is solved per non-admixed source population, falling back to `binary.prevalence` for source populations not listed. As an alternative to prevalence targets, advanced configs may provide fixed source-population intercepts directly:
+
+```yaml
+phenotype:
+  binary:
+    alpha_by_population:
+      EUR: -2.0
+      AFR: -0.5
+```
+
+Do not provide `prevalence_by_population` and `alpha_by_population` together; they are alternative source-alpha inputs.
+
+For local-ancestry admixed cohorts, `ADMIX` samples are not assigned an admixed target prevalence by fallback. If a single cohort-level prevalence is used, the shared cohort `alpha` is applied to admixed samples. If source-population alphas differ, admixed samples receive per-sample intercepts from causal-architecture-weighted local ancestry exposure:
+
+- `alpha_i = sum_p w_i,p * alpha_p`
+- `w_i,p` is computed from local ancestry at selected causal haplotypes using squared expected log-odds effects, without using the sample's realized allele carriage
+
+This makes admixed case prevalence an emergent output rather than a forced target. For admix-only cohorts or external source-prevalence priors, provide `alpha_by_population` for the source populations; an explicit `ADMIX` alpha is also accepted when a fixed admixed baseline is intended.
 
 Binary phenotype outputs keep:
 
 - `PHENO` as 0/1 labels (`0=control`, `1=case`)
 - `LIABILITY` as the pre-binary continuous liability
 - `BINARY_PROBABILITY` as the calibrated draw probability
+- `BINARY_ALPHA` as the per-sample intercept used in the Bernoulli draw
 - binary summary columns in `truth/component_summary.tsv` and `run_manifest.tsv`, including case/control counts, realized prevalence, `binary_alpha`, and `binary_alpha_by_population`
 
 For GWAS, REGENIE switches from `--qt` to `--bt` when `trait_type=binary`; PLINK2 adds `--1` so the 0/1 labels are interpreted as control/case status. Round-trip validation compares binary GWAS effects on an approximate log-odds scale by multiplying liability-scale truth by `binary_liability_logit_scale / sqrt(realized_var_liability)` and reports `validation_status=validated_binary_log_odds`. This is a diagnostic for effect direction and gross calibration, not the same exact slope contract as quantitative GWAS.

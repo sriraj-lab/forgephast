@@ -6,9 +6,11 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from forgephast.phenotype.phenotypes.simulate import (
+    _admix_alpha_weights_from_local_ancestry,
     _binary_phenotype_from_liability,
     _calibrate_logistic_intercept,
     _resolve_cohort_component_targets,
@@ -212,21 +214,126 @@ def test_binary_phenotype_from_liability_supports_population_prevalence() -> Non
     sample_populations = ["EUR"] * 100 + ["AFR"] * 100
     rng = np.random.default_rng(17)
 
-    labels, probabilities, summary = _binary_phenotype_from_liability(
+    labels, probabilities, alpha_values, summary = _binary_phenotype_from_liability(
         liability=liability,
         sample_populations=sample_populations,
         prevalence=0.1,
         liability_logit_scale=1.0,
         prevalence_by_population={"AFR": 0.3},
+        alpha_by_population={},
         rng=rng,
     )
 
     assert set(labels.tolist()) <= {0, 1}
     assert probabilities[:100].mean() == pytest.approx(0.1, abs=1e-10)
     assert probabilities[100:].mean() == pytest.approx(0.3, abs=1e-10)
+    assert np.all(np.isfinite(alpha_values))
     assert summary["binary_case_count"] + summary["binary_control_count"] == 200
     assert '"AFR"' in summary["binary_alpha_by_population"]
     assert '"EUR"' in summary["binary_alpha_by_population"]
+    assert summary["binary_alpha_mode"] == "population_specific"
+
+
+def test_binary_phenotype_uses_source_weighted_alpha_for_admix() -> None:
+    rng = np.random.default_rng(23)
+    n_per_group = 2000
+    liability = np.concatenate(
+        [
+            rng.normal(loc=-0.2, scale=1.0, size=n_per_group),
+            rng.normal(loc=0.2, scale=1.0, size=n_per_group),
+            rng.normal(loc=0.0, scale=1.0, size=n_per_group),
+        ]
+    )
+    sample_populations = (
+        ["EUR"] * n_per_group
+        + ["AFR"] * n_per_group
+        + ["ADMIX"] * n_per_group
+    )
+    admix_weights = {
+        row: {"EUR": 0.75, "AFR": 0.25}
+        for row in range(2 * n_per_group, 3 * n_per_group)
+    }
+
+    labels, probabilities, alpha_values, summary = _binary_phenotype_from_liability(
+        liability=liability,
+        sample_populations=sample_populations,
+        prevalence=0.2,
+        liability_logit_scale=1.0,
+        prevalence_by_population={"EUR": 0.1, "AFR": 0.3},
+        alpha_by_population={},
+        admix_alpha_weights_by_row=admix_weights,
+        rng=np.random.default_rng(101),
+    )
+
+    source_alphas = json.loads(summary["binary_alpha_by_population"])
+    expected_admix_alpha = 0.75 * source_alphas["EUR"] + 0.25 * source_alphas["AFR"]
+    assert probabilities[:n_per_group].mean() == pytest.approx(0.1, abs=1e-10)
+    assert probabilities[n_per_group : 2 * n_per_group].mean() == pytest.approx(0.3, abs=1e-10)
+    assert np.allclose(alpha_values[2 * n_per_group :], expected_admix_alpha)
+    admix_mean_probability = probabilities[2 * n_per_group :].mean()
+    admix_realized_prevalence = labels[2 * n_per_group :].mean()
+    assert 0.1 < admix_mean_probability < 0.3
+    assert admix_realized_prevalence == pytest.approx(admix_mean_probability, abs=0.04)
+    assert summary["binary_admix_alpha_mode"] == "causal_architecture_weighted_source_alpha"
+    assert summary["binary_admix_sample_count"] == n_per_group
+
+
+def test_binary_phenotype_supports_explicit_source_alpha_for_admix_only() -> None:
+    liability = np.linspace(-1.0, 1.0, 10)
+    sample_populations = ["ADMIX"] * 10
+    admix_weights = {row: {"EUR": 0.6, "AFR": 0.4} for row in range(10)}
+
+    _, probabilities, alpha_values, summary = _binary_phenotype_from_liability(
+        liability=liability,
+        sample_populations=sample_populations,
+        prevalence=0.2,
+        liability_logit_scale=1.0,
+        prevalence_by_population={},
+        alpha_by_population={"EUR": -2.0, "AFR": -0.5},
+        admix_alpha_weights_by_row=admix_weights,
+        rng=np.random.default_rng(19),
+    )
+
+    expected_alpha = 0.6 * -2.0 + 0.4 * -0.5
+    assert np.allclose(alpha_values, expected_alpha)
+    assert np.all((probabilities > 0.0) & (probabilities < 1.0))
+    assert summary["binary_alpha_by_population"] == '{"AFR": -0.5, "EUR": -2.0}'
+    assert summary["binary_admix_alpha_mode"] == "causal_architecture_weighted_source_alpha"
+
+
+def test_admix_alpha_weights_use_squared_log_odds_architecture_not_alleles() -> None:
+    codes = np.asarray(
+        [
+            [[0, 1], [1, 1]],
+            [[0, 0], [0, 1]],
+        ],
+        dtype=np.int16,
+    )
+    effects_detail = pd.DataFrame(
+        [
+            {"variant_id": "v1", "population": "EUR", "beta": 2.0},
+            {"variant_id": "v1", "population": "AFR", "beta": 1.0},
+            {"variant_id": "v2", "population": "EUR", "beta": 1.0},
+            {"variant_id": "v2", "population": "AFR", "beta": 3.0},
+        ]
+    )
+
+    weights = _admix_alpha_weights_from_local_ancestry(
+        admix_row_indices=[10, 11],
+        admix_local_ancestry_codes=codes,
+        ancestry_order=["EUR", "AFR"],
+        effects_detail=effects_detail,
+        variant_ids=["v1", "v2"],
+        liability=np.asarray([0.0, 1.0, 2.0, 3.0]),
+        liability_logit_scale=1.5,
+    )
+
+    # Sample 10 exposure: EUR gets v1_EUR^2=4; AFR gets v1_AFR^2 + 2*v2_AFR^2 = 19.
+    assert weights[10]["EUR"] == pytest.approx(4.0 / 23.0)
+    assert weights[10]["AFR"] == pytest.approx(19.0 / 23.0)
+    # Sample 11 exposure: EUR gets 2*v1_EUR^2 + v2_EUR^2 = 9; AFR gets v2_AFR^2 = 9.
+    assert weights[11]["EUR"] == pytest.approx(0.5)
+    assert weights[11]["AFR"] == pytest.approx(0.5)
 
 
 def test_multi_population_cohort_uses_jittered_betas_without_rescaling() -> None:
