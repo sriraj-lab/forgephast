@@ -480,3 +480,33 @@ def test_rejects_non_boolean_local_ancestry_use_numba() -> None:
     payload["local_ancestry"] = {"enabled": False, "use_numba": "yes"}
     with pytest.raises(ValueError, match="use_numba"):
         RunConfig.from_dict(payload)
+
+
+def test_local_ancestry_source_zarr_mode_builds() -> None:
+    payload = _base_payload()
+    payload["chromosomes"] = [22]
+    payload["cohorts"][0]["local_ancestry_source_pattern"] = "/tmp/admix.chr{chrom}.local_ancestry.zarr"
+    payload["local_ancestry"] = {
+        "enabled": True,
+        "mode": "source_zarr",
+        "ancestry_order": ["EUR", "AFR"],
+    }
+
+    cfg = RunConfig.from_dict(payload)
+
+    assert cfg.local_ancestry.mode == "source_zarr"
+    assert cfg.cohorts[0].local_ancestry_source_pattern == "/tmp/admix.chr{chrom}.local_ancestry.zarr"
+
+
+def test_local_ancestry_source_zarr_requires_source_pattern() -> None:
+    payload = _base_payload()
+    payload["chromosomes"] = [22]
+    payload["cohorts"][0]["local_ancestry_tracts_pattern"] = "/tmp/admix.chr{chrom}.tracts.tsv.gz"
+    payload["local_ancestry"] = {
+        "enabled": True,
+        "mode": "source_zarr",
+        "ancestry_order": ["EUR", "AFR"],
+    }
+
+    with pytest.raises(ValueError, match="local_ancestry_source_pattern"):
+        RunConfig.from_dict(payload)

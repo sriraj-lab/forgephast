@@ -53,6 +53,7 @@ def _write_msprime_config(tmp_path, *, name: str, admixed: bool, n_shards: int) 
                 ],
                 "admixture_time_generations": 8.0,
                 "write_full_tract_tsv": True,
+                "write_ancestry_source_zarr": True,
             },
         }
     else:
@@ -65,6 +66,7 @@ def _write_msprime_config(tmp_path, *, name: str, admixed: bool, n_shards: int) 
                 "sources": [{"population": "P1", "weight": 1.0}],
                 "admixture_time_generations": None,
                 "write_full_tract_tsv": True,
+                "write_ancestry_source_zarr": True,
             },
         }
 
@@ -105,6 +107,8 @@ def test_msprime_deterministic_output_fixed_seed(tmp_path):
     assert pop_a.tract_summary_path.exists() and pop_b.tract_summary_path.exists()
     assert pop_a.individual_ancestry_path is not None and pop_b.individual_ancestry_path is not None
     assert pop_a.individual_ancestry_path.exists() and pop_b.individual_ancestry_path.exists()
+    assert pop_a.ancestry_source_path is not None and pop_b.ancestry_source_path is not None
+    assert pop_a.ancestry_source_path.exists() and pop_b.ancestry_source_path.exists()
 
     with open(pop_a.tract_summary_path, "r", encoding="utf-8") as handle:
         summary_a = json.load(handle)

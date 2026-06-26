@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from hapstore.ids import align_by_ids, read_sample_ids
 
+from ...local_ancestry import LocalAncestrySource
 from ..architectures.base import ArchitectureInput, create_plugin
 from ..causal.hybrid_sampler import sample_membership_for_replicate
 from ..causal.selection import build_bucketed_pool
@@ -844,6 +845,7 @@ def run_simulation(
     if runtime_cache is None:
         kinship_cache: Dict[str, np.ndarray] = {}
         tracts_cache: Dict[tuple[str, int, str], dict] = {}
+        ancestry_source_cache: Dict[tuple[str, int, str], LocalAncestrySource] = {}
         sample_ids_cache: Dict[str, List[str]] = {}
         sample_pops_cache: Dict[str, List[str]] = {}
         genotype_cache: dict[str, dict[str, Any]] = {}
@@ -852,6 +854,7 @@ def run_simulation(
     else:
         kinship_cache = runtime_cache.setdefault("simulate_kinship_cache", {})
         tracts_cache = runtime_cache.setdefault("simulate_tracts_cache", {})
+        ancestry_source_cache = runtime_cache.setdefault("simulate_ancestry_source_cache", {})
         sample_ids_cache = runtime_cache.setdefault("simulate_sample_ids_cache", {})
         sample_pops_cache = runtime_cache.setdefault("simulate_sample_pops_cache", {})
         genotype_cache = runtime_cache.setdefault("simulate_genotype_cache", {})
@@ -940,7 +943,11 @@ def run_simulation(
                 )
                 sample_pops_cache[cohort.name] = sample_populations
 
-            la_enabled = bool(run_cfg.local_ancestry.enabled and cohort.local_ancestry_tracts_pattern)
+            if str(run_cfg.local_ancestry.mode) == "source_zarr":
+                local_ancestry_pattern = cohort.local_ancestry_source_pattern
+            else:
+                local_ancestry_pattern = cohort.local_ancestry_tracts_pattern
+            la_enabled = bool(run_cfg.local_ancestry.enabled and local_ancestry_pattern)
 
             # Grid groups may set a per-group HapStore I/O thread budget to balance
             # parallel groups within one SLURM allocation.
@@ -951,7 +958,10 @@ def run_simulation(
                     pass
 
             cohort_tmp = run_dir / "tmp" / "dosages" / f"rep{replicate}" / cohort.name
-            genotype_cache_key = f"{replicate}|{cohort.name}|{la_enabled}|{'|'.join(variant_ids)}"
+            genotype_cache_key = (
+                f"{replicate}|{cohort.name}|{run_cfg.local_ancestry.mode}|{la_enabled}|"
+                f"{'|'.join(variant_ids)}"
+            )
             if genotype_cache_key in genotype_cache:
                 _bump("simulate_genotype", True)
                 cached = genotype_cache[genotype_cache_key]
@@ -1040,54 +1050,88 @@ def run_simulation(
                             dtype=np.int8,
                         )
 
-                        pattern = str(cohort.local_ancestry_tracts_pattern)
+                        pattern = str(local_ancestry_pattern)
                         for chrom in run_cfg.chromosomes:
                             idx_for_chrom = variant_indices_by_chrom[int(chrom)]
                             if int(idx_for_chrom.shape[0]) == 0:
                                 continue
                             positions_bp = variant_pos_bp[idx_for_chrom]
 
-                            tracts_path = (
+                            ancestry_path = (
                                 pattern.format(chrom=int(chrom)) if "{chrom}" in pattern else pattern
                             )
-                            cache_key = (cohort.name, int(chrom), tracts_path)
-                            if cache_key in tracts_cache:
-                                tracts_by_sample_hap = tracts_cache[cache_key]
-                            else:
-                                t_load = time.perf_counter()
-                                tracts_by_sample_hap = load_tracts_tsv_gz(
-                                    tracts_path,
+                            if str(run_cfg.local_ancestry.mode) == "source_zarr":
+                                cache_key = (cohort.name, int(chrom), ancestry_path)
+                                if cache_key in ancestry_source_cache:
+                                    ancestry_source = ancestry_source_cache[cache_key]
+                                else:
+                                    t_load = time.perf_counter()
+                                    ancestry_source = LocalAncestrySource.open(ancestry_path)
+                                    ancestry_source_cache[cache_key] = ancestry_source
+                                    _timed(
+                                        "simulate.load_ancestry_source",
+                                        t_load,
+                                        replicate=int(replicate),
+                                        cohort=str(cohort.name),
+                                        chrom=int(chrom),
+                                        n_admix_samples=int(len(truth_admix_sample_ids)),
+                                    )
+
+                                t_rast = time.perf_counter()
+                                codes_subset = ancestry_source.rasterize(
                                     sample_ids=truth_admix_sample_ids,
-                                    label_map=dict(run_cfg.local_ancestry.label_map),
+                                    positions_bp=positions_bp,
+                                    ancestry_to_index=ancestry_to_index,
+                                    chunk_n_samples=int(run_cfg.local_ancestry.chunk_n_samples),
                                 )
-                                tracts_cache[cache_key] = tracts_by_sample_hap
                                 _timed(
-                                    "simulate.load_tracts",
-                                    t_load,
+                                    "simulate.rasterize_ancestry_source",
+                                    t_rast,
                                     replicate=int(replicate),
                                     cohort=str(cohort.name),
                                     chrom=int(chrom),
                                     n_admix_samples=int(len(truth_admix_sample_ids)),
+                                    n_variants=int(len(positions_bp)),
                                 )
+                            else:
+                                cache_key = (cohort.name, int(chrom), ancestry_path)
+                                if cache_key in tracts_cache:
+                                    tracts_by_sample_hap = tracts_cache[cache_key]
+                                else:
+                                    t_load = time.perf_counter()
+                                    tracts_by_sample_hap = load_tracts_tsv_gz(
+                                        ancestry_path,
+                                        sample_ids=truth_admix_sample_ids,
+                                        label_map=dict(run_cfg.local_ancestry.label_map),
+                                    )
+                                    tracts_cache[cache_key] = tracts_by_sample_hap
+                                    _timed(
+                                        "simulate.load_tracts",
+                                        t_load,
+                                        replicate=int(replicate),
+                                        cohort=str(cohort.name),
+                                        chrom=int(chrom),
+                                        n_admix_samples=int(len(truth_admix_sample_ids)),
+                                    )
 
-                            t_rast = time.perf_counter()
-                            codes_subset = rasterize_tracts_to_variant_ancestry(
-                                sample_ids=truth_admix_sample_ids,
-                                tracts_by_sample_hap=tracts_by_sample_hap,
-                                variant_positions_bp=positions_bp,
-                                ancestry_to_index=ancestry_to_index,
-                                chunk_n_samples=int(run_cfg.local_ancestry.chunk_n_samples),
-                                use_numba=bool(run_cfg.local_ancestry.use_numba),
-                            )
-                            _timed(
-                                "simulate.rasterize_tracts",
-                                t_rast,
-                                replicate=int(replicate),
-                                cohort=str(cohort.name),
-                                chrom=int(chrom),
-                                n_admix_samples=int(len(truth_admix_sample_ids)),
-                                n_variants=int(len(positions_bp)),
-                            )
+                                t_rast = time.perf_counter()
+                                codes_subset = rasterize_tracts_to_variant_ancestry(
+                                    sample_ids=truth_admix_sample_ids,
+                                    tracts_by_sample_hap=tracts_by_sample_hap,
+                                    variant_positions_bp=positions_bp,
+                                    ancestry_to_index=ancestry_to_index,
+                                    chunk_n_samples=int(run_cfg.local_ancestry.chunk_n_samples),
+                                    use_numba=bool(run_cfg.local_ancestry.use_numba),
+                                )
+                                _timed(
+                                    "simulate.rasterize_tracts",
+                                    t_rast,
+                                    replicate=int(replicate),
+                                    cohort=str(cohort.name),
+                                    chrom=int(chrom),
+                                    n_admix_samples=int(len(truth_admix_sample_ids)),
+                                    n_variants=int(len(positions_bp)),
+                                )
                             admix_local_ancestry_codes[:, idx_for_chrom, :] = codes_subset.astype(
                                 np.int8, copy=False
                             )

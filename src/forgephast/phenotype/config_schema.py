@@ -158,6 +158,7 @@ class CohortConfig:
     genotype_prefix_override: Optional[str] = None
     population_map_file: Optional[str] = None
     local_ancestry_tracts_pattern: Optional[str] = None
+    local_ancestry_source_pattern: Optional[str] = None
 
     def validate(self) -> None:
         _check_non_empty(self.name, "cohort.name")
@@ -165,6 +166,10 @@ class CohortConfig:
         if self.local_ancestry_tracts_pattern is not None and not str(self.local_ancestry_tracts_pattern):
             raise ValueError(
                 f"cohort {self.name}: local_ancestry_tracts_pattern cannot be empty when provided"
+            )
+        if self.local_ancestry_source_pattern is not None and not str(self.local_ancestry_source_pattern):
+            raise ValueError(
+                f"cohort {self.name}: local_ancestry_source_pattern cannot be empty when provided"
             )
 
 
@@ -593,7 +598,7 @@ class LocalAncestryConfig:
             raise ValueError("local_ancestry.use_numba must be a boolean")
         if not self.enabled:
             return
-        _check_one_of(self.mode, {"tracts_tsv"}, "local_ancestry.mode")
+        _check_one_of(self.mode, {"tracts_tsv", "source_zarr"}, "local_ancestry.mode")
         if not self.ancestry_order:
             raise ValueError("local_ancestry.ancestry_order cannot be empty when enabled")
         if len(set(self.ancestry_order)) != len(self.ancestry_order):

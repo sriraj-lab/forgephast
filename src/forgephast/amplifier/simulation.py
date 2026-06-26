@@ -16,6 +16,7 @@ from hapstore import ingest_arrays as _hapstore_ingest_arrays
 import numpy as np
 import pandas as pd
 
+from ..local_ancestry import write_local_ancestry_source_from_tract_rows
 from .config import RunConfig
 from .donors import load_manifest
 from .donor_panels import load_donor_haplotypes_from_source, subset_panel_donors
@@ -275,6 +276,7 @@ class PopulationSimulationArtifacts:
     engine: str = "mosaic"
     tract_summary_path: Path | None = None
     tracts_tsv_path: Path | None = None
+    ancestry_source_path: Path | None = None
     individual_ancestry_path: Path | None = None
 
 
@@ -358,6 +360,7 @@ class _PopulationWorkItem:
     msprime_admixture_time_generations: float | None = None
     msprime_end_time_generations: float = 10.0
     msprime_write_full_tract_tsv: bool = False
+    msprime_write_ancestry_source_zarr: bool = False
 
 
 _TASK_PANEL_BY_POP: dict[str, Any] = {}
@@ -708,6 +711,7 @@ def _simulate_chromosome_shard(
         msprime_admixture_time_generations: float | None = None
         msprime_end_time_generations = 10.0
         msprime_write_full_tract_tsv = False
+        msprime_write_ancestry_source_zarr = False
         if pop.engine == "msprime_tracts":
             assert pop.msprime is not None
             msprime_source_populations = [str(source.population) for source in pop.msprime.sources]
@@ -719,6 +723,7 @@ def _simulate_chromosome_shard(
             )
             msprime_end_time_generations = float(pop.msprime.end_time_generations)
             msprime_write_full_tract_tsv = bool(pop.msprime.write_full_tract_tsv)
+            msprime_write_ancestry_source_zarr = bool(pop.msprime.write_ancestry_source_zarr)
             if msprime_source_populations:
                 first_source = msprime_source_populations[0]
                 panel_source_kind, panel_source_path = config.resolve_donor_panel_source(
@@ -748,6 +753,7 @@ def _simulate_chromosome_shard(
                 msprime_admixture_time_generations=msprime_admixture_time_generations,
                 msprime_end_time_generations=msprime_end_time_generations,
                 msprime_write_full_tract_tsv=msprime_write_full_tract_tsv,
+                msprime_write_ancestry_source_zarr=msprime_write_ancestry_source_zarr,
             )
         )
         if pop_n > 0:
@@ -842,6 +848,7 @@ def _simulate_chromosome_shard(
         variants = None
         tract_summary_path: Path | None = None
         tracts_tsv_path: Path | None = None
+        ancestry_source_path: Path | None = None
         individual_ancestry_path: Path | None = None
         if item.engine == "msprime_tracts":
             t_source = perf_counter()
@@ -970,6 +977,22 @@ def _simulate_chromosome_shard(
                     tracts_tsv_path,
                     sep="\t",
                     index=False,
+                )
+            if item.msprime_write_ancestry_source_zarr:
+                ancestry_source_path = chrom_dir / f"{item.pop_name}.chr{chrom}.local_ancestry.zarr"
+                write_local_ancestry_source_from_tract_rows(
+                    ancestry_source_path,
+                    sample_ids=item.sample_ids,
+                    tract_rows=msprime_result.tract_rows,
+                    ancestry_order=source_order,
+                    chrom=int(chrom),
+                    metadata={
+                        "population": str(item.pop_name),
+                        "shard_id": int(item.shard_id),
+                        "n_shards": int(item.n_shards),
+                        "n_diploids": int(item.pop_n),
+                        "engine": "msprime_tracts",
+                    },
                 )
             elapsed_diag = perf_counter() - t_diag
             pop_stage["write_msprime_tract_diagnostics_sec"] = elapsed_diag
@@ -1113,6 +1136,7 @@ def _simulate_chromosome_shard(
                 engine=str(item.engine),
                 tract_summary_path=tract_summary_path,
                 tracts_tsv_path=tracts_tsv_path,
+                ancestry_source_path=ancestry_source_path,
                 individual_ancestry_path=individual_ancestry_path,
             )
         )
@@ -1147,6 +1171,9 @@ def _simulate_chromosome_shard(
                     "hapstore": str(pop_hapstore) if pop_hapstore is not None else None,
                     "pgen_prefix": str(pop_pgen_prefix) if pop_pgen_prefix is not None else None,
                     "tract_summary": str(tract_summary_path) if tract_summary_path is not None else None,
+                    "ancestry_source": (
+                        str(ancestry_source_path) if ancestry_source_path is not None else None
+                    ),
                     "individual_ancestry": (
                         str(individual_ancestry_path) if individual_ancestry_path is not None else None
                     ),

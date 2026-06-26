@@ -99,10 +99,15 @@ class MsprimePopulationConfig:
     admixture_time_generations: float | None = None
     end_time_generations: float = 10.0
     write_full_tract_tsv: bool = False
+    write_ancestry_source_zarr: bool = False
 
     def validate(self, *, population_name: str) -> None:
         if not self.sources:
             raise ValueError(f"population {population_name}: msprime.sources cannot be empty")
+        if not isinstance(self.write_full_tract_tsv, bool):
+            raise ValueError(f"population {population_name}: msprime.write_full_tract_tsv must be a boolean")
+        if not isinstance(self.write_ancestry_source_zarr, bool):
+            raise ValueError(f"population {population_name}: msprime.write_ancestry_source_zarr must be a boolean")
         for source in self.sources:
             source.validate()
         total_weight = float(sum(float(source.weight) for source in self.sources))

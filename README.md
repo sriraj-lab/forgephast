@@ -279,6 +279,37 @@ For local-ancestry admixed cohorts, `ADMIX` samples are not assigned an admixed 
 
 This makes admixed case prevalence an emergent output rather than a forced target. For admix-only cohorts or external source-prevalence priors, provide `alpha_by_population` for the source populations; an explicit `ADMIX` alpha is also accepted when a fixed admixed baseline is intended.
 
+Local ancestry truth can be supplied either as the legacy compressed tract TSV or as a stable Zarr source object. The Zarr source object is a run-length encoded per-haplotype store with schema attrs and typed compressed arrays, not a pickled Python object.
+
+Amplifier `msprime_tracts` populations can emit this source object:
+
+```yaml
+populations:
+  - name: ADMIX
+    engine: msprime_tracts
+    msprime:
+      sources:
+        - {population: EUR, weight: 0.6}
+        - {population: AFR, weight: 0.4}
+      admixture_time_generations: 8.0
+      write_ancestry_source_zarr: true
+```
+
+Phenotype configs can then consume it:
+
+```yaml
+cohorts:
+  - name: train
+    local_ancestry_source_pattern: /path/to/ADMIX.chr{chrom}.local_ancestry.zarr
+
+local_ancestry:
+  enabled: true
+  mode: source_zarr
+  ancestry_order: [EUR, AFR]
+```
+
+Use `mode: tracts_tsv` with `cohort.local_ancestry_tracts_pattern` for the legacy TSV path.
+
 Binary phenotype outputs keep:
 
 - `PHENO` as 0/1 labels (`0=control`, `1=case`)

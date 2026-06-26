@@ -523,6 +523,33 @@ def test_config_rejects_msprime_weights_not_summing_to_one(tmp_path):
         _ = from_yaml(cfg_path)
 
 
+def test_config_accepts_msprime_ancestry_source_zarr_flag(tmp_path):
+    cfg_path = write_test_config(tmp_path, name="msprime_source_zarr")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["populations"][2] = {
+        "name": "P3",
+        "engine": "msprime_tracts",
+        "selector": None,
+        "n_diploids": 4,
+        "msprime": {
+            "sources": [
+                {"population": "P1", "weight": 0.6},
+                {"population": "P2", "weight": 0.4},
+            ],
+            "admixture_time_generations": 8.0,
+            "write_ancestry_source_zarr": True,
+        },
+    }
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    cfg = from_yaml(cfg_path)
+
+    assert cfg.populations[2].msprime is not None
+    assert cfg.populations[2].msprime.write_ancestry_source_zarr is True
+
+
 def test_config_rejects_msprime_source_population_not_defined(tmp_path):
     cfg_path = write_test_config(tmp_path, name="msprime_unknown_source")
     with open(cfg_path, "r", encoding="utf-8") as handle:

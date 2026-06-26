@@ -110,16 +110,24 @@ class RunConfig:
                 raise ValueError(
                     f"local_ancestry.ancestry_order labels must exist in effect_model.population_order; missing={missing}"
                 )
-            la_cohorts = [c for c in self.cohorts if c.local_ancestry_tracts_pattern]
+            if self.local_ancestry.mode == "tracts_tsv":
+                la_cohorts = [c for c in self.cohorts if c.local_ancestry_tracts_pattern]
+                pattern_name = "local_ancestry_tracts_pattern"
+            elif self.local_ancestry.mode == "source_zarr":
+                la_cohorts = [c for c in self.cohorts if c.local_ancestry_source_pattern]
+                pattern_name = "local_ancestry_source_pattern"
+            else:  # guarded by LocalAncestryConfig.validate
+                raise ValueError(f"Unsupported local_ancestry.mode={self.local_ancestry.mode!r}")
             if not la_cohorts:
                 raise ValueError(
-                    "local_ancestry.enabled=true requires at least one cohort.local_ancestry_tracts_pattern"
+                    f"local_ancestry.enabled=true with mode={self.local_ancestry.mode!r} "
+                    f"requires at least one cohort.{pattern_name}"
                 )
             for cohort in la_cohorts:
-                pattern = str(cohort.local_ancestry_tracts_pattern)
+                pattern = str(getattr(cohort, pattern_name))
                 if len(self.chromosomes) > 1 and "{chrom}" not in pattern:
                     raise ValueError(
-                        f"cohort {cohort.name}: local_ancestry_tracts_pattern must include {{chrom}} when multiple chromosomes are configured"
+                        f"cohort {cohort.name}: {pattern_name} must include {{chrom}} when multiple chromosomes are configured"
                     )
 
         if not self.chromosomes:
