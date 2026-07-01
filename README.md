@@ -320,6 +320,65 @@ Binary phenotype outputs keep:
 
 For GWAS, REGENIE switches from `--qt` to `--bt` when `trait_type=binary`; PLINK2 adds `--1` so the 0/1 labels are interpreted as control/case status. Round-trip validation compares binary GWAS effects on an approximate log-odds scale by multiplying liability-scale truth by `binary_liability_logit_scale / sqrt(realized_var_liability)` and reports `validation_status=validated_binary_log_odds`. This is a diagnostic for effect direction and gross calibration, not the same exact slope contract as quantitative GWAS.
 
+### HapStore-native source-pair tables
+
+`forgephast phenotype build-source-pairs` builds the causal/source-pair candidate table consumed by `causal_selection.source_pairs_file` directly from HapStore genotype blocks. It computes pooled and group-specific MAF columns from additive genotypes, applies a pooled MAF floor, and writes a TSV with variant ID, chromosome, position, source variant ID, `maf_pooled`, and configured group MAF columns.
+
+```bash
+forgephast phenotype build-source-pairs --config source_pairs.yaml
+```
+
+Minimal config:
+
+```yaml
+hapstore:
+  layout: per_chr              # per_chr | single_store | per_pop_per_chr
+  root_dir: /path/to/hapstores
+  file_pattern: chr{chrom}.hapstore.zarr
+  missing_sentinel: 255
+
+samples:
+  file: train_samples.tsv
+  id_column: IID
+  group_column: population
+
+chromosomes: [1, 2, 3]
+
+groups:
+  - name: EUR
+    column: population
+    value: EUR
+    maf_column: maf_eur
+  - name: AFR
+    column: population
+    value: AFR
+    maf_column: maf_afr
+
+source_pairs:
+  pooled_maf_min: 0.0005
+  variant_block_size: 1024
+  variant_id_column: variant_id
+  pooled_maf_column: maf_pooled
+
+output:
+  source_pairs_file: inputs/source_pairs.tsv
+  qc_file: inputs/source_pairs_qc.tsv
+```
+
+If `groups` is omitted, groups are derived from unique values in `samples.group_column` and written as `maf_<group>`. Subgroup columns can be expressed with filters:
+
+```yaml
+groups:
+  - name: AFR_GULF
+    column: source_population
+    value: AFR_GULF
+    filters:
+      population: AFR
+    maf_column: maf_afr_gulf
+```
+
+For `hapstore.layout: per_pop_per_chr`, set `samples.store_population_column` if it differs from `samples.group_column`; the file pattern must include both `{population}` and `{chrom}`. The first native mode is intentionally limited to candidate-table generation and does not construct LD proxy/tag pairs.
+
 ### Migration note: `beta_scale` column
 
 The `beta_scale` column emitted on `truth/effect_sizes.tsv` was produced by the

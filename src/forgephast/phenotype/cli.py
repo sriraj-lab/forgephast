@@ -37,6 +37,7 @@ from .grid import (
     load_grid_spec,
     write_grid_manifest,
 )
+from .causal.source_pairs import SourcePairBuildConfig, write_source_pairs_from_hapstore
 from .gwas import GwasTask
 from .gwas.base import prepare_manifest_covariates_for_gwas
 from .gwas.registry import available_engine_names, build_engines
@@ -826,6 +827,27 @@ def _parse_args() -> argparse.Namespace:
         help="Optional GWAS engine filter (only for stage=full grids)",
     )
 
+    source_pairs = sub.add_parser(
+        "build-source-pairs",
+        help="Build causal/source-pair table from HapStore genotype blocks",
+    )
+    source_pairs.add_argument("--config", required=True, help="Path to source-pair build YAML")
+    source_pairs.add_argument(
+        "--output",
+        default=None,
+        help="Optional source-pairs TSV output override",
+    )
+    source_pairs.add_argument(
+        "--qc-output",
+        default=None,
+        help="Optional source-pairs QC TSV output override",
+    )
+    source_pairs.add_argument(
+        "--log",
+        default=None,
+        help="Optional log file override",
+    )
+
     rt_plots = sub.add_parser("roundtrip-plots", help="Render round-trip plots from existing GWAS outputs")
     rt_plots.add_argument("--config", required=True, help="Path to run config YAML")
     rt_plots.add_argument(
@@ -873,6 +895,26 @@ def main() -> None:
         setup_logging(log_file)
         out = _run_grid(args.grid, engines_filter=args.engine)
         logger.info("GRID_COMPLETED manifest=%s", out)
+        return
+
+    if args.command == "build-source-pairs":
+        source_cfg = SourcePairBuildConfig.from_yaml(args.config)
+        if args.output:
+            source_cfg.output.source_pairs_file = str(args.output)
+        if args.qc_output:
+            source_cfg.output.qc_file = str(args.qc_output)
+        log_file = Path(args.log or source_cfg.output.log_file) if (args.log or source_cfg.output.log_file) else None
+        setup_logging(log_file)
+        logger.info("pipeline command=%s", args.command)
+        logger.info("config=%s", args.config)
+        result = write_source_pairs_from_hapstore(source_cfg)
+        logger.info(
+            "SOURCE_PAIRS_COMPLETED source_pairs=%s qc=%s n_variants_total=%d n_variants_written=%d",
+            result.source_pairs_file,
+            result.qc_file or "",
+            int(result.n_variants_total),
+            int(result.n_variants_written),
+        )
         return
 
     config = _load_config(args.config)
