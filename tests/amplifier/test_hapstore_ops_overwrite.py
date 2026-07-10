@@ -78,6 +78,7 @@ def test_merge_streaming_uses_concat_with_n_workers(monkeypatch):
 
     assert out == "concat"
     assert calls["axis"] == "samples"
+    assert calls["validate"] == "full"
     assert calls["n_workers"] == 8
     assert calls["overwrite"] is True
 

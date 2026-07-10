@@ -65,48 +65,21 @@ def _merge_chromosomes_sample_axis_flat(
     if output_mode != "w":
         raise ValueError("output_mode='w' is required; legacy append-mode HapStore merge was removed")
 
-    out_path = Path(output_store)
-    if out_path.exists():
-        shutil.rmtree(out_path, ignore_errors=True)
-
-    try:
-        return _pkg_concat_hapstores(
-            input_stores=input_stores,
-            output_store=output_store,
-            chrom=chrom,
-            axis="samples",
-            validate="spot",
-            n_workers=int(n_workers),
-            compression_level=compression_level,
-            chunk_variant_size=chunk_variant_size,
-            chunk_haplotype_size=chunk_haplotype_size,
-            chunk_sample_size=chunk_sample_size,
-            store_genotypes=store_genotypes,
-            attrs=attrs,
-            overwrite=True,
-        )
-    except AssertionError as exc:
-        if "spot validation failed" not in str(exc).lower() or int(n_workers) <= 1:
-            raise
-        logger.warning(
-            "Parallel HapStore concat failed spot validation; retrying serial concat with n_workers=1. error=%s",
-            exc,
-        )
-        return _pkg_concat_hapstores(
-            input_stores=input_stores,
-            output_store=output_store,
-            chrom=chrom,
-            axis="samples",
-            validate="spot",
-            n_workers=1,
-            compression_level=compression_level,
-            chunk_variant_size=chunk_variant_size,
-            chunk_haplotype_size=chunk_haplotype_size,
-            chunk_sample_size=chunk_sample_size,
-            store_genotypes=store_genotypes,
-            attrs=attrs,
-            overwrite=True,
-        )
+    return _pkg_concat_hapstores(
+        input_stores=input_stores,
+        output_store=output_store,
+        chrom=chrom,
+        axis="samples",
+        validate="full",
+        n_workers=int(n_workers),
+        compression_level=compression_level,
+        chunk_variant_size=chunk_variant_size,
+        chunk_haplotype_size=chunk_haplotype_size,
+        chunk_sample_size=chunk_sample_size,
+        store_genotypes=store_genotypes,
+        attrs=attrs,
+        overwrite=True,
+    )
 
 
 def merge_chromosomes_sample_axis(

@@ -951,14 +951,13 @@ class HapStoreAdapter:
                 merged_store_path = (
                     out_prefix.parent / f"{out_prefix.name}.merged_input.chr{chrom}.hapstore.zarr"
                 )
-                if merged_store_path.exists():
-                    shutil.rmtree(merged_store_path, ignore_errors=True)
                 concat_overrides = _concat_layout_overrides(input_stores, chrom)
                 concat_hapstores(
                     input_stores=input_stores,
                     output_store=merged_store_path,
                     chrom=chrom,
                     axis="samples",
+                    validate="full",
                     n_workers=max(1, concat_workers),
                     overwrite=True,
                     store_genotypes=False,
