@@ -207,8 +207,10 @@ def load_causal_pool(
 
     variant_col = config.variant_id_column
     if df[variant_col].duplicated().any():
-        logger.warning("Duplicate variant IDs in pool; keeping first occurrence")
-        df = df.drop_duplicates(subset=[variant_col], keep="first").copy()
+        duplicates = df.loc[df[variant_col].duplicated(keep=False), variant_col].astype(str).head(5).tolist()
+        raise ValueError(
+            f"causal pool contains duplicate variant IDs; first duplicates={duplicates}"
+        )
 
     # Tightness filter runs on the broadest pool, before bucket assignment,
     # so tier changes can be compared on equal footing for reporting.

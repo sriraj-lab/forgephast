@@ -150,12 +150,19 @@ class PopulationSpec:
     selector_weights: dict[str, float] | None = None
     engine: str = "mosaic"
     msprime: MsprimePopulationConfig | None = None
+    donor_only: bool = False
 
     def validate(self) -> None:
         if not self.name:
             raise ValueError("population name cannot be empty")
-        if self.n_diploids <= 0:
-            raise ValueError(f"population {self.name}: n_diploids must be > 0")
+        if not isinstance(self.donor_only, bool):
+            raise ValueError(f"population {self.name}: donor_only must be a boolean")
+        if self.donor_only and self.engine != "mosaic":
+            raise ValueError(f"population {self.name}: donor_only requires engine='mosaic'")
+        if self.n_diploids < 0 or (self.n_diploids == 0 and not self.donor_only):
+            raise ValueError(
+                f"population {self.name}: n_diploids must be > 0 unless donor_only=true"
+            )
         if self.engine not in {"mosaic", "msprime_tracts"}:
             raise ValueError(
                 f"population {self.name}: engine must be one of {{'mosaic', 'msprime_tracts'}}"
@@ -200,6 +207,7 @@ class SimulationConfig:
     mean_tract_cm: float = 1.0
     threads_per_task: int = 1
     donor_io_workers: int = 1
+    haplotype_batch_size: int = 128
 
     # Unified simulate settings for shard-pool execution.
     n_shards: int | None = None
@@ -217,6 +225,8 @@ class SimulationConfig:
             raise ValueError("simulation.threads_per_task must be > 0")
         if self.donor_io_workers <= 0:
             raise ValueError("simulation.donor_io_workers must be > 0")
+        if self.haplotype_batch_size <= 0:
+            raise ValueError("simulation.haplotype_batch_size must be > 0")
         if self.n_shards is not None and self.n_shards <= 0:
             raise ValueError("simulation.n_shards must be > 0 when provided")
         if self.task_workers is not None and self.task_workers <= 0:
@@ -229,6 +239,8 @@ class SimulationConfig:
 @dataclass
 class OutputConfig:
     root: str
+    scratch_first: bool = True
+    scratch_root: str | None = None
     write_phased_vcf: bool = False
     write_pgen: bool = True
     write_hapstore: bool = True
@@ -250,6 +262,10 @@ class OutputConfig:
 
     def validate(self) -> None:
         _check_non_empty(self.root, "outputs.root")
+        if not isinstance(self.scratch_first, bool):
+            raise ValueError("outputs.scratch_first must be a boolean")
+        if self.scratch_root is not None and not str(self.scratch_root).strip():
+            raise ValueError("outputs.scratch_root cannot be empty when provided")
         if not self.write_hapstore:
             raise ValueError("outputs.write_hapstore must be true; amplifier outputs are HapStore-native")
         _check_positive(self.hapstore_chunk_variant_size, "outputs.hapstore_chunk_variant_size")
@@ -607,6 +623,20 @@ def _construct_dataclass(section: str, cls: type[Any], kwargs: dict[str, Any]) -
 
 
 def from_dict(data: dict[str, Any]) -> RunConfig:
+    allowed_top_level = {
+        "name",
+        "input",
+        "populations",
+        "simulation",
+        "outputs",
+        "qc",
+        "calibration",
+        "benchmark",
+    }
+    unknown_top_level = sorted(set(data).difference(allowed_top_level))
+    if unknown_top_level:
+        raise ValueError(f"Unknown top-level config key(s): {unknown_top_level}")
+
     removed_sections = [x for x in ("calibration", "benchmark") if x in data]
     if removed_sections:
         joined = ", ".join(removed_sections)

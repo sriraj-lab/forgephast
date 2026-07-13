@@ -850,7 +850,7 @@ def run_simulation(
         sample_pops_cache: Dict[str, List[str]] = {}
         genotype_cache: dict[str, dict[str, Any]] = {}
         effect_geometry_cache: Dict[str, Dict[str, object]] = {}
-        max_cache_bytes: int | None = None
+        max_cache_bytes: int | None = 0
     else:
         kinship_cache = runtime_cache.setdefault("simulate_kinship_cache", {})
         tracts_cache = runtime_cache.setdefault("simulate_tracts_cache", {})
@@ -952,10 +952,7 @@ def run_simulation(
             # Grid groups may set a per-group HapStore I/O thread budget to balance
             # parallel groups within one SLURM allocation.
             if runtime_cache is not None and hasattr(adapter, "set_io_threads"):
-                try:
-                    adapter.set_io_threads(int(runtime_cache.get("hapstore_io_threads", 1)))
-                except Exception:
-                    pass
+                adapter.set_io_threads(int(runtime_cache.get("hapstore_io_threads", 1)))
 
             cohort_tmp = run_dir / "tmp" / "dosages" / f"rep{replicate}" / cohort.name
             genotype_cache_key = (
@@ -976,6 +973,7 @@ def run_simulation(
                 donor_fallback_sample_pops = cached.get("donor_fallback_sample_pops")
                 la_genotypes_by_population = cached.get("la_genotypes_by_population", {})
                 dosage_effect_allele = dict(cached["dosage_effect_allele"])
+                dosage_other_allele = dict(cached["dosage_other_allele"])
             else:
                 _bump("simulate_genotype", False)
                 sample_frame = _sample_frame(sample_ids)
@@ -1145,24 +1143,39 @@ def run_simulation(
                             )
                 else:
                     t_export = time.perf_counter()
-                    dosage_df = adapter.export_dosages(
-                        sample_ids=sample_ids,
-                        sample_populations=sample_populations,
-                        variant_ids=variant_ids,
-                        out_dir=cohort_tmp,
-                        chromosomes=run_cfg.chromosomes,
-                    )
+                    if hasattr(adapter, "export_genotypes_u8"):
+                        genotype_matrix = adapter.export_genotypes_u8(
+                            sample_ids=sample_ids,
+                            sample_populations=sample_populations,
+                            variant_ids=variant_ids,
+                            out_dir=cohort_tmp,
+                            chromosomes=run_cfg.chromosomes,
+                        )
+                        sample_frame = _sample_frame(sample_ids)
+                        export_stage = "simulate.export_genotypes_u8"
+                    else:
+                        dosage_df = adapter.export_dosages(
+                            sample_ids=sample_ids,
+                            sample_populations=sample_populations,
+                            variant_ids=variant_ids,
+                            out_dir=cohort_tmp,
+                            chromosomes=run_cfg.chromosomes,
+                        )
+                        sample_frame = dosage_df[["FID", "IID"]].copy()
+                        genotype_matrix = dosage_df[variant_ids].to_numpy(
+                            dtype=np.float32, copy=False
+                        )
+                        export_stage = "simulate.export_dosages"
                     _timed(
-                        "simulate.export_dosages",
+                        export_stage,
                         t_export,
                         replicate=int(replicate),
                         cohort=str(cohort.name),
                         n_samples=int(len(sample_ids)),
                         n_variants=int(len(variant_ids)),
                     )
-                    sample_frame = dosage_df[["FID", "IID"]].copy()
-                    genotype_matrix = dosage_df[variant_ids].to_numpy(dtype=np.float32, copy=False)
                 dosage_effect_allele = dict(adapter.last_export_allele_by_variant)
+                dosage_other_allele = dict(adapter.last_export_other_allele_by_variant)
                 cache_entry = {
                     "sample_frame": sample_frame,
                     "genotype_matrix": genotype_matrix,
@@ -1175,6 +1188,7 @@ def run_simulation(
                     "donor_fallback_sample_pops": list(donor_fallback_sample_pops) if donor_fallback_sample_pops is not None else None,
                     "la_genotypes_by_population": la_genotypes_by_population,
                     "dosage_effect_allele": dict(dosage_effect_allele),
+                    "dosage_other_allele": dict(dosage_other_allele),
                 }
                 entry_bytes = _cache_bytes(cache_entry)
                 if max_cache_bytes is None:
@@ -1602,6 +1616,9 @@ def run_simulation(
                 effects_out = effects_detail.copy()
                 effects_out["dosage_effect_allele"] = (
                     effects_out["variant_id"].astype(str).map(dosage_effect_allele).fillna("")
+                )
+                effects_out["dosage_other_allele"] = (
+                    effects_out["variant_id"].astype(str).map(dosage_other_allele).fillna("")
                 )
                 effects_out["architecture"] = architecture.name
                 effects_out["cohort"] = cohort.name

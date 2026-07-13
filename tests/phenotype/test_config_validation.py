@@ -529,3 +529,23 @@ def test_local_ancestry_source_zarr_requires_source_pattern() -> None:
 
     with pytest.raises(ValueError, match="local_ancestry_source_pattern"):
         RunConfig.from_dict(payload)
+
+
+def test_rejects_unknown_top_level_and_gwas_keys() -> None:
+    payload = _base_payload()
+    payload["chromsome"] = [1]
+    with pytest.raises(ValueError, match="Unknown top-level phenotype config key"):
+        RunConfig.from_dict(payload)
+
+    payload = _base_payload()
+    payload["gwas"]["taks_workers"] = 2
+    with pytest.raises(ValueError, match="Unknown gwas config key"):
+        RunConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("removed_key", ["path_prefix", "conversion_enabled"])
+def test_rejects_silently_ignored_legacy_genotype_keys(removed_key: str) -> None:
+    payload = _base_payload()
+    payload["genotype_input"][removed_key] = "legacy"
+    with pytest.raises(ValueError, match=removed_key):
+        RunConfig.from_dict(payload)

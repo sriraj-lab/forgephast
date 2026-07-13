@@ -5,24 +5,47 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Dict, List
+from uuid import uuid4
 
 import pandas as pd
+
+
+def _atomic_to_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        frame.to_csv(tmp_path, sep="\t", index=False)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_json(payload: dict[str, object], path: Path) -> None:
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _write_keep_file(phenotype_df: pd.DataFrame, out_path: Path) -> None:
     """Write normalized FID IID keep file."""
     keep = phenotype_df[["FID", "IID"]].copy()
-    keep.to_csv(out_path, sep="\t", index=False)
+    _atomic_to_csv(keep, out_path)
 
 
 def write_simulation_outputs(
     run_name: str,
     output_root: Path,
     records: List[Dict[str, object]],
+    run_identity: str = "",
 ) -> pd.DataFrame:
     """Persist simulation record tables and return run manifest dataframe."""
     run_dir = output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    completion_path = run_dir / "SIMULATE_COMPLETE.json"
+    completion_path.unlink(missing_ok=True)
 
     truth_dir = run_dir / "truth"
     truth_dir.mkdir(parents=True, exist_ok=True)
@@ -53,10 +76,10 @@ def write_simulation_outputs(
         pcs_df = rec["pcs_df"]
         coeff_df = rec["coefficients_df"]
 
-        phenotype_df.to_csv(phenotype_path, sep="\t", index=False)
-        covariate_df.to_csv(covariate_path, sep="\t", index=False)
-        pcs_df.to_csv(pcs_path, sep="\t", index=False)
-        coeff_df.to_csv(coeff_path, sep="\t", index=False)
+        _atomic_to_csv(phenotype_df, phenotype_path)
+        _atomic_to_csv(covariate_df, covariate_path)
+        _atomic_to_csv(pcs_df, pcs_path)
+        _atomic_to_csv(coeff_df, coeff_path)
         _write_keep_file(phenotype_df, keep_path)
 
         membership_frames.append(rec["membership_df"])
@@ -316,15 +339,22 @@ def write_simulation_outputs(
     )
     effect_geometry_df = pd.DataFrame(effect_geometry_rows)
 
-    membership_df.to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
-    membership_summary_df.to_csv(
-        truth_dir / "causal_membership_summary.tsv",
-        sep="\t",
-        index=False,
+    _atomic_to_csv(membership_df, truth_dir / "causal_membership.tsv")
+    _atomic_to_csv(membership_summary_df, truth_dir / "causal_membership_summary.tsv")
+    _atomic_to_csv(effects_df, truth_dir / "effect_sizes.tsv")
+    _atomic_to_csv(component_df, truth_dir / "component_summary.tsv")
+    _atomic_to_csv(effect_geometry_df, truth_dir / "effect_geometry.tsv")
+    _atomic_to_csv(manifest_df, run_dir / "run_manifest.tsv")
+    _atomic_write_json(
+        {
+            "schema_version": 1,
+            "run_name": run_name,
+            "run_identity": str(run_identity),
+            "manifest": "run_manifest.tsv",
+            "n_manifest_rows": int(len(manifest_df)),
+            "n_records": int(len(records)),
+        },
+        completion_path,
     )
-    effects_df.to_csv(truth_dir / "effect_sizes.tsv", sep="\t", index=False)
-    component_df.to_csv(truth_dir / "component_summary.tsv", sep="\t", index=False)
-    effect_geometry_df.to_csv(truth_dir / "effect_geometry.tsv", sep="\t", index=False)
-    manifest_df.to_csv(run_dir / "run_manifest.tsv", sep="\t", index=False)
 
     return manifest_df

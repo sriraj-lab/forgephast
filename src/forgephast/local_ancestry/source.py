@@ -228,7 +228,10 @@ def write_local_ancestry_source_from_tract_rows(
         sample_idx = haplotype_index // 2
         phase = haplotype_index % 2
         if sample_idx < 0 or sample_idx >= len(ordered_sample_ids):
-            continue
+            raise ValueError(
+                f"tract row haplotype_index={haplotype_index} is outside "
+                f"[0, {2 * len(ordered_sample_ids)})"
+            )
         sample_id = ordered_sample_ids[sample_idx]
         tracts_by_sample_hap[(sample_id, phase)].append(
             LocalAncestryTract(
@@ -331,6 +334,37 @@ class LocalAncestrySource:
             raise ValueError("Invalid local ancestry source: hap_phase length mismatch")
         if tract_start_bp.shape != tract_end_bp.shape or tract_start_bp.shape != source_code.shape:
             raise ValueError("Invalid local ancestry source: tract arrays must have matching shapes")
+        _validate_sample_ids(sample_ids)
+        _validate_ancestry_order(ancestry_order)
+        n_haplotypes = int(hap_sample_index.shape[0])
+        n_samples = int(len(sample_ids))
+        n_tracts = int(tract_start_bp.shape[0])
+        if n_haplotypes != 2 * n_samples:
+            raise ValueError("Invalid local ancestry source: expected exactly two haplotypes per sample")
+        if hap_offsets[0] != 0 or hap_offsets[-1] != n_tracts:
+            raise ValueError("Invalid local ancestry source: hap_offsets bounds mismatch")
+        if np.any(np.diff(hap_offsets) < 0):
+            raise ValueError("Invalid local ancestry source: hap_offsets must be non-decreasing")
+        if np.any(hap_sample_index < 0) or np.any(hap_sample_index >= n_samples):
+            raise ValueError("Invalid local ancestry source: hap_sample_index out of bounds")
+        if np.any((hap_phase != 0) & (hap_phase != 1)):
+            raise ValueError("Invalid local ancestry source: hap_phase values must be 0 or 1")
+        expected_pairs = {(idx, phase) for idx in range(n_samples) for phase in (0, 1)}
+        observed_pairs = {
+            (int(sample_idx), int(phase))
+            for sample_idx, phase in zip(hap_sample_index, hap_phase)
+        }
+        if observed_pairs != expected_pairs or len(observed_pairs) != n_haplotypes:
+            raise ValueError("Invalid local ancestry source: sample/phase rows must be unique and complete")
+        if np.any(tract_end_bp <= tract_start_bp):
+            raise ValueError("Invalid local ancestry source: tract ends must exceed starts")
+        if np.any(source_code < 0) or np.any(source_code >= len(ancestry_order)):
+            raise ValueError("Invalid local ancestry source: source_code out of bounds")
+        for hap_idx in range(n_haplotypes):
+            start = int(hap_offsets[hap_idx])
+            end = int(hap_offsets[hap_idx + 1])
+            if end - start > 1 and np.any(tract_start_bp[start + 1 : end] < tract_end_bp[start : end - 1]):
+                raise ValueError("Invalid local ancestry source: tracts must be ordered and non-overlapping")
         return cls(
             path=source_path,
             chrom=str(group.attrs.get("chrom", "")),

@@ -8,11 +8,29 @@ import yaml
 
 from forgephast.amplifier.config import from_yaml
 from forgephast.amplifier.donors import build_manifest_from_config
-from forgephast.amplifier.merge import merge_chromosome
+from forgephast.amplifier.merge import _read_sample_manifests, merge_chromosome
 from forgephast.amplifier.qc import run_qc
 from forgephast.amplifier.simulation import simulate_chromosome_population_shard_pool
 
 from .conftest import write_test_config
+
+
+def test_read_sample_manifests_rejects_duplicate_sample_ids(tmp_path: Path) -> None:
+    first = tmp_path / "first.tsv"
+    second = tmp_path / "second.tsv"
+    first.write_text("sample_id\tshard_id\ns1\t0\n", encoding="utf-8")
+    second.write_text("sample_id\tshard_id\ns1\t1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate sample_id"):
+        _read_sample_manifests([first, second])
+
+
+def test_read_sample_manifests_rejects_invalid_shard_id(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text("sample_id\tshard_id\ns1\tnot-an-integer\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        _read_sample_manifests([manifest])
 
 
 

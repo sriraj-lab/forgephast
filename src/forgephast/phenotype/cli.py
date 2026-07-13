@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+from dataclasses import asdict
 import json
 import logging
 import math
@@ -26,6 +27,7 @@ import pandas as pd
 import yaml
 
 from .._internal.cache import bump_counter, canonical_hash, counter_delta, snapshot_counters
+from .._internal.resources import require_slurm_cpu_budget, slurm_cpu_budget
 from .config import RunConfig
 from .data.genotypes import build_genotype_adapter
 from .data.global_pcs import refresh_manifest_global_pcs
@@ -39,7 +41,7 @@ from .grid import (
 )
 from .causal.source_pairs import SourcePairBuildConfig, write_source_pairs_from_hapstore
 from .gwas import GwasTask
-from .gwas.base import prepare_manifest_covariates_for_gwas
+from .gwas.base import prepare_manifest_covariates_for_gwas, validate_gwas_task_sample_ids
 from .gwas.registry import available_engine_names, build_engines
 from .io.write_outputs import write_simulation_outputs
 from .phenotypes.simulate import run_simulation
@@ -198,6 +200,7 @@ def _run_simulate(
         run_name=config.name,
         output_root=Path(config.paths.output_root),
         records=records,
+        run_identity=canonical_hash(asdict(config)),
     )
     manifest_path = run_dir / "run_manifest.tsv"
     stage_rows.append(
@@ -226,18 +229,61 @@ def _make_engines(config: RunConfig) -> Dict[str, object]:
 
 def _manifest_to_tasks(manifest_df: pd.DataFrame, chromosomes: List[int]) -> List[GwasTask]:
     """Convert manifest dataframe into GWAS task objects."""
+    required_columns = (
+        "run_name",
+        "replicate",
+        "architecture",
+        "cohort",
+        "pgen_prefix",
+        "keep_file",
+        "phenotype_file",
+        "covariates_file",
+        "global_pcs_file",
+        "output_dir",
+    )
+    missing_columns = [column for column in required_columns if column not in manifest_df.columns]
+    if missing_columns:
+        raise ValueError(f"run manifest is missing required columns: {missing_columns}")
+
+    text_columns = [column for column in required_columns if column != "replicate"]
+    normalized = manifest_df.copy()
+    for column in text_columns:
+        values = normalized[column].astype("string").fillna("").str.strip()
+        invalid = values.eq("")
+        if invalid.any():
+            rows = normalized.index[invalid].tolist()[:10]
+            raise ValueError(f"run manifest column {column!r} is blank at rows {rows}")
+        normalized[column] = values
+
+    replicate_values = pd.to_numeric(normalized["replicate"], errors="coerce")
+    invalid_replicate = replicate_values.isna() | (replicate_values % 1 != 0)
+    if invalid_replicate.any():
+        rows = normalized.index[invalid_replicate].tolist()[:10]
+        raise ValueError(f"run manifest has non-integer replicate values at rows {rows}")
+    normalized["replicate"] = replicate_values.astype(int)
+
+    task_key = ["run_name", "replicate", "architecture", "cohort"]
+    duplicate_key = normalized.duplicated(subset=task_key, keep=False)
+    if duplicate_key.any():
+        duplicates = normalized.loc[duplicate_key, task_key].drop_duplicates().to_dict("records")
+        raise ValueError(f"run manifest contains duplicate GWAS task keys: {duplicates[:10]}")
+
     tasks = []
-    for _, row in manifest_df.iterrows():
+    for _, row in normalized.iterrows():
         pgen_prefix = str(row["pgen_prefix"])
-        if not pgen_prefix:
-            raise ValueError(
-                "run manifest row has empty pgen_prefix. For HapStore input, run export stage first."
-            )
         trait_type_value = row.get("trait_type", "quantitative")
         trait_type = (
             "quantitative"
             if pd.isna(trait_type_value) or not str(trait_type_value).strip()
             else str(trait_type_value)
+        )
+        if trait_type not in {"quantitative", "binary"}:
+            raise ValueError(f"run manifest has unsupported trait_type {trait_type!r}")
+        merged_covariates_value = row.get("merged_covariates_file", "")
+        merged_covariates_file = (
+            ""
+            if pd.isna(merged_covariates_value)
+            else str(merged_covariates_value).strip()
         )
         tasks.append(
             GwasTask(
@@ -251,7 +297,7 @@ def _manifest_to_tasks(manifest_df: pd.DataFrame, chromosomes: List[int]) -> Lis
                 covariates_file=str(row["covariates_file"]),
                 global_pcs_file=str(row["global_pcs_file"]),
                 output_dir=str(row["output_dir"]),
-                merged_covariates_file=str(row.get("merged_covariates_file", "")),
+                merged_covariates_file=merged_covariates_file,
                 trait_type=trait_type,
                 chromosomes=list(chromosomes),
             )
@@ -276,6 +322,8 @@ def _run_gwas(
     tasks = _manifest_to_tasks(manifest_df, chromosomes=config.chromosomes)
     if not tasks:
         raise ValueError("run manifest contains zero tasks")
+    for task in tasks:
+        validate_gwas_task_sample_ids(task)
     stage_rows.append(
         {
             "stage": "load_gwas_manifest",
@@ -384,6 +432,17 @@ def _run_gwas(
     t1 = time.perf_counter()
     rows: list[dict[str, Any]] = []
     workers = max(1, int(config.gwas.task_workers))
+    engine_threads = max(
+        [
+            int(config.gwas.plink2.threads) if "plink2" in engines else 1,
+            int(config.gwas.regenie.threads) if "regenie" in engines else 1,
+        ]
+    )
+    require_slurm_cpu_budget(
+        workers=min(workers, max(1, len(jobs))),
+        threads_per_worker=engine_threads,
+        context="phenotype GWAS",
+    )
     logger.info("GWAS_EXECUTION_PLAN run=%s n_jobs=%d workers=%d", config.name, len(jobs), workers)
     if workers == 1 or len(jobs) <= 1:
         for job in jobs:
@@ -718,7 +777,7 @@ def _run_grid(grid_path: str, engines_filter: List[str] | None) -> Path:
             out[i] += 1
         return out
 
-    total_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK") or (os.cpu_count() or 1))
+    total_cpus = int(slurm_cpu_budget() or (os.cpu_count() or 1))
     budgets_enabled = str(os.environ.get("POLY_GRID_GROUP_CPU_BUDGETS", "1")).strip().lower() not in {
         "0",
         "false",
@@ -737,6 +796,12 @@ def _run_grid(grid_path: str, engines_filter: List[str] | None) -> Path:
     else:
         hapstore_budgets = [None] * len(groups)
         logger.info("grid hapstore_io_threads enabled=0")
+
+    active_parallel_runs = min(int(spec.parallel_runs), max(1, len(groups)))
+    if active_parallel_runs > total_cpus:
+        raise ValueError(
+            f"grid parallel_runs={active_parallel_runs} exceeds available CPU budget {total_cpus}"
+        )
 
     def _runner(group_cases: list[Any], hapstore_io_threads: int | None) -> list[dict[str, Any]]:
         return execute_group(

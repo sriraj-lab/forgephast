@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 
 from forgephast.phenotype.io.write_outputs import write_simulation_outputs
@@ -87,6 +89,9 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     }
 
     manifest_df = write_simulation_outputs("run1", output_root, [record])
+    completion = json.loads(
+        (output_root / "run1" / "SIMULATE_COMPLETE.json").read_text(encoding="utf-8")
+    )
     component_df = pd.read_csv(output_root / "run1" / "truth" / "component_summary.tsv", sep="\t")
     geometry_df = pd.read_csv(output_root / "run1" / "truth" / "effect_geometry.tsv", sep="\t")
     membership_summary_df = pd.read_csv(
@@ -108,6 +113,8 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     assert component_df.loc[0, "binary_alpha_by_population"] == '{"__cohort__": -1.25}'
     assert int(manifest_df.loc[0, "binary_case_count"]) == 1
     assert int(manifest_df.loc[0, "binary_control_count"]) == 4
+    assert completion["schema_version"] == 1
+    assert completion["n_manifest_rows"] == 1
     assert float(manifest_df.loc[0, "binary_realized_prevalence"]) == 0.2
     assert component_df.loc[0, "resolved_h2_fixed_by_population"] == '{"AFR": 0.28, "EUR": 0.25}'
     assert component_df.loc[0, "resolved_h2_bg_by_population"] == '{"AFR": 0.1, "EUR": 0.1}'

@@ -31,6 +31,40 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _read_sample_manifests(manifest_paths: Sequence[Path]) -> pd.DataFrame:
+    frames = [pd.read_csv(path, sep="\t", dtype=str) for path in manifest_paths]
+    for path, frame in zip(manifest_paths, frames):
+        missing_columns = [column for column in ("sample_id", "shard_id") if column not in frame.columns]
+        if missing_columns:
+            raise ValueError(f"sample manifest {path} is missing required columns: {missing_columns}")
+        if frame["sample_id"].astype("string").fillna("").str.strip().eq("").any():
+            raise ValueError(f"sample manifest {path} contains blank sample_id values")
+
+    sample_order_presence = {"sample_order" in frame.columns for frame in frames}
+    if len(sample_order_presence) > 1:
+        raise ValueError("sample_order must be present in either all shard manifests or none")
+
+    merged_df = pd.concat(frames, ignore_index=True)
+    merged_df["sample_id"] = merged_df["sample_id"].astype("string").str.strip()
+    duplicate_samples = merged_df["sample_id"].duplicated(keep=False)
+    if duplicate_samples.any():
+        duplicate_ids = merged_df.loc[duplicate_samples, "sample_id"].unique().tolist()
+        raise ValueError(f"duplicate sample_id values across shard manifests: {duplicate_ids[:10]}")
+
+    if "sample_order" in merged_df.columns:
+        sample_order = pd.to_numeric(merged_df["sample_order"], errors="raise")
+        if (sample_order % 1 != 0).any():
+            raise ValueError("sample manifest sample_order values must be integers")
+        merged_df["sample_order"] = sample_order.astype(int)
+    shard_ids = pd.to_numeric(merged_df["shard_id"], errors="raise")
+    if (shard_ids % 1 != 0).any():
+        raise ValueError("sample manifest shard_id values must be integers")
+    merged_df["shard_id"] = shard_ids.astype(int)
+
+    sort_cols = ["shard_id", "sample_order"] if "sample_order" in merged_df.columns else ["shard_id", "sample_id"]
+    return merged_df.sort_values(sort_cols)
+
+
 def _cleanup_hapstore_dirs(paths: Sequence[Path], *, chrom: int, pop: str) -> None:
     removed = 0
     for path in paths:
@@ -234,7 +268,7 @@ def merge_chromosome(
 
     input_run_root = Path(input_root) if input_root is not None else config.run_root
 
-    configured_populations = [pop.name for pop in config.populations]
+    configured_populations = [pop.name for pop in config.populations if not pop.donor_only]
     if not configured_populations:
         raise ValueError("No populations configured")
     if populations is None:
@@ -279,6 +313,7 @@ def merge_chromosome(
                     raise FileNotFoundError(f"Missing shard population HapStore: {pop_hapstore}")
                 if pop_hapstore.exists():
                     shard_hapstores_by_population[pop].append(pop_hapstore)
+        merged_df = _read_sample_manifests(manifest_paths)
         stage_timings["collect_inputs_sec"] = perf_counter() - t_collect
     logger.info(
         "merge input summary chrom=%s n_shards=%s populations=%s hapstore_counts=%s",
@@ -396,13 +431,6 @@ def merge_chromosome(
         merged_manifest_dir = ensure_dir(config.run_root / "manifests")
         merged_manifest = merged_manifest_dir / f"merged_samples_chr{chrom}.tsv"
         t_manifest = perf_counter()
-        frames = [pd.read_csv(path, sep="\t", dtype=str) for path in manifest_paths]
-        merged_df = pd.concat(frames, ignore_index=True)
-        if "sample_order" in merged_df.columns:
-            merged_df["sample_order"] = pd.to_numeric(merged_df["sample_order"], errors="coerce").fillna(0).astype(int)
-        merged_df["shard_id"] = pd.to_numeric(merged_df["shard_id"], errors="coerce").fillna(0).astype(int)
-        sort_cols = ["shard_id", "sample_order"] if "sample_order" in merged_df.columns else ["shard_id", "sample_id"]
-        merged_df = merged_df.drop_duplicates(subset=["sample_id"]).sort_values(sort_cols)
         merged_df.to_csv(merged_manifest, sep="\t", index=False)
         stage_timings["merge_manifest_sec"] = perf_counter() - t_manifest
     logger.info(

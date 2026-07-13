@@ -23,15 +23,26 @@ def _pair_key(a: str, b: str) -> str:
     return f"{a}__{b}" if a <= b else f"{b}__{a}"
 
 
+def _threads_per_matrix_worker(total_threads: int | None, workers: int) -> int | None:
+    if total_threads is None:
+        return None
+    return max(1, int(total_threads) // max(1, int(workers)))
+
+
 def validate_population_variant_axes_impl(stores: dict[str, HapStore], chrom: int) -> int:
     pops = sorted(stores.keys())
     if not pops:
         raise ValueError("population_hapstores cannot be empty")
     ref_pop = pops[0]
-    ref_pos = stores[ref_pop].variant_positions(chrom)
+    ref_info = stores[ref_pop].variant_info(chrom)
+    ref_pos = np.asarray(ref_info["pos"])
     for pop in pops[1:]:
-        cur = stores[pop].variant_positions(chrom)
-        if cur.shape != ref_pos.shape or not np.array_equal(cur, ref_pos):
+        cur_info = stores[pop].variant_info(chrom)
+        fields_match = all(
+            np.array_equal(np.asarray(cur_info[field]), np.asarray(ref_info[field]))
+            for field in ("pos", "ref", "alt", "vid")
+        )
+        if not fields_match:
             raise ValueError(
                 f"variant axis mismatch between populations {ref_pop!r} and {pop!r} "
                 f"in HapStore QC for chr{chrom}"
@@ -83,6 +94,8 @@ def run_qc_matrix_hapstore_impl(
             seed=pop_seed_base,
         )
         per_pop_indices.update(pop_indices)
+        max_workers = min(max(1, int(config.qc.matrix_workers)), max(1, len(pop_indices)))
+        count_numba_threads = _threads_per_matrix_worker(numba_threads, max_workers)
         selected_variant_count = int(variant_indices.size) if variant_indices is not None else int(n_variants)
         logger.info(
             "main QC matrix count-build strategy mode=combined_hapstore chrom=%s strategy=%s total_variants=%s selected_variants=%s",
@@ -99,12 +112,11 @@ def run_qc_matrix_hapstore_impl(
                 sample_indices=pop_indices[pop],
                 variant_indices=None,
                 variant_block_size=variant_block,
-                numba_threads=numba_threads,
+                numba_threads=count_numba_threads,
             )
             ac, an = _subselect_counts(ac_full, an_full, variant_indices)
             return pop, ac, an
 
-        max_workers = min(max(1, int(config.qc.matrix_workers)), max(1, len(pop_indices)))
         if max_workers > 1 and len(pop_indices) > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [pool.submit(_count_pop, pop) for pop in sorted(pop_indices.keys())]
@@ -124,6 +136,9 @@ def run_qc_matrix_hapstore_impl(
             seed=int(derived_seed(int(config.qc.seed), "main_qc_variants", chrom)),
         )
         selected_variant_count = int(variant_indices.size) if variant_indices is not None else int(n_variants)
+        pops = sorted(stores.keys())
+        max_workers = min(max(1, int(config.qc.matrix_workers)), max(1, len(pops)))
+        count_numba_threads = _threads_per_matrix_worker(numba_threads, max_workers)
         logger.info(
             "main QC matrix count-build strategy mode=population_hapstores chrom=%s strategy=%s total_variants=%s selected_variants=%s",
             chrom,
@@ -147,13 +162,11 @@ def run_qc_matrix_hapstore_impl(
                 sample_indices=pop_idx,
                 variant_indices=None,
                 variant_block_size=variant_block,
-                numba_threads=numba_threads,
+                numba_threads=count_numba_threads,
             )
             ac, an = _subselect_counts(ac_full, an_full, variant_indices)
             return pop, ac, an, pop_idx
 
-        pops = sorted(stores.keys())
-        max_workers = min(max(1, int(config.qc.matrix_workers)), max(1, len(pops)))
         if max_workers > 1 and len(pops) > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = [pool.submit(_count_pop, pop) for pop in pops]

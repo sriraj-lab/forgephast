@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import logging
 import multiprocessing as mp
+import os
 from pathlib import Path
 import shutil
 from time import perf_counter
@@ -16,6 +17,7 @@ from hapstore import ingest_arrays as _hapstore_ingest_arrays
 import numpy as np
 import pandas as pd
 
+from .._internal.resources import require_slurm_cpu_budget
 from ..local_ancestry import write_local_ancestry_source_from_tract_rows
 from .config import RunConfig
 from .donors import load_manifest
@@ -32,6 +34,56 @@ from .vcfio import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_scratch_root(config: RunConfig) -> Path | None:
+    if not bool(config.outputs.scratch_first):
+        return None
+    if config.outputs.scratch_root is not None:
+        return Path(config.outputs.scratch_root)
+    slurm_tmpdir = os.environ.get("SLURM_TMPDIR", "").strip()
+    if slurm_tmpdir:
+        return Path(slurm_tmpdir)
+    user = os.environ.get("USER", "").strip()
+    cluster_scratch = Path("/scratch/tmp") / user if user else None
+    if cluster_scratch is not None and cluster_scratch.is_dir() and os.access(cluster_scratch, os.W_OK):
+        return cluster_scratch
+    return None
+
+
+def _scratch_dir(
+    config: RunConfig,
+    *,
+    chrom: int,
+    shard_id: int,
+    n_shards: int,
+    population: str | None = None,
+) -> Path | None:
+    root = _resolve_scratch_root(config)
+    if root is None:
+        return None
+    job_token = os.environ.get("SLURM_JOB_ID", f"pid{os.getpid()}")
+    path = (
+        root
+        / "forgephast"
+        / config.name
+        / str(job_token)
+        / f"chr{chrom}"
+        / f"shard_{shard_id}_of_{n_shards}"
+    )
+    if population is not None:
+        path = path / str(population)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _copy_scratch_tree(source: Path, destination: Path) -> float:
+    started = perf_counter()
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination, dirs_exist_ok=True)
+    return perf_counter() - started
 
 
 def _is_stale_hapstore_error(exc: Exception) -> bool:
@@ -223,6 +275,7 @@ def simulate_haplotypes(
     seed: int,
     threads: int,
     donor_hap_sampling_weights: np.ndarray | None = None,
+    batch_size: int = 128,
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     n_donor_haps = donor_haps.shape[0]
@@ -242,28 +295,37 @@ def simulate_haplotypes(
             raise ValueError("donor_hap_sampling_weights must sum to a positive value")
         donor_choice_probs = donor_choice_probs / total_weight
 
-    init_donors = rng.choice(n_donor_haps, size=n_haps, replace=True, p=donor_choice_probs).astype(np.int32)
-    if n_markers > 1:
-        u = rng.random((n_haps, n_markers - 1), dtype=np.float32)
-        replacement = rng.choice(
-            n_donor_haps,
-            size=(n_haps, n_markers - 1),
-            replace=True,
-            p=donor_choice_probs,
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be > 0")
+    out = np.empty((n_haps, n_markers), dtype=np.uint8)
+    for start in range(0, n_haps, int(batch_size)):
+        end = min(n_haps, start + int(batch_size))
+        batch_n = end - start
+        init_donors = rng.choice(
+            n_donor_haps, size=batch_n, replace=True, p=donor_choice_probs
         ).astype(np.int32)
-    else:
-        u = np.zeros((n_haps, 0), dtype=np.float32)
-        replacement = np.zeros((n_haps, 0), dtype=np.int32)
+        if n_markers > 1:
+            u = rng.random((batch_n, n_markers - 1), dtype=np.float32)
+            replacement = rng.choice(
+                n_donor_haps,
+                size=(batch_n, n_markers - 1),
+                replace=True,
+                p=donor_choice_probs,
+            ).astype(np.int32)
+        else:
+            u = np.zeros((batch_n, 0), dtype=np.float32)
+            replacement = np.zeros((batch_n, 0), dtype=np.int32)
 
-    return _simulate_dispatch(
-        donor_haps=donor_haps,
-        switch_probs=switch_probs,
-        init_donors=init_donors,
-        u=u,
-        replacement=replacement,
-        use_parallel_kernel=True,
-        threads=max(1, int(threads)),
-    )
+        out[start:end] = _simulate_dispatch(
+            donor_haps=donor_haps,
+            switch_probs=switch_probs,
+            init_donors=init_donors,
+            u=u,
+            replacement=replacement,
+            use_parallel_kernel=True,
+            threads=max(1, int(threads)),
+        )
+    return out
 
 
 @dataclass
@@ -366,6 +428,7 @@ class _PopulationWorkItem:
 _TASK_PANEL_BY_POP: dict[str, Any] = {}
 _TASK_SWITCH_PROBS_BY_POP: dict[str, np.ndarray] = {}
 _TASK_THREADS_PER_TASK: int = 1
+_TASK_HAPLOTYPE_BATCH_SIZE: int = 128
 
 
 def _init_pool_worker_logging(queue: Any, level: int) -> None:
@@ -378,12 +441,14 @@ def _init_pool_worker_with_state(
     panel_by_pop: dict[str, Any],
     switch_probs_by_pop: dict[str, np.ndarray],
     threads_per_task: int,
+    haplotype_batch_size: int,
 ) -> None:
     _init_pool_worker_logging(queue, level)
     _init_task_worker(
         panel_by_pop=panel_by_pop,
         switch_probs_by_pop=switch_probs_by_pop,
         threads_per_task=threads_per_task,
+        haplotype_batch_size=haplotype_batch_size,
     )
 
 
@@ -391,14 +456,17 @@ def _init_task_worker(
     panel_by_pop: dict[str, Any],
     switch_probs_by_pop: dict[str, np.ndarray],
     threads_per_task: int,
+    haplotype_batch_size: int,
 ) -> None:
     global _TASK_PANEL_BY_POP
     global _TASK_SWITCH_PROBS_BY_POP
     global _TASK_THREADS_PER_TASK
+    global _TASK_HAPLOTYPE_BATCH_SIZE
 
     _TASK_PANEL_BY_POP = panel_by_pop
     _TASK_SWITCH_PROBS_BY_POP = switch_probs_by_pop
     _TASK_THREADS_PER_TASK = int(threads_per_task)
+    _TASK_HAPLOTYPE_BATCH_SIZE = int(haplotype_batch_size)
 
 
 def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
@@ -408,6 +476,7 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
         pop_n,
         seed,
         chrom_dir_str,
+        work_dir_str,
         chrom,
         shard_id,
         n_shards,
@@ -426,7 +495,8 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
 
     panel = _TASK_PANEL_BY_POP[pop_name]
     switch_probs = _TASK_SWITCH_PROBS_BY_POP[pop_name]
-    chrom_dir = Path(chrom_dir_str)
+    final_chrom_dir = Path(chrom_dir_str)
+    chrom_dir = Path(work_dir_str)
 
     timings: dict[str, float] = {}
     with telemetry_span(
@@ -447,6 +517,7 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
                 seed=seed,
                 threads=_TASK_THREADS_PER_TASK,
                 donor_hap_sampling_weights=panel.donor_hap_sampling_weights,
+                batch_size=_TASK_HAPLOTYPE_BATCH_SIZE,
             )
             timings["simulate_haplotypes_sec"] = perf_counter() - t_sim
 
@@ -500,6 +571,19 @@ def _simulate_population_shard_task(args: tuple[Any, ...]) -> dict[str, Any]:
                 pop_pgen_prefix = chrom_dir / f"{pop_name}.chr{chrom}"
                 pop_pgen_prefix = _write_pgen_from_hapstore(out_prefix=pop_pgen_prefix, chrom=int(chrom), hapstore_path=pop_hapstore)
                 timings["write_pop_pgen_sec"] = perf_counter() - t_pgen
+
+    if chrom_dir != final_chrom_dir:
+        timings["sync_scratch_outputs_sec"] = _copy_scratch_tree(chrom_dir, final_chrom_dir)
+
+        def _remap(path: Path | None) -> Path | None:
+            if path is None:
+                return None
+            return final_chrom_dir / path.relative_to(chrom_dir)
+
+        pop_vcf = _remap(pop_vcf)
+        pop_hapstore = _remap(pop_hapstore)
+        pop_pgen_prefix = _remap(pop_pgen_prefix)
+        shutil.rmtree(chrom_dir)
 
     return {
         "population": pop_name,
@@ -686,11 +770,19 @@ def _simulate_chromosome_shard(
     donor_io_workers = int(config.simulation.donor_io_workers)
     cache_dir = config.donor_cache_root
 
-    chrom_dir = ensure_dir(config.run_root / "synthetic" / f"chr{chrom}" / f"shard_{shard_id}_of_{n_shards}")
+    final_chrom_dir = ensure_dir(
+        config.run_root / "synthetic" / f"chr{chrom}" / f"shard_{shard_id}_of_{n_shards}"
+    )
+    scratch_chrom_dir = _scratch_dir(
+        config,
+        chrom=int(chrom),
+        shard_id=int(shard_id),
+        n_shards=int(n_shards),
+    )
+    chrom_dir = scratch_chrom_dir or final_chrom_dir
     manifest_dir = ensure_dir(config.run_root / "manifests")
 
     combined_sample_ids: list[str] = []
-    combined_haps_blocks: list[np.ndarray] = []
     variant_table = None
     sample_rows: list[dict[str, str | int]] = []
     population_outputs: list[PopulationSimulationArtifacts] = []
@@ -700,6 +792,8 @@ def _simulate_chromosome_shard(
     work_items: list[_PopulationWorkItem] = []
     union_donors_by_source: dict[tuple[str, Path], set[str]] = {}
     for pop in config.populations:
+        if pop.donor_only:
+            continue
         panel_source_kind, panel_source_path = config.resolve_donor_panel_source(
             chrom=int(chrom),
             population=str(pop.name),
@@ -1044,6 +1138,7 @@ def _simulate_chromosome_shard(
                 seed=item.seed,
                 threads=threads,
                 donor_hap_sampling_weights=panel.donor_hap_sampling_weights,
+                batch_size=int(config.simulation.haplotype_batch_size),
             )
             elapsed_simulate = perf_counter() - t_simulate
             pop_stage["simulate_haplotypes_sec"] = elapsed_simulate
@@ -1053,9 +1148,17 @@ def _simulate_chromosome_shard(
             raise RuntimeError(f"Failed to resolve variants for population {item.pop_name}")
         if variant_table is None:
             variant_table = variants
-        elif not np.array_equal(variants.pos, variant_table.pos):
+        elif not all(
+            (
+                np.array_equal(variants.pos, variant_table.pos),
+                np.array_equal(variants.ref, variant_table.ref),
+                np.array_equal(variants.alt, variant_table.alt),
+                np.array_equal(variants.vid, variant_table.vid),
+            )
+        ):
             raise ValueError(
-                f"Population {item.pop_name} has marker mismatch on chr{chrom}; variants must align"
+                f"Population {item.pop_name} has marker identity mismatch on chr{chrom}; "
+                "positions, REF, ALT, and source IDs must align"
             )
 
         pop_vcf: Path | None = None
@@ -1142,8 +1245,6 @@ def _simulate_chromosome_shard(
         )
 
         combined_sample_ids.extend(item.sample_ids)
-        if write_combined:
-            combined_haps_blocks.append(synthetic_haps)
         for sid in item.sample_ids:
             sample_rows.append(
                 {
@@ -1190,23 +1291,21 @@ def _simulate_chromosome_shard(
     combined_vcf_out: Path | None = None
     combined_hapstore_out: Path | None = None
     if write_combined:
-        t_concat = perf_counter()
-        combined_haps = np.concatenate(combined_haps_blocks, axis=0)
-        _add_timing("concatenate_combined_haps_sec", perf_counter() - t_concat)
         combined_vcf: Path | None = None
 
         if write_hapstore:
             t_write_combined_hapstore = perf_counter()
             combined_hapstore = chrom_dir / f"combined.chr{chrom}.hapstore.zarr"
-            _ingest_arrays_with_retry(
-                output_zarr=combined_hapstore,
+            population_hapstores = [
+                output.hapstore_path
+                for output in population_outputs
+                if output.hapstore_path is not None
+            ]
+            merge_chromosomes_sample_axis(
+                input_stores=population_hapstores,
+                output_store=combined_hapstore,
                 chrom=f"chr{chrom}",
-                haplotypes=combined_haps,
-                variant_pos=variant_table.pos,
-                sample_ids=combined_sample_ids,
-                ref=variant_table.ref,
-                alt=variant_table.alt,
-                vid=variant_table.vid,
+                output_mode="w",
                 store_genotypes=bool(config.outputs.hapstore_store_genotypes),
                 chunk_variant_size=int(config.outputs.hapstore_chunk_variant_size),
                 chunk_haplotype_size=(
@@ -1225,6 +1324,7 @@ def _simulate_chromosome_shard(
                     else config.outputs.hapstore_compression_level
                 ),
                 attrs={"source": "population_amplifier"},
+                n_workers=max(1, int(config.simulation.threads_per_task)),
             )
             _add_timing("write_combined_hapstore_sec", perf_counter() - t_write_combined_hapstore)
             combined_hapstore_out = combined_hapstore
@@ -1252,6 +1352,37 @@ def _simulate_chromosome_shard(
                 hapstore_path=combined_hapstore_out,
             )
             _add_timing("write_combined_pgen_sec", perf_counter() - t_combined_pgen)
+
+    if scratch_chrom_dir is not None:
+        sync_elapsed = _copy_scratch_tree(scratch_chrom_dir, final_chrom_dir)
+        _add_timing("sync_scratch_outputs_sec", sync_elapsed)
+
+        def _remap(path: Path | None) -> Path | None:
+            if path is None:
+                return None
+            return final_chrom_dir / path.relative_to(scratch_chrom_dir)
+
+        for output in population_outputs:
+            output.vcf_path = _remap(output.vcf_path)
+            output.hapstore_path = _remap(output.hapstore_path)
+            output.pgen_prefix = _remap(output.pgen_prefix)
+            output.tract_summary_path = _remap(output.tract_summary_path)
+            output.tracts_tsv_path = _remap(output.tracts_tsv_path)
+            output.ancestry_source_path = _remap(output.ancestry_source_path)
+            output.individual_ancestry_path = _remap(output.individual_ancestry_path)
+        combined_vcf_out = _remap(combined_vcf_out)
+        combined_hapstore_out = _remap(combined_hapstore_out)
+        combined_pgen_prefix = _remap(combined_pgen_prefix)
+        shutil.rmtree(scratch_chrom_dir)
+        logger.info(
+            "simulate_chromosome scratch sync complete chrom=%s shard=%s/%s source=%s destination=%s elapsed=%.2fs",
+            chrom,
+            shard_id,
+            n_shards,
+            scratch_chrom_dir,
+            final_chrom_dir,
+            sync_elapsed,
+        )
 
     t_manifest_write = perf_counter()
     sample_manifest = pd.DataFrame(sample_rows)
@@ -1310,6 +1441,11 @@ def simulate_chromosome_population_shard_pool(
         threads_per_task = int(config.simulation.threads_per_task)
     if threads_per_task <= 0:
         raise ValueError("threads_per_task must be > 0")
+    require_slurm_cpu_budget(
+        workers=min(int(task_workers), max(1, int(n_shards) * len(config.populations))),
+        threads_per_worker=int(threads_per_task),
+        context="amplifier simulation",
+    )
 
     t0 = perf_counter()
     stage_timings: dict[str, float] = {}
@@ -1335,6 +1471,8 @@ def simulate_chromosome_population_shard_pool(
         shard_results: list[SimulationResult] = []
         task_count = 0
         for pop in config.populations:
+            if pop.donor_only:
+                continue
             for shard_id in range(n_shards):
                 _, pop_n = shard_bounds(pop.n_diploids, shard_id=shard_id, n_shards=n_shards)
                 if pop_n > 0:
@@ -1398,6 +1536,8 @@ def simulate_chromosome_population_shard_pool(
         work_items: list[_PopulationWorkItem] = []
         union_donors_by_source: dict[tuple[str, Path], set[str]] = {}
         for pop in config.populations:
+            if pop.donor_only:
+                continue
             donors = manifest.donors_by_population[pop.name]
             panel_source_kind, panel_source_path = config.resolve_donor_panel_source(
                 chrom=int(chrom),
@@ -1458,6 +1598,8 @@ def simulate_chromosome_population_shard_pool(
         switch_probs_by_pop: dict[str, np.ndarray] = {}
         exemplars_by_pop: dict[str, _PopulationWorkItem] = {}
         for pop in config.populations:
+            if pop.donor_only:
+                continue
             exemplar = next((x for x in work_items if x.pop_name == pop.name), None)
             if exemplar is not None:
                 exemplars_by_pop[pop.name] = exemplar
@@ -1515,6 +1657,13 @@ def simulate_chromosome_population_shard_pool(
             chrom_dir = ensure_dir(
                 config.run_root / "synthetic" / f"chr{chrom}" / f"shard_{item.shard_id}_of_{n_shards}"
             )
+            scratch_task_dir = _scratch_dir(
+                config,
+                chrom=int(chrom),
+                shard_id=int(item.shard_id),
+                n_shards=int(n_shards),
+                population=str(item.pop_name),
+            )
             task_args.append(
                 (
                     item.pop_name,
@@ -1522,6 +1671,7 @@ def simulate_chromosome_population_shard_pool(
                     item.pop_n,
                     item.seed,
                     str(chrom_dir),
+                    str(scratch_task_dir or chrom_dir),
                     chrom,
                     item.shard_id,
                     n_shards,
@@ -1583,6 +1733,7 @@ def simulate_chromosome_population_shard_pool(
                 panel_by_pop,
                 switch_probs_by_pop,
                 threads_per_task=int(threads_per_task),
+                haplotype_batch_size=int(config.simulation.haplotype_batch_size),
             )
             for args in task_args:
                 _record_task_result(_simulate_population_shard_task(args))
@@ -1606,6 +1757,7 @@ def simulate_chromosome_population_shard_pool(
                     panel_by_pop,
                     switch_probs_by_pop,
                     threads_per_task=int(threads_per_task),
+                    haplotype_batch_size=int(config.simulation.haplotype_batch_size),
                 )
                 try:
                     with ctx.Pool(
@@ -1625,6 +1777,7 @@ def simulate_chromosome_population_shard_pool(
                         panel_by_pop,
                         switch_probs_by_pop,
                         int(threads_per_task),
+                        int(config.simulation.haplotype_batch_size),
                     )
                     if log_queue is not None:
                         initializer = _init_pool_worker_with_state
@@ -1634,6 +1787,7 @@ def simulate_chromosome_population_shard_pool(
                             panel_by_pop,
                             switch_probs_by_pop,
                             int(threads_per_task),
+                            int(config.simulation.haplotype_batch_size),
                         )
                     with ctx.Pool(
                         processes=process_count,

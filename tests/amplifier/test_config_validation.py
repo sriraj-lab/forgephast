@@ -18,6 +18,28 @@ def test_config_parses_k_populations(tmp_path):
     assert cfg.simulation.chromosomes == [21]
 
 
+def test_config_rejects_donor_only_msprime_population(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["populations"][0].update(
+        {
+            "donor_only": True,
+            "engine": "msprime_tracts",
+            "selector": None,
+            "msprime": {
+                "sources": [{"population": "P2", "weight": 1.0}],
+                "admixture_time_generations": None,
+            },
+        }
+    )
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    with pytest.raises(ValueError, match="donor_only requires engine='mosaic'"):
+        from_yaml(cfg_path)
+
+
 
 def test_config_rejects_empty_population_list(tmp_path):
     cfg_path = write_test_config(tmp_path)
@@ -773,3 +795,15 @@ def test_config_accepts_explicit_admixed_qc_fields(tmp_path):
     assert cfg.qc.admixed_qc_mode == "strict"
     assert cfg.qc.admixed_hwe_inbreeding_mode == "legacy"
     assert cfg.qc.admixed_tract_length_min_tracts == 100
+
+
+def test_config_rejects_unknown_top_level_key(tmp_path):
+    cfg_path = write_test_config(tmp_path, name="unknown_top_level")
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["simulaton"] = {}
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    with pytest.raises(ValueError, match="Unknown top-level config key"):
+        from_yaml(cfg_path)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
+import pytest
 
 from forgephast.phenotype.grid import GridFactor, build_grouped_cases, expand_grid_cases, load_grid_spec
 
@@ -175,3 +176,21 @@ def test_expand_grid_cases_applies_coupled_overrides() -> None:
         vb = case.payload["variance_budget"]
         total = float(vb["h2_fixed"]) + float(vb["h2_bg"]) + float(vb["covariate"]) + float(vb["residual"])
         assert abs(total - 1.0) < 1e-6
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"base_config": "base.yaml", "fators": []},
+        {"base_config": "base.yaml", "runtime": {"max_cache_gb": 1.0, "cpus": 2}},
+        {
+            "base_config": "base.yaml",
+            "factors": [{"path": "chromosomes", "values": [[1]], "label": "bad"}],
+        },
+    ],
+)
+def test_load_grid_spec_rejects_unknown_keys(tmp_path: Path, payload: dict) -> None:
+    spec_path = tmp_path / "grid_unknown.yaml"
+    spec_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="Unknown grid"):
+        load_grid_spec(spec_path)

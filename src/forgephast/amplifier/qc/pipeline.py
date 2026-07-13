@@ -426,7 +426,9 @@ def _resolve_synthetic_outputs(config: RunConfig, chrom: int, n_shards: int) -> 
 
     pop_dir = config.run_root / "merged" / f"chr{chrom}" / "populations"
     population_hapstores: dict[str, Path] = {
-        pop.name: pop_dir / f"{pop.name}.chr{chrom}.merged.hapstore.zarr" for pop in config.populations
+        pop.name: pop_dir / f"{pop.name}.chr{chrom}.merged.hapstore.zarr"
+        for pop in config.populations
+        if not pop.donor_only
     }
     if merged_manifest.exists() and population_hapstores and all(path.exists() for path in population_hapstores.values()):
         return QcInputs(

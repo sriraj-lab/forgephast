@@ -90,10 +90,12 @@ def _write_manifest(cfg: RunConfig) -> Path:
     pheno = run_dir / "pheno.tsv"
     cov = run_dir / "cov.tsv"
     pcs = run_dir / "pcs.tsv"
+    pgen_prefix = run_dir / "fake_pgen"
     keep.write_text("FID IID\n0 s1\n0 s2\n", encoding="utf-8")
     pheno.write_text("FID\tIID\tPHENO\n0\ts1\t1\n0\ts2\t2\n", encoding="utf-8")
     cov.write_text("FID\tIID\tage\n0\ts1\t30\n0\ts2\t40\n", encoding="utf-8")
     pcs.write_text("FID\tIID\tPC1\n0\ts1\t0.1\n0\ts2\t-0.1\n", encoding="utf-8")
+    Path(f"{pgen_prefix}.psam").write_text("#FID\tIID\n0\ts1\n0\ts2\n", encoding="utf-8")
 
     manifest = pd.DataFrame(
         {
@@ -101,7 +103,7 @@ def _write_manifest(cfg: RunConfig) -> Path:
             "replicate": [1, 2],
             "architecture": ["a1", "a1"],
             "cohort": ["c1", "c1"],
-            "pgen_prefix": ["/tmp/fake", "/tmp/fake"],
+            "pgen_prefix": [str(pgen_prefix), str(pgen_prefix)],
             "keep_file": [str(keep), str(keep)],
             "phenotype_file": [str(pheno), str(pheno)],
             "covariates_file": [str(cov), str(cov)],

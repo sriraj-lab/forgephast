@@ -104,8 +104,9 @@ def test_build_roundtrip_plots_writes_default_and_group_outputs(tmp_path: Path) 
         {
             "variant_id": ["chr1:10", "chr1:20", "chr1:10", "chr1:20"],
             "population": ["EUR", "EUR", "AFR", "AFR"],
-            "beta": [0.5, -0.4, 0.2, -0.1],
-            "dosage_effect_allele": ["A", "G", "A", "G"],
+                "beta": [0.5, -0.4, 0.2, -0.1],
+                "dosage_effect_allele": ["A", "G", "A", "G"],
+                "dosage_other_allele": ["G", "A", "G", "A"],
             "architecture": ["a1", "a1", "a1", "a1"],
             "cohort": ["c1", "c1", "c1", "c1"],
             "replicate": [1, 1, 1, 1],

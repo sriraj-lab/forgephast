@@ -149,6 +149,17 @@ def load_grid_spec(path: str | Path) -> GridSpec:
         payload = yaml.safe_load(handle)
     if not isinstance(payload, dict):
         raise ValueError("Grid spec must be a mapping")
+    allowed_top_level = {
+        "base_config",
+        "stage",
+        "factors",
+        "parallel_runs",
+        "continue_on_error",
+        "runtime",
+    }
+    unknown_top_level = sorted(set(payload).difference(allowed_top_level))
+    if unknown_top_level:
+        raise ValueError(f"Unknown grid config key(s): {unknown_top_level}")
 
     base_config = str(payload.get("base_config", "")).strip()
     if not base_config:
@@ -167,6 +178,9 @@ def load_grid_spec(path: str | Path) -> GridSpec:
     for item in factors_payload:
         if not isinstance(item, dict):
             raise ValueError("Each factor entry must be a mapping")
+        unknown_factor_keys = sorted(set(item).difference({"path", "paths", "values"}))
+        if unknown_factor_keys:
+            raise ValueError(f"Unknown grid factor key(s): {unknown_factor_keys}")
         has_path = "path" in item and item.get("path") is not None
         has_paths = "paths" in item and item.get("paths") is not None
         if has_path and has_paths:
@@ -209,6 +223,9 @@ def load_grid_spec(path: str | Path) -> GridSpec:
     runtime_payload = payload.get("runtime", {}) or {}
     if not isinstance(runtime_payload, dict):
         raise ValueError("grid.runtime must be a mapping when provided")
+    unknown_runtime_keys = sorted(set(runtime_payload).difference({"max_cache_gb"}))
+    if unknown_runtime_keys:
+        raise ValueError(f"Unknown grid.runtime key(s): {unknown_runtime_keys}")
     max_cache_gb = float(runtime_payload.get("max_cache_gb", 8.0))
     if max_cache_gb <= 0:
         raise ValueError("grid.runtime.max_cache_gb must be > 0")

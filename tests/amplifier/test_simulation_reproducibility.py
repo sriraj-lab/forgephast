@@ -61,6 +61,30 @@ def test_haplotype_simulation_seed_determinism(tmp_path):
     assert not np.array_equal(out_a, out_c)
 
 
+def test_simulate_haplotypes_bounds_random_workspace_by_batch(monkeypatch):
+    batch_shapes: list[int] = []
+
+    def fake_dispatch(**kwargs):  # noqa: ANN003
+        batch_shapes.append(int(kwargs["init_donors"].shape[0]))
+        return np.zeros(
+            (kwargs["init_donors"].shape[0], kwargs["donor_haps"].shape[1]),
+            dtype=np.uint8,
+        )
+
+    monkeypatch.setattr(simulation_module, "_simulate_dispatch", fake_dispatch)
+    out = simulation_module.simulate_haplotypes(
+        donor_haps=np.zeros((4, 5), dtype=np.uint8),
+        switch_probs=np.zeros(4, dtype=float),
+        n_haps=10,
+        seed=1,
+        threads=1,
+        batch_size=3,
+    )
+
+    assert out.shape == (10, 5)
+    assert batch_shapes == [3, 3, 3, 1]
+
+
 
 def test_simulate_emits_outputs(tmp_path):
     cfg_path = write_test_config(tmp_path)

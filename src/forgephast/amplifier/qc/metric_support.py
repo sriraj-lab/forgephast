@@ -168,7 +168,8 @@ def run_registered_metrics(
                 "error": str(exc),
             }
             if spec.contributes_gate:
-                metric_payload["gate_pass"] = None
+                metric_payload["gate_pass"] = False
+                gate_pass = False
 
         if (
             admixed_qc_enabled

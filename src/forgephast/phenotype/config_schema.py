@@ -108,6 +108,7 @@ class HapStoreInputConfig:
     file_pattern: str = "{population}/chr{chrom}.hapstore.zarr"
     store_path: Optional[str] = None
     missing_sentinel: int = 255
+    missing_policy: str = "error"
     missing_fill_value: float = 0.0
     io_threads: int = 1
     coalesce_max_gap_variants: int = 0
@@ -125,6 +126,11 @@ class HapStoreInputConfig:
             if not self.store_path:
                 raise ValueError("genotype_input.hapstore.store_path is required for layout=single_store")
         _check_in_range(int(self.missing_sentinel), 0, 255, "genotype_input.hapstore.missing_sentinel")
+        _check_one_of(
+            self.missing_policy,
+            {"error", "fill"},
+            "genotype_input.hapstore.missing_policy",
+        )
         if not np.isfinite(float(self.missing_fill_value)):
             raise ValueError("genotype_input.hapstore.missing_fill_value must be finite")
         _check_positive(int(self.io_threads), "genotype_input.hapstore.io_threads")
@@ -928,9 +934,15 @@ class RoundTripValidationConfig:
     top_k: int = 100
     report_path: Optional[str] = None
     require_positive_slope: bool = True
+    min_overlap_variants: int = 2
+    require_finite_metrics: bool = True
 
     def validate(self) -> None:
         _check_positive(int(self.top_k), "roundtrip_validation.top_k")
+        _check_positive(
+            int(self.min_overlap_variants),
+            "roundtrip_validation.min_overlap_variants",
+        )
 
 
 @dataclass

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from forgephast.amplifier.config import MsprimePopulationConfig, MsprimeSourceSpec, PopulationSpec, from_yaml
-from forgephast.amplifier.donors import build_manifest_from_config
+from forgephast.amplifier.donors import build_manifest_from_config, load_manifest
 
 from .conftest import write_test_config
 
@@ -22,7 +23,13 @@ def test_manifest_selectors_and_counts(tmp_path):
     assert count_map["P3"] == 2
 
     df = pd.read_csv(manifest.manifest_path, sep="\t")
-    assert set(df.columns) == {"sample_id", "population", "source_value", "sampling_weight"}
+    assert set(df.columns) == {
+        "sample_id",
+        "population",
+        "source_value",
+        "sampling_weight",
+        "donor_only",
+    }
     assert df["sample_id"].nunique() == 6
 
 
@@ -65,3 +72,24 @@ def test_manifest_selector_weights_assign_balanced_group_mixture(tmp_path):
     assert weights["B1"] == weights["B2"]
     assert weights["A1"] == 0.375
     assert weights["B1"] == 0.125
+
+
+def test_load_manifest_rebuilds_when_selector_identity_changes(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    cfg = from_yaml(cfg_path)
+    build_manifest_from_config(cfg)
+    assert load_manifest(cfg).donors_by_population["P1"] == ["A1", "A2"]
+
+    cfg.populations[0].selector = {"values": ["POP_B"]}
+    assert load_manifest(cfg).donors_by_population["P1"] == ["B1", "B2"]
+
+
+def test_manifest_rejects_duplicate_metadata_sample_ids(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    cfg = from_yaml(cfg_path)
+    metadata_path = cfg.input.metadata_path
+    with open(metadata_path, "a", encoding="utf-8") as handle:
+        handle.write("A1\tPOP_A\n")
+
+    with pytest.raises(ValueError, match="duplicate sample IDs"):
+        build_manifest_from_config(cfg)

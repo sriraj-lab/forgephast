@@ -116,6 +116,10 @@ def evaluate_main_qc_gates(
                 pair_pass = None
             elif base is None or np.isnan(base) or np.isnan(obs):
                 gate_reason = "missing_baseline_or_observed"
+                if gated:
+                    pair_pass = False
+                    n_fst_pairs_gated += 1
+                    n_fst_pairs_failed += 1
             else:
                 if abs(base) > 1e-12:
                     rel = abs(obs - base) / abs(base)
@@ -168,7 +172,8 @@ def evaluate_main_qc_gates(
                 "reason": "activation_error",
                 "error": str(exc),
             }
-            logger.warning("Skipping stochastic donor-baseline FST gate activation due to error: %s", exc)
+            gate_pass = False
+            logger.warning("Stochastic donor-baseline FST gate activation failed: %s", exc)
         if isinstance(fst_stochastic_gate_activation, dict) and bool(fst_stochastic_gate_activation.get("enabled")):
             try:
                 manifest = load_manifest_fn(config)
@@ -188,7 +193,8 @@ def evaluate_main_qc_gates(
                     "reason": "error",
                     "error": str(exc),
                 }
-                logger.warning("Stochastic donor-baseline FST gate failed; falling back to standard gate: %s", exc)
+                gate_pass = False
+                logger.warning("Stochastic donor-baseline FST gate failed: %s", exc)
             if (
                 isinstance(fst_stochastic_gate, dict)
                 and bool(fst_stochastic_gate.get("available"))
@@ -208,6 +214,9 @@ def evaluate_main_qc_gates(
             within_pass: bool | None = None
             if np.isnan(value):
                 gate_reason = "missing_observed"
+                if gated:
+                    within_pass = False
+                    gate_pass = False
             else:
                 within_pass = bool(abs(value) <= config.qc.within_split_abs_max)
                 if gated:
@@ -224,7 +233,15 @@ def evaluate_main_qc_gates(
                 "within_pass": within_pass,
             }
     except Exception as exc:
-        logger.warning("Skipping donor-baseline gate due to error: %s", exc)
+        gate_pass = False
+        fst_gate_effective_pass = False
+        fst_pairwise_gate_status["__gate_error__"] = {
+            "gated": True,
+            "reason": "error",
+            "error": str(exc),
+            "pair_pass": False,
+        }
+        logger.warning("Donor-baseline gate failed: %s", exc)
 
     if bool(config.qc.engine_aware_gating) or admixed_qc_enabled:
         try:
@@ -237,7 +254,7 @@ def evaluate_main_qc_gates(
             if (
                 isinstance(msprime_tract_composition_gate, dict)
                 and bool(msprime_tract_composition_gate.get("enabled"))
-                and msprime_tract_composition_gate.get("gate_pass") is False
+                and msprime_tract_composition_gate.get("gate_pass") is not True
             ):
                 gate_pass = False
         except Exception as exc:
@@ -263,7 +280,7 @@ def evaluate_main_qc_gates(
             if (
                 isinstance(admixed_tract_length_gate, dict)
                 and bool(admixed_tract_length_gate.get("enabled"))
-                and admixed_tract_length_gate.get("gate_pass") is False
+                and admixed_tract_length_gate.get("gate_pass") is not True
             ):
                 gate_pass = False
         except Exception as exc:
@@ -288,7 +305,7 @@ def evaluate_main_qc_gates(
             if (
                 isinstance(admixed_ancestry_variance_gate, dict)
                 and bool(admixed_ancestry_variance_gate.get("enabled"))
-                and admixed_ancestry_variance_gate.get("gate_pass") is False
+                and admixed_ancestry_variance_gate.get("gate_pass") is not True
             ):
                 gate_pass = False
         except Exception as exc:

@@ -4,6 +4,7 @@ import numpy as np
 
 from forgephast.amplifier.config import from_yaml
 from forgephast.amplifier.qc.pipeline import _resolve_python_qc_numba_threads
+from forgephast.amplifier.qc.matrix_backend import _threads_per_matrix_worker
 from forgephast.amplifier.qc.metrics.ld_decay import ld_curve_from_genotypes
 from forgephast.amplifier.qc.metrics.fst import hudson_fst_from_counts
 
@@ -19,6 +20,12 @@ def test_resolve_python_qc_numba_threads_precedence(tmp_path):
 
     cfg.qc.numba_threads = 7
     assert _resolve_python_qc_numba_threads(cfg) == 7
+
+
+def test_matrix_worker_thread_budget_is_not_multiplied():
+    assert _threads_per_matrix_worker(8, 4) == 2
+    assert _threads_per_matrix_worker(3, 8) == 1
+    assert _threads_per_matrix_worker(None, 4) is None
 
 
 def test_hudson_fst_numba_threads_parity():

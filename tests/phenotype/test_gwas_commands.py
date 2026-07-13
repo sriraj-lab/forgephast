@@ -6,7 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
+from forgephast.phenotype.cli import _manifest_to_tasks
 from forgephast.phenotype.config import Plink2EngineConfig, RegenieEngineConfig
 from forgephast.phenotype.gwas import (
     GwasResult,
@@ -15,7 +17,42 @@ from forgephast.phenotype.gwas import (
     RegenieEngine,
     merge_covariates_for_gwas,
     prepare_manifest_covariates_for_gwas,
+    validate_gwas_task_sample_ids,
 )
+
+
+def _task_manifest() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "run_name": "run",
+                "replicate": 0,
+                "architecture": "arch",
+                "cohort": "all",
+                "pgen_prefix": "/tmp/data",
+                "keep_file": "/tmp/keep.tsv",
+                "phenotype_file": "/tmp/pheno.tsv",
+                "covariates_file": "/tmp/covar.tsv",
+                "global_pcs_file": "/tmp/pcs.tsv",
+                "output_dir": "/tmp/out",
+            }
+        ]
+    )
+
+
+def test_manifest_to_tasks_rejects_blank_required_value() -> None:
+    manifest = _task_manifest()
+    manifest.loc[0, "pgen_prefix"] = pd.NA
+
+    with pytest.raises(ValueError, match="pgen_prefix.*blank"):
+        _manifest_to_tasks(manifest, chromosomes=[21])
+
+
+def test_manifest_to_tasks_rejects_duplicate_task_key() -> None:
+    manifest = pd.concat([_task_manifest(), _task_manifest()], ignore_index=True)
+
+    with pytest.raises(ValueError, match="duplicate GWAS task keys"):
+        _manifest_to_tasks(manifest, chromosomes=[21])
 
 
 def _make_task(tmp_path: Path) -> GwasTask:
@@ -197,6 +234,47 @@ def test_merge_covariates_for_gwas_falls_back_to_iid_when_fid_differs(tmp_path: 
     assert covars == ["age", "PC1"]
     assert out_df["FID"].tolist() == [0, 0] or out_df["FID"].tolist() == ["0", "0"]
     assert out_df.shape[0] == 2
+
+
+def test_merge_covariates_for_gwas_rejects_sample_set_mismatch(tmp_path: Path) -> None:
+    cov_path = tmp_path / "cov.tsv"
+    pcs_path = tmp_path / "pcs.tsv"
+    pd.DataFrame({"FID": ["0", "0"], "IID": ["s1", "s2"]}).to_csv(
+        cov_path, sep="\t", index=False
+    )
+    pd.DataFrame({"FID": ["0", "0"], "IID": ["s1", "s3"]}).to_csv(
+        pcs_path, sep="\t", index=False
+    )
+
+    with pytest.raises(ValueError, match="sample sets differ"):
+        merge_covariates_for_gwas(str(cov_path), str(pcs_path), tmp_path / "merged.tsv")
+
+
+def test_merge_covariates_for_gwas_rejects_duplicate_iids(tmp_path: Path) -> None:
+    cov_path = tmp_path / "cov.tsv"
+    pcs_path = tmp_path / "pcs.tsv"
+    pd.DataFrame({"FID": ["0", "0"], "IID": ["s1", "s1"]}).to_csv(
+        cov_path, sep="\t", index=False
+    )
+    pd.DataFrame({"FID": ["0"], "IID": ["s1"]}).to_csv(pcs_path, sep="\t", index=False)
+
+    with pytest.raises(ValueError, match="duplicate IID"):
+        merge_covariates_for_gwas(str(cov_path), str(pcs_path), tmp_path / "merged.tsv")
+
+
+def test_validate_gwas_task_sample_ids_rejects_silent_subset(tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+    pgen_prefix = tmp_path / "pgen"
+    Path(f"{pgen_prefix}.psam").write_text(
+        "#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8"
+    )
+    task.pgen_prefix = str(pgen_prefix)
+    pd.DataFrame({"FID": ["s1"], "IID": ["s1"], "PHENO": [1]}).to_csv(
+        task.phenotype_file, sep="\t", index=False
+    )
+
+    with pytest.raises(ValueError, match="sample set mismatch.*phenotype_file"):
+        validate_gwas_task_sample_ids(task)
 
 
 def test_merge_covariates_for_gwas_allows_ids_only(tmp_path: Path) -> None:

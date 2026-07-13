@@ -179,7 +179,47 @@ class SourcePairBuildConfig:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "SourcePairBuildConfig":
         data = dict(payload)
+        allowed_top_level = {
+            "hapstore",
+            "samples",
+            "output",
+            "chromosomes",
+            "groups",
+            "source_pairs",
+            "source_pairs_file",
+            "qc_file",
+            "log_file",
+            "pooled_maf_min",
+            "variant_block_size",
+            "variant_id_column",
+            "chrom_column",
+            "position_column",
+            "source_variant_id_column",
+            "pooled_maf_column",
+        }
+        unknown_top_level = sorted(set(data).difference(allowed_top_level))
+        if unknown_top_level:
+            raise ValueError(
+                f"Unknown source-pair config key(s): {unknown_top_level}"
+            )
         source_pair_options = dict(data.get("source_pairs", {}) or {})
+        allowed_source_pair_options = {
+            "pooled_maf_min",
+            "variant_block_size",
+            "variant_id_column",
+            "chrom_column",
+            "position_column",
+            "source_variant_id_column",
+            "pooled_maf_column",
+        }
+        unknown_source_pair_options = sorted(
+            set(source_pair_options).difference(allowed_source_pair_options)
+        )
+        if unknown_source_pair_options:
+            raise ValueError(
+                "Unknown source_pairs config key(s): "
+                f"{unknown_source_pair_options}"
+            )
         output_payload = data.get("output", {})
         if isinstance(output_payload, Mapping):
             output_data = dict(output_payload)
@@ -620,6 +660,8 @@ def _counts_to_frame(
             config.chrom_column: normalize_chrom(chrom, prefix=False),
             config.position_column: positions,
             config.source_variant_id_column: source_variant_ids,
+            "ref": [str(value) for value in reference["ref"]],
+            "alt": [str(value) for value in reference["alt"]],
             config.pooled_maf_column: pooled_maf,
         }
     )
@@ -644,14 +686,26 @@ def _read_variant_reference(
     positions = np.asarray(info["pos"], dtype=np.int64)
     if positions.size == 0:
         raise ValueError(f"HapStore chromosome {chrom_key} contains zero variants")
-    if positions.size > 1 and not bool(np.all(positions[1:] >= positions[:-1])):
-        raise ValueError(f"HapStore chromosome {chrom_key} positions are not sorted")
+    if positions.size > 1 and not bool(np.all(positions[1:] > positions[:-1])):
+        raise ValueError(
+            f"HapStore chromosome {chrom_key} positions must be strictly increasing; "
+            "duplicate positions are incompatible with chr:pos causal IDs"
+        )
+    ref = [str(value) for value in info["ref"]]
+    alt = [str(value) for value in info["alt"]]
+    if len(ref) != int(positions.shape[0]) or len(alt) != int(positions.shape[0]):
+        raise ValueError(f"HapStore chromosome {chrom_key} REF/ALT arrays are not length-aligned")
     vid = info.get("vid")
     if vid is None or len(vid) != int(positions.shape[0]):
         source_variant_ids = [f"{normalize_chrom(chrom, prefix=True)}:{int(pos)}" for pos in positions.tolist()]
     else:
         source_variant_ids = [str(value) for value in vid]
-    return {"positions": positions, "source_variant_ids": source_variant_ids}
+    return {
+        "positions": positions,
+        "source_variant_ids": source_variant_ids,
+        "ref": ref,
+        "alt": alt,
+    }
 
 
 def _validate_matching_variants(
@@ -664,6 +718,10 @@ def _validate_matching_variants(
         raise ValueError(f"HapStore variants do not match reference positions: {path}")
     if list(reference["source_variant_ids"]) != list(observed["source_variant_ids"]):
         raise ValueError(f"HapStore variants do not match reference source IDs: {path}")
+    if list(reference["ref"]) != list(observed["ref"]):
+        raise ValueError(f"HapStore variants do not match reference REF alleles: {path}")
+    if list(reference["alt"]) != list(observed["alt"]):
+        raise ValueError(f"HapStore variants do not match reference ALT alleles: {path}")
 
 
 def _store_refs_for_chrom(

@@ -37,9 +37,11 @@ class HapStoreAdapter:
             None if hapstore_cfg.store_path is None else Path(str(hapstore_cfg.store_path))
         )
         self.missing_sentinel = np.uint8(int(hapstore_cfg.missing_sentinel))
+        self.missing_policy = str(getattr(hapstore_cfg, "missing_policy", "error"))
         self.missing_fill_value = float(hapstore_cfg.missing_fill_value)
         self.io_threads = max(1, int(getattr(hapstore_cfg, "io_threads", 1) or 1))
         self.last_export_allele_by_variant: dict[str, str] = {}
+        self.last_export_other_allele_by_variant: dict[str, str] = {}
         self._cache_lock = threading.Lock()
         self._store_cache: dict[tuple[str, int], object] = {}
         self._sample_index_cache: dict[tuple[str, int], dict[str, int]] = {}
@@ -124,9 +126,10 @@ class HapStoreAdapter:
             raise ValueError(
                 f"HapStore variant metadata length mismatch for population={population} chrom={chrom}"
             )
-        if pos.shape[0] > 1 and not bool(np.all(pos[1:] >= pos[:-1])):
+        if pos.shape[0] > 1 and not bool(np.all(pos[1:] > pos[:-1])):
             raise ValueError(
-                f"HapStore positions are not sorted for population={population} chrom={chrom}"
+                f"HapStore positions must be strictly increasing for population={population} "
+                f"chrom={chrom}; duplicate positions are incompatible with chr:pos IDs"
             )
         out = (pos, ref, alt)
         with self._cache_lock:
@@ -146,15 +149,16 @@ class HapStoreAdapter:
             )
         return int(match.group("chrom")), int(match.group("pos"))
 
-    def _resolve_indices_and_alt(
+    def _resolve_indices_and_alleles(
         self,
         *,
         population: str,
         chrom: int,
         variant_ids: list[str],
-    ) -> tuple[list[int], list[str]]:
-        pos_array, _, alt_array = self._get_variant_arrays(population, chrom)
+    ) -> tuple[list[int], list[str], list[str]]:
+        pos_array, ref_array, alt_array = self._get_variant_arrays(population, chrom)
         resolved_idx: list[int] = []
+        resolved_ref: list[str] = []
         resolved_alt: list[str] = []
         for variant_id in variant_ids:
             _, pos = self._parse_variant_id(variant_id)
@@ -164,13 +168,15 @@ class HapStoreAdapter:
                     f"Variant {variant_id} not found in HapStore for population={population} chrom={chrom}"
                 )
             alt = str(alt_array[idx])
-            if alt in {"", "."}:
+            ref = str(ref_array[idx])
+            if ref in {"", "."} or alt in {"", "."}:
                 raise ValueError(
-                    f"Missing ALT allele in HapStore for variant {variant_id} population={population}"
+                    f"Missing REF/ALT allele in HapStore for variant {variant_id} population={population}"
                 )
             resolved_idx.append(idx)
+            resolved_ref.append(ref)
             resolved_alt.append(alt)
-        return resolved_idx, resolved_alt
+        return resolved_idx, resolved_ref, resolved_alt
 
     def _resolve_sample_indices(
         self,
@@ -393,7 +399,7 @@ class HapStoreAdapter:
         sample_populations: List[str],
         variant_ids: List[str],
         kind: str,
-    ) -> tuple[np.ndarray, dict[str, str]]:
+    ) -> tuple[np.ndarray, dict[str, str], dict[str, str]]:
         pop_rows, variant_by_chrom, col_index = self._variant_layout(
             sample_ids=sample_ids,
             sample_populations=sample_populations,
@@ -401,6 +407,7 @@ class HapStoreAdapter:
         )
         export_t0 = time.perf_counter()
         allele_by_variant: dict[str, str] = {}
+        other_allele_by_variant: dict[str, str] = {}
 
         if kind == "genotypes":
             out = np.zeros((len(sample_ids), len(variant_ids)), dtype=np.uint8)
@@ -437,12 +444,14 @@ class HapStoreAdapter:
                 float(time.perf_counter() - export_t0),
             )
 
-            def _work(chrom_item: tuple[int, list[str]]) -> tuple[int, list[str], np.ndarray, list[str]]:
+            def _work(
+                chrom_item: tuple[int, list[str]],
+            ) -> tuple[int, list[str], np.ndarray, list[str], list[str]]:
                 chrom, chrom_variant_ids = chrom_item
                 store = self._open_store(population, chrom)
                 idx_map = self._get_sample_index_map(population, chrom)
                 sample_indices = self._resolve_sample_indices(population, chrom, cohort_iids)
-                variant_indices, alt_alleles = self._resolve_indices_and_alt(
+                variant_indices, ref_alleles, alt_alleles = self._resolve_indices_and_alleles(
                     population=population,
                     chrom=chrom,
                     variant_ids=chrom_variant_ids,
@@ -471,16 +480,16 @@ class HapStoreAdapter:
                         ),
                         max_slice_variants=int(getattr(self.cfg, "max_slice_variants", 0) or 0),
                     )
-                return chrom, chrom_variant_ids, block, alt_alleles
+                return chrom, chrom_variant_ids, block, ref_alleles, alt_alleles
 
             threads = self._effective_io_threads(len(variant_by_chrom))
             items = list(variant_by_chrom.items())
-            results: list[tuple[int, list[str], np.ndarray, list[str]]] = []
+            results: list[tuple[int, list[str], np.ndarray, list[str], list[str]]] = []
             if threads <= 1 or len(items) <= 1:
                 for item in items:
                     result = _work(item)
                     results.append(result)
-                    chrom, chrom_variant_ids, _, _ = result
+                    chrom, chrom_variant_ids, _, _, _ = result
                     completed_groups += 1
                     logger.info(
                         "[hapstore-export-array] chromosome-done kind=%s population=%s chrom=%s variants=%d completed_groups=%d/%d population_elapsed_seconds=%.3f total_elapsed_seconds=%.3f",
@@ -496,10 +505,12 @@ class HapStoreAdapter:
             else:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=int(threads)) as ex:
                     future_map = {ex.submit(_work, item): item[0] for item in items}
-                    done_by_chrom: dict[int, tuple[int, list[str], np.ndarray, list[str]]] = {}
+                    done_by_chrom: dict[
+                        int, tuple[int, list[str], np.ndarray, list[str], list[str]]
+                    ] = {}
                     for future in concurrent.futures.as_completed(future_map):
                         result = future.result()
-                        chrom, chrom_variant_ids, _, _ = result
+                        chrom, chrom_variant_ids, _, _, _ = result
                         done_by_chrom[int(chrom)] = result
                         completed_groups += 1
                         logger.info(
@@ -515,14 +526,23 @@ class HapStoreAdapter:
                         )
                     results = [done_by_chrom[int(chrom)] for chrom, _ in items]
 
-            for _, chrom_variant_ids, block, alt_alleles in results:
-                for variant_id, alt in zip(chrom_variant_ids, alt_alleles):
+            for _, chrom_variant_ids, block, ref_alleles, alt_alleles in results:
+                for variant_id, ref, alt in zip(
+                    chrom_variant_ids, ref_alleles, alt_alleles, strict=True
+                ):
                     prev = allele_by_variant.get(variant_id)
                     if prev is None:
                         allele_by_variant[variant_id] = alt
                     elif prev != alt:
                         raise ValueError(
                             f"ALT allele mismatch across populations for {variant_id}: {prev} vs {alt}"
+                        )
+                    prev_ref = other_allele_by_variant.get(variant_id)
+                    if prev_ref is None:
+                        other_allele_by_variant[variant_id] = ref
+                    elif prev_ref != ref:
+                        raise ValueError(
+                            f"REF allele mismatch across populations for {variant_id}: {prev_ref} vs {ref}"
                         )
                 cols = np.asarray([col_index[v] for v in chrom_variant_ids], dtype=np.int64)
                 if kind == "genotypes":
@@ -551,7 +571,7 @@ class HapStoreAdapter:
             float(time.perf_counter() - export_t0),
         )
 
-        return out, allele_by_variant
+        return out, allele_by_variant, other_allele_by_variant
 
     def export_dosages(
         self,
@@ -564,18 +584,31 @@ class HapStoreAdapter:
         """Export additive dosages for requested variants from HapStore."""
         del out_dir
         del chromosomes
-        geno_u8, allele_by_variant = self._export_variant_array(
+        geno_u8, allele_by_variant, other_allele_by_variant = self._export_variant_array(
             sample_ids=sample_ids,
             sample_populations=sample_populations,
             variant_ids=variant_ids,
             kind="genotypes",
         )
+        missing_count = int(np.count_nonzero(geno_u8 == self.missing_sentinel))
+        if missing_count and self.missing_policy == "error":
+            raise ValueError(
+                f"HapStore dosage export encountered {missing_count} missing genotype values; "
+                "set genotype_input.hapstore.missing_policy=fill to opt in to replacement"
+            )
         dosage = geno_u8.astype(np.float32)
-        dosage[geno_u8 == self.missing_sentinel] = np.float32(self.missing_fill_value)
+        if missing_count:
+            logger.warning(
+                "HapStore dosage export replacing %d missing values with %s",
+                missing_count,
+                self.missing_fill_value,
+            )
+            dosage[geno_u8 == self.missing_sentinel] = np.float32(self.missing_fill_value)
         out = pd.DataFrame(dosage, columns=variant_ids, copy=False)
         out.insert(0, "IID", sample_ids)
         out.insert(0, "FID", sample_ids)
         self.last_export_allele_by_variant = allele_by_variant
+        self.last_export_other_allele_by_variant = other_allele_by_variant
         return out
 
     def export_genotypes_u8(
@@ -588,21 +621,35 @@ class HapStoreAdapter:
     ) -> np.ndarray:
         """Export additive genotypes as uint8 matrix (n_samples, n_variants).
 
-        Values are in {0,1,2}, with missing mapped to 0.
+        Values are in {0,1,2}. Missing values fail by default and are replaced
+        only when ``missing_policy=fill`` is configured.
 
         Note: this avoids DataFrame construction + float conversions in export_dosages and is
         intended for high-throughput internal computations.
         """
         del out_dir
         del chromosomes
-        geno, allele_by_variant = self._export_variant_array(
+        geno, allele_by_variant, other_allele_by_variant = self._export_variant_array(
             sample_ids=sample_ids,
             sample_populations=sample_populations,
             variant_ids=variant_ids,
             kind="genotypes",
         )
-        geno = np.where(geno == self.missing_sentinel, np.uint8(0), geno).astype(np.uint8, copy=False)
+        missing_count = int(np.count_nonzero(geno == self.missing_sentinel))
+        if missing_count:
+            if self.missing_policy == "error":
+                raise ValueError(
+                    f"HapStore genotype export encountered {missing_count} missing values; "
+                    "set genotype_input.hapstore.missing_policy=fill to opt in to replacement"
+                )
+            fill = float(self.missing_fill_value)
+            if not fill.is_integer() or int(fill) not in {0, 1, 2}:
+                raise ValueError("missing_fill_value must be one of {0,1,2} for uint8 genotype export")
+            logger.warning("HapStore genotype export replacing %d missing values with %d", missing_count, int(fill))
+            geno = np.where(geno == self.missing_sentinel, np.uint8(int(fill)), geno)
+        geno = geno.astype(np.uint8, copy=False)
         self.last_export_allele_by_variant = allele_by_variant
+        self.last_export_other_allele_by_variant = other_allele_by_variant
         return geno
 
     def export_haplotypes(
@@ -615,19 +662,32 @@ class HapStoreAdapter:
     ) -> np.ndarray:
         """Export phased haplotypes for requested variants from HapStore.
 
-        Returns a uint8 array of shape (n_samples, n_variants, 2) with values in {0,1}
-        and missing values mapped to 0.
+        Returns a uint8 array of shape (n_samples, n_variants, 2) with values in
+        {0,1}. Missing values fail by default.
         """
         del out_dir
         del chromosomes
-        hap, allele_by_variant = self._export_variant_array(
+        hap, allele_by_variant, other_allele_by_variant = self._export_variant_array(
             sample_ids=sample_ids,
             sample_populations=sample_populations,
             variant_ids=variant_ids,
             kind="haplotypes",
         )
-        hap = np.where(hap == self.missing_sentinel, np.uint8(0), hap).astype(np.uint8, copy=False)
+        missing_count = int(np.count_nonzero(hap == self.missing_sentinel))
+        if missing_count:
+            if self.missing_policy == "error":
+                raise ValueError(
+                    f"HapStore haplotype export encountered {missing_count} missing values; "
+                    "set genotype_input.hapstore.missing_policy=fill to opt in to replacement"
+                )
+            fill = float(self.missing_fill_value)
+            if not fill.is_integer() or int(fill) not in {0, 1}:
+                raise ValueError("missing_fill_value must be one of {0,1} for uint8 haplotype export")
+            logger.warning("HapStore haplotype export replacing %d missing values with %d", missing_count, int(fill))
+            hap = np.where(hap == self.missing_sentinel, np.uint8(int(fill)), hap)
+        hap = hap.astype(np.uint8, copy=False)
         self.last_export_allele_by_variant = allele_by_variant
+        self.last_export_other_allele_by_variant = other_allele_by_variant
         return hap
 
     def _allocate_variant_counts(

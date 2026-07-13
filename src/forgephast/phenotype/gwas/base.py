@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List
 
+from hapstore.ids import read_sample_ids
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,33 @@ class GwasEngine(ABC):
         """Execute one GWAS task."""
 
 
+def validate_gwas_task_sample_ids(task: GwasTask) -> None:
+    covariate_path = task.merged_covariates_file or task.covariates_file
+    sources = {
+        "pgen_psam": f"{task.pgen_prefix}.psam",
+        "keep_file": task.keep_file,
+        "phenotype_file": task.phenotype_file,
+        "covariates_file": covariate_path,
+    }
+    ids_by_source: dict[str, list[str]] = {}
+    for source, path in sources.items():
+        ids = [str(value) for value in read_sample_ids(path)]
+        if len(ids) != len(set(ids)):
+            raise ValueError(f"GWAS {source} contains duplicate sample IDs: {path}")
+        if not ids:
+            raise ValueError(f"GWAS {source} contains zero sample IDs: {path}")
+        ids_by_source[source] = ids
+
+    reference = set(ids_by_source["pgen_psam"])
+    for source, ids in ids_by_source.items():
+        observed = set(ids)
+        if observed != reference:
+            raise ValueError(
+                f"GWAS sample set mismatch for {source}: "
+                f"missing={sorted(reference - observed)[:10]}, extra={sorted(observed - reference)[:10]}"
+            )
+
+
 def merge_covariates_for_gwas(
     covariates_file: str,
     pcs_file: str,
@@ -88,13 +117,45 @@ def merge_covariates_for_gwas(
             )
         for id_col in ("FID", "IID"):
             df[id_col] = df[id_col].astype("string").fillna("").str.strip()
+            if df[id_col].eq("").any():
+                rows = df.index[df[id_col].eq("")].tolist()[:10]
+                raise ValueError(f"{df_name} file has blank {id_col} values at rows {rows}")
+        if df["IID"].duplicated(keep=False).any():
+            duplicate_ids = df.loc[df["IID"].duplicated(keep=False), "IID"].unique().tolist()
+            raise ValueError(f"{df_name} file has duplicate IID values: {duplicate_ids[:10]}")
 
-    merged = cov_df.merge(pcs_df, on=["FID", "IID"], how="inner", suffixes=("", "_pcs"))
-    if merged.empty:
-        pcs_iid = pcs_df.drop(columns=["FID"], errors="ignore").drop_duplicates(subset=["IID"])
-        merged = cov_df.merge(pcs_iid, on=["IID"], how="inner", suffixes=("", "_pcs"))
-    if merged.empty:
-        raise ValueError("covariate/PC merge is empty")
+    cov_iids = set(cov_df["IID"])
+    pcs_iids = set(pcs_df["IID"])
+    if cov_iids != pcs_iids:
+        missing_in_pcs = sorted(cov_iids - pcs_iids)[:10]
+        missing_in_covariates = sorted(pcs_iids - cov_iids)[:10]
+        raise ValueError(
+            "covariate and PC sample sets differ: "
+            f"missing_in_pcs={missing_in_pcs}, missing_in_covariates={missing_in_covariates}"
+        )
+
+    cov_pairs = set(zip(cov_df["FID"], cov_df["IID"]))
+    pcs_pairs = set(zip(pcs_df["FID"], pcs_df["IID"]))
+    if cov_pairs == pcs_pairs:
+        merged = cov_df.merge(
+            pcs_df,
+            on=["FID", "IID"],
+            how="inner",
+            suffixes=("", "_pcs"),
+            validate="one_to_one",
+        )
+    else:
+        merged = cov_df.merge(
+            pcs_df.drop(columns=["FID"]),
+            on=["IID"],
+            how="inner",
+            suffixes=("", "_pcs"),
+            validate="one_to_one",
+        )
+    if len(merged) != len(cov_df):
+        raise RuntimeError(
+            f"covariate/PC merge changed row count: covariates={len(cov_df)}, merged={len(merged)}"
+        )
 
     if "age" in merged.columns and "age_centered" in merged.columns:
         logger.info("Dropping raw age from GWAS covariates because age_centered is present")

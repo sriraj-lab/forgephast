@@ -214,6 +214,52 @@ def test_export_manifest_pgens_updates_manifest(monkeypatch, tmp_path: Path) -> 
     assert ensured.loc[0, "pgen_filter_mode"] == "native_hapstore"
 
 
+def test_export_manifest_pgens_rebuilds_when_disk_identity_mismatches(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cfg = RunConfig.from_dict(_payload(tmp_path))
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    truth_dir = run_dir / "truth"
+    truth_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "causal_id": ["chr1:10"],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+        }
+    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+    manifest_path = run_dir / "run_manifest.tsv"
+    pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "pgen_prefix": [""],
+        }
+    ).to_csv(manifest_path, sep="\t", index=False)
+
+    fake = _FakeAdapter()
+    monkeypatch.setattr(
+        "forgephast.phenotype.data.pgen_export.build_genotype_adapter",
+        lambda **_: fake,
+    )
+
+    first_manifest = pd.read_csv(export_manifest_pgens(cfg, manifest_path), sep="\t")
+    chrom_prefix = Path(json.loads(first_manifest.loc[0, "chrom_pgen_manifest"])["1"])
+    assert len(fake.calls) == 1
+
+    export_manifest_pgens(cfg, manifest_path)
+    assert len(fake.calls) == 1
+
+    Path(f"{chrom_prefix}.forgephast.json").write_text(
+        '{"schema_version": 1, "artifact_key": "wrong"}\n', encoding="utf-8"
+    )
+    export_manifest_pgens(cfg, manifest_path)
+    assert len(fake.calls) == 2
+
+
 def test_export_manifest_pgens_can_preserve_unfiltered_native_output(
     monkeypatch, tmp_path: Path
 ) -> None:

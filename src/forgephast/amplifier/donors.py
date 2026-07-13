@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 
+from .._internal.cache import canonical_hash
 from .config import RunConfig
 from .utils import apply_selector, ensure_dir, read_table
 
@@ -20,10 +23,49 @@ class Manifest:
     donor_weights_by_population: dict[str, dict[str, float]]
 
 
+def _input_fingerprint(path_value: str | None) -> dict[str, object] | None:
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    stat = path.stat()
+    return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _manifest_identity(config: RunConfig) -> str:
+    return canonical_hash(
+        {
+            "input": asdict(config.input),
+            "populations": [asdict(population) for population in config.populations],
+            "metadata": _input_fingerprint(config.input.metadata_path),
+            "allowed_samples": _input_fingerprint(config.input.allowed_samples_path),
+        }
+    )
+
+
+def _atomic_to_csv(frame: pd.DataFrame, path: Path) -> None:
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        frame.to_csv(tmp_path, sep="\t", index=False)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _atomic_write_text(value: str, path: Path) -> None:
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(value, encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 
 def build_manifest_from_config(config: RunConfig) -> Manifest:
     run_root = ensure_dir(config.run_root)
     out_dir = ensure_dir(run_root / "manifests")
+    identity_path = out_dir / "donor_manifest.forgephast.json"
+    identity_path.unlink(missing_ok=True)
 
     metadata = read_table(config.input.metadata_path, sep=config.input.metadata_sep)
     if config.input.sample_id_column not in metadata.columns:
@@ -37,8 +79,15 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
 
     sample_col = config.input.sample_id_column
     pop_col = config.input.population_column
-    metadata[sample_col] = metadata[sample_col].astype(str).str.strip()
-    metadata[pop_col] = metadata[pop_col].astype(str).str.strip()
+    metadata[sample_col] = metadata[sample_col].astype("string").fillna("").str.strip()
+    metadata[pop_col] = metadata[pop_col].astype("string").fillna("").str.strip()
+    if metadata[sample_col].eq("").any() or metadata[pop_col].eq("").any():
+        raise ValueError("metadata contains blank sample or population identifiers")
+    if metadata[sample_col].duplicated(keep=False).any():
+        duplicate_ids = metadata.loc[
+            metadata[sample_col].duplicated(keep=False), sample_col
+        ].unique().tolist()
+        raise ValueError(f"metadata contains duplicate sample IDs: {duplicate_ids[:10]}")
 
     allowed: set[str] | None = None
     if config.input.allowed_samples_path:
@@ -47,7 +96,9 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
             header=None,
             dtype=str,
         ).iloc[:, 0]
-        allowed = set(allowed_series.astype(str).str.strip())
+        allowed = set(allowed_series.astype("string").fillna("").str.strip())
+        if "" in allowed:
+            raise ValueError("allowed_samples_path contains blank sample IDs")
 
     donor_rows: list[dict[str, object]] = []
     donor_files: dict[str, Path] = {}
@@ -111,9 +162,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
             source_value_by_donor = {}
 
         donor_file = out_dir / f"donors_{pop.name}.txt"
-        with open(donor_file, "w", encoding="utf-8") as handle:
-            for sid in donors:
-                handle.write(f"{sid}\n")
+        _atomic_write_text("".join(f"{sid}\n" for sid in donors), donor_file)
 
         donor_files[pop.name] = donor_file
         donors_by_population[pop.name] = donors
@@ -124,6 +173,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
                 "population": pop.name,
                 "source_value": source_value_by_donor.get(sid, ""),
                 "sampling_weight": float(weights_by_donor.get(sid, 0.0)),
+                "donor_only": bool(pop.donor_only),
             }
             for sid in donors
         )
@@ -147,18 +197,37 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
             .sort_values(["population", "sample_id"])
         )
     else:
-        manifest_df = pd.DataFrame(columns=["sample_id", "population", "source_value", "sampling_weight"])
+        manifest_df = pd.DataFrame(
+            columns=["sample_id", "population", "source_value", "sampling_weight", "donor_only"]
+        )
     manifest_path = out_dir / "donor_manifest.tsv"
-    manifest_df.to_csv(manifest_path, sep="\t", index=False)
+    _atomic_to_csv(manifest_df, manifest_path)
 
     counts_df = pd.DataFrame(
         [
-            {"population": pop.name, "n_donors": len(donors_by_population.get(pop.name, []))}
+            {
+                "population": pop.name,
+                "n_donors": len(donors_by_population.get(pop.name, [])),
+                "donor_only": bool(pop.donor_only),
+            }
             for pop in config.populations
         ]
     ).sort_values("population")
     donor_counts_path = out_dir / "donor_counts.tsv"
-    counts_df.to_csv(donor_counts_path, sep="\t", index=False)
+    _atomic_to_csv(counts_df, donor_counts_path)
+    _atomic_write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "manifest_identity": _manifest_identity(config),
+                "n_manifest_rows": int(len(manifest_df)),
+                "populations": sorted(pop.name for pop in config.populations),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        identity_path,
+    )
 
     return Manifest(
         manifest_path=manifest_path,
@@ -174,11 +243,41 @@ def load_manifest(config: RunConfig) -> Manifest:
     out_dir = config.run_root / "manifests"
     manifest_path = out_dir / "donor_manifest.tsv"
     donor_counts_path = out_dir / "donor_counts.tsv"
-    if not manifest_path.exists() or not donor_counts_path.exists():
+    identity_path = out_dir / "donor_manifest.forgephast.json"
+    try:
+        identity_payload = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        identity_payload = {}
+    if (
+        not manifest_path.exists()
+        or not donor_counts_path.exists()
+        or identity_payload.get("schema_version") != 1
+        or identity_payload.get("manifest_identity") != _manifest_identity(config)
+    ):
         return build_manifest_from_config(config)
 
     manifest_df = pd.read_csv(manifest_path, sep="\t", dtype=str)
     counts_df = pd.read_csv(donor_counts_path, sep="\t")
+    required_manifest_columns = {"sample_id", "population", "sampling_weight", "donor_only"}
+    if not required_manifest_columns.issubset(manifest_df.columns):
+        raise ValueError(
+            f"donor manifest is missing required columns: {sorted(required_manifest_columns - set(manifest_df.columns))}"
+        )
+    if not {"population", "n_donors"}.issubset(counts_df.columns):
+        raise ValueError("donor counts file is missing population or n_donors")
+    for column in ("sample_id", "population"):
+        manifest_df[column] = manifest_df[column].astype("string").fillna("").str.strip()
+    if manifest_df[["sample_id", "population"]].eq("").any().any():
+        raise ValueError("donor manifest contains blank sample or population identifiers")
+    if manifest_df.duplicated(subset=["sample_id", "population"], keep=False).any():
+        raise ValueError("donor manifest contains duplicate sample/population rows")
+    configured_populations = {population.name for population in config.populations}
+    counted_populations = set(counts_df["population"].astype(str))
+    if counted_populations != configured_populations:
+        raise ValueError(
+            "donor counts populations do not match config: "
+            f"configured={sorted(configured_populations)}, observed={sorted(counted_populations)}"
+        )
     donors_by_population: dict[str, list[str]] = {}
     donor_files: dict[str, Path] = {}
     donor_weights_by_population: dict[str, dict[str, float]] = {}

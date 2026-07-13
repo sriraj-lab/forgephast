@@ -31,6 +31,8 @@ class FakeStore:
         return {
             "pos": np.asarray(self._positions, dtype=np.int64),
             "vid": list(self._vids),
+            "ref": ["A"] * len(self._positions),
+            "alt": ["G"] * len(self._positions),
         }
 
     def genotypes(self, chrom, variant_slice=None, sample_mask=None):
@@ -210,3 +212,29 @@ def test_build_source_pairs_raises_when_selected_sample_missing(tmp_path: Path) 
 
     with pytest.raises(ValueError, match="missing 1 selected sample"):
         build_source_pairs_from_hapstore(config, opener=lambda path: {store_path: store}[path])
+
+
+def test_source_pair_config_rejects_unknown_keys(tmp_path: Path) -> None:
+    sample_path = _write_samples(tmp_path)
+    payload = _base_payload(tmp_path, sample_path)
+    payload["source_pairs"]["variant_blok_size"] = 10
+    with pytest.raises(ValueError, match="Unknown source_pairs config key"):
+        SourcePairBuildConfig.from_dict(payload)
+
+
+def test_source_pairs_reject_duplicate_positions(tmp_path: Path) -> None:
+    sample_path = _write_samples(tmp_path)
+    config = SourcePairBuildConfig.from_dict(_base_payload(tmp_path, sample_path))
+    store_path = tmp_path / "stores" / "chr1.hapstore.zarr"
+    store = FakeStore(
+        sample_ids=["s1", "s2", "s3"],
+        positions=[10, 10],
+        vids=["rs10a", "rs10b"],
+        genotypes=[[0, 1], [2, 1], [0, 0]],
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        build_source_pairs_from_hapstore(
+            config,
+            opener=lambda path: {store_path: store}[path],
+        )

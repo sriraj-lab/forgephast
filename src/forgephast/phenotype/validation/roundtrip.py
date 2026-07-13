@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from hapstore.ids import align_by_ids, read_sample_ids
 
+from ...local_ancestry.source import LocalAncestrySource
 from ..config import CohortConfig, RunConfig
 from ..local_ancestry.tracts import load_tracts_tsv_gz
 
@@ -125,11 +126,40 @@ def _admix_population_mass(
 ) -> Dict[str, float]:
     if not admix_sample_ids:
         return {}
-    if not cohort.local_ancestry_tracts_pattern:
+    if not cohort.local_ancestry_tracts_pattern and not cohort.local_ancestry_source_pattern:
         return {}
 
     ancestry_bp: Dict[str, float] = {}
     for chrom in run_cfg.chromosomes:
+        if cohort.local_ancestry_source_pattern:
+            pattern = str(cohort.local_ancestry_source_pattern)
+            source_path = Path(pattern.format(chrom=int(chrom))) if "{chrom}" in pattern else Path(pattern)
+            source = LocalAncestrySource.open(source_path)
+            source_index = {sample_id: idx for idx, sample_id in enumerate(source.sample_ids)}
+            missing_ids = sorted(set(admix_sample_ids).difference(source_index))
+            if missing_ids:
+                raise ValueError(
+                    f"cohort {cohort.name}: local ancestry source missing admixed samples: "
+                    f"{missing_ids[:5]}"
+                )
+            selected = {int(source_index[sample_id]) for sample_id in admix_sample_ids}
+            label_map = dict(run_cfg.local_ancestry.label_map)
+            for hap_idx, sample_idx in enumerate(source.hap_sample_index):
+                if int(sample_idx) not in selected:
+                    continue
+                start = int(source.hap_offsets[hap_idx])
+                end = int(source.hap_offsets[hap_idx + 1])
+                for tract_idx in range(start, end):
+                    raw_label = source.ancestry_order[int(source.source_code[tract_idx])]
+                    label = str(label_map.get(raw_label, raw_label))
+                    span = max(
+                        0,
+                        int(source.tract_end_bp[tract_idx])
+                        - int(source.tract_start_bp[tract_idx]),
+                    )
+                    ancestry_bp[label] = ancestry_bp.get(label, 0.0) + float(span)
+            continue
+
         pattern = str(cohort.local_ancestry_tracts_pattern)
         tracts_path = Path(pattern.format(chrom=int(chrom))) if "{chrom}" in pattern else Path(pattern)
         tracts = load_tracts_tsv_gz(
@@ -205,7 +235,9 @@ def _weighted_truth_effects(
         & (truth_df["cohort"] == str(cohort))
     ].copy()
     if rows.empty:
-        return pd.DataFrame(columns=["variant_id", "beta_true", "dosage_effect_allele"])
+        return pd.DataFrame(
+            columns=["variant_id", "beta_true", "dosage_effect_allele", "dosage_other_allele"]
+        )
 
     pivot = rows.pivot_table(
         index="variant_id",
@@ -228,11 +260,22 @@ def _weighted_truth_effects(
         .agg(lambda s: s.dropna().astype(str).iloc[0] if not s.dropna().empty else "")
         .to_dict()
     )
+    if "dosage_other_allele" in rows.columns:
+        other_allele_map = (
+            rows.groupby("variant_id")["dosage_other_allele"]
+            .agg(lambda s: s.dropna().astype(str).iloc[0] if not s.dropna().empty else "")
+            .to_dict()
+        )
+    else:
+        other_allele_map = {}
     out = pd.DataFrame(
         {
             "variant_id": pivot.index.astype(str).tolist(),
             "beta_true": beta_true,
             "dosage_effect_allele": [allele_map.get(str(v), "") for v in pivot.index.tolist()],
+            "dosage_other_allele": [
+                other_allele_map.get(str(v), "") for v in pivot.index.tolist()
+            ],
         }
     )
     return out
@@ -289,10 +332,21 @@ def merge_assoc_truth_effects(
     allele_present = (
         merged["gwas_effect_allele"].astype(str) != ""
     ) & (merged["dosage_effect_allele"].astype(str) != "")
-    flip_mask = allele_present & (
-        merged["gwas_effect_allele"].astype(str).str.upper()
-        != merged["dosage_effect_allele"].astype(str).str.upper()
-    )
+    gwas_allele = merged["gwas_effect_allele"].astype(str).str.upper()
+    effect_allele = merged["dosage_effect_allele"].astype(str).str.upper()
+    other_allele = merged["dosage_other_allele"].astype(str).str.upper()
+    same_mask = allele_present & (gwas_allele == effect_allele)
+    flip_mask = allele_present & (other_allele != "") & (gwas_allele == other_allele)
+    mismatch_mask = allele_present & ~(same_mask | flip_mask)
+    if bool(mismatch_mask.any()):
+        mismatches = merged.loc[
+            mismatch_mask,
+            ["variant_id", "gwas_effect_allele", "dosage_effect_allele", "dosage_other_allele"],
+        ].head(5)
+        raise ValueError(
+            "GWAS alleles do not match simulated REF/ALT identity: "
+            f"{mismatches.to_dict(orient='records')}"
+        )
     merged.loc[flip_mask, "beta_hat_harmonized"] *= -1.0
     return merged
 
@@ -520,6 +574,11 @@ def collect_roundtrip_details(
             truth_weighted["binary_validation_scale"] = float(
                 scale_metadata["binary_validation_scale"]
             )
+            if not np.isfinite(float(scale_metadata["binary_validation_scale"])):
+                failures.append(
+                    f"Non-finite binary truth scale for engine={engine} rep={replicate} "
+                    f"arch={architecture} cohort={cohort_name}"
+                )
         membership_subset = _membership_subset(
             membership_df=membership_df,
             replicate=replicate,
@@ -546,6 +605,11 @@ def collect_roundtrip_details(
         causal_set = set(membership_subset["variant_id"].astype(str).tolist())
         assoc["is_causal"] = assoc["variant_id"].astype(str).isin(causal_set)
         merged = merge_assoc_truth_effects(assoc, truth_weighted)
+        truth_values = pd.to_numeric(truth_weighted.get("beta_true"), errors="coerce")
+        nonzero_truth = bool(
+            truth_values is not None
+            and np.any(np.isfinite(truth_values) & (np.abs(truth_values) > 0.0))
+        )
         if merged.empty:
             metrics = {
                 "run_name": str(row["run_name"]),
@@ -585,6 +649,11 @@ def collect_roundtrip_details(
                     metrics=metrics,
                 )
             )
+            if nonzero_truth:
+                failures.append(
+                    f"No harmonized causal overlap for engine={engine} rep={replicate} "
+                    f"arch={architecture} cohort={cohort_name}"
+                )
             continue
 
         slope, intercept, corr, sign = _linear_metrics(merged)
@@ -630,8 +699,36 @@ def collect_roundtrip_details(
             )
         )
 
+        if nonzero_truth and int(merged.shape[0]) < int(
+            run_cfg.roundtrip_validation.min_overlap_variants
+        ):
+            failures.append(
+                f"Insufficient causal overlap for engine={engine} rep={replicate} "
+                f"arch={architecture} cohort={cohort_name}: "
+                f"n_overlap={merged.shape[0]} "
+                f"minimum={run_cfg.roundtrip_validation.min_overlap_variants}"
+            )
+
+        if nonzero_truth and run_cfg.roundtrip_validation.require_finite_metrics:
+            nonfinite = [
+                name
+                for name in (
+                    "beta_slope",
+                    "beta_intercept",
+                    "beta_corr",
+                    "sign_concordance",
+                )
+                if not np.isfinite(metrics[name])
+            ]
+            if nonfinite:
+                failures.append(
+                    f"Non-finite round-trip metric(s) for engine={engine} rep={replicate} "
+                    f"arch={architecture} cohort={cohort_name}: {nonfinite}"
+                )
+
         if (
-            run_cfg.roundtrip_validation.require_positive_slope
+            nonzero_truth
+            and run_cfg.roundtrip_validation.require_positive_slope
             and np.isfinite(metrics["beta_slope"])
             and float(metrics["beta_slope"]) <= 0.0
         ):

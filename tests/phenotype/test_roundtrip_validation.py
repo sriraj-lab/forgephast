@@ -6,7 +6,9 @@ import gzip
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
+from forgephast.local_ancestry.source import LocalAncestryTract, write_local_ancestry_source
 from forgephast.phenotype.config import RunConfig
 from forgephast.phenotype.validation.roundtrip import (
     _linear_metrics,
@@ -106,6 +108,7 @@ def test_build_roundtrip_report_harmonizes_allele_and_computes_metrics(tmp_path:
             "population": ["EUR", "EUR", "AFR", "AFR"],
             "beta": [0.5, -0.4, 0.5, -0.4],
             "dosage_effect_allele": ["A", "G", "A", "G"],
+            "dosage_other_allele": ["C", "A", "C", "A"],
             "architecture": ["a1", "a1", "a1", "a1"],
             "cohort": ["c1", "c1", "c1", "c1"],
             "replicate": [1, 1, 1, 1],
@@ -176,6 +179,7 @@ def test_build_roundtrip_report_validates_binary_trait_on_log_odds_scale(tmp_pat
             "population": ["EUR", "EUR", "AFR", "AFR"],
             "beta": [0.4, -0.2, 0.4, -0.2],
             "dosage_effect_allele": ["A", "G", "A", "G"],
+            "dosage_other_allele": ["C", "A", "C", "A"],
             "architecture": ["a1", "a1", "a1", "a1"],
             "cohort": ["c1", "c1", "c1", "c1"],
             "replicate": [1, 1, 1, 1],
@@ -285,6 +289,45 @@ def test_population_weights_expand_admix_from_local_ancestry_tracts(tmp_path: Pa
     assert abs(weights["AFR"] - 0.4) < 1e-9
 
 
+def test_population_weights_expand_admix_from_local_ancestry_source(tmp_path: Path) -> None:
+    payload = _base_payload(tmp_path)
+    sample_ids = tmp_path / "samples_admix_source.txt"
+    sample_ids.write_text("eur1\nadm1\n", encoding="utf-8")
+    pop_map = tmp_path / "pop_admix_source.tsv"
+    pop_map.write_text("IID\tpopulation\neur1\tEUR\nadm1\tADMIX\n", encoding="utf-8")
+    source_path = tmp_path / "chr1.local_ancestry.zarr"
+    write_local_ancestry_source(
+        source_path,
+        sample_ids=["adm1"],
+        tracts_by_sample_hap={
+            ("adm1", 0): [
+                LocalAncestryTract(0, 40, "EUR"),
+                LocalAncestryTract(40, 100, "AFR"),
+            ],
+            ("adm1", 1): [LocalAncestryTract(0, 100, "AFR")],
+        },
+        ancestry_order=["EUR", "AFR"],
+        chrom=1,
+    )
+    payload["cohorts"][0]["sample_ids_file"] = str(sample_ids)
+    payload["cohorts"][0]["population_map_file"] = str(pop_map)
+    payload["cohorts"][0]["local_ancestry_source_pattern"] = str(source_path)
+    payload["chromosomes"] = [1]
+    payload["local_ancestry"] = {
+        "enabled": True,
+        "mode": "source_zarr",
+        "ancestry_order": ["EUR", "AFR"],
+        "label_map": {},
+    }
+
+    cfg = RunConfig.from_dict(payload)
+    weights = _population_weights(cfg.cohorts[0], ["eur1", "adm1"], cfg)
+
+    assert set(weights) == {"EUR", "AFR"}
+    assert abs(weights["EUR"] - 0.6) < 1e-9
+    assert abs(weights["AFR"] - 0.4) < 1e-9
+
+
 def test_linear_metrics_returns_nan_for_degenerate_null_fit() -> None:
     merged = pd.DataFrame(
         {
@@ -315,6 +358,7 @@ def test_build_roundtrip_report_ids_only_reuses_base_truth(tmp_path: Path) -> No
             "population": ["EUR", "EUR", "AFR", "AFR"],
             "beta": [0.5, -0.4, 0.5, -0.4],
             "dosage_effect_allele": ["A", "G", "A", "G"],
+            "dosage_other_allele": ["C", "A", "C", "A"],
             "architecture": ["a1", "a1", "a1", "a1"],
             "cohort": ["c1", "c1", "c1", "c1"],
             "replicate": [1, 1, 1, 1],
@@ -375,6 +419,7 @@ def test_build_roundtrip_report_regenie_resolves_assoc_output_and_parses_trait_s
             "population": ["EUR", "EUR", "AFR", "AFR"],
             "beta": [0.5, -0.4, 0.5, -0.4],
             "dosage_effect_allele": ["A", "G", "A", "G"],
+            "dosage_other_allele": ["C", "A", "C", "A"],
             "architecture": ["a1", "a1", "a1", "a1"],
             "cohort": ["c1", "c1", "c1", "c1"],
             "replicate": [1, 1, 1, 1],
@@ -425,3 +470,53 @@ def test_build_roundtrip_report_regenie_resolves_assoc_output_and_parses_trait_s
     assert int(report.loc[0, "n_assoc_variants"]) == 2
     assert int(report.loc[0, "n_overlap"]) == 2
     assert int(report.loc[0, "top_k_causal_count"]) == 2
+
+
+def test_roundtrip_fails_when_nonzero_truth_has_no_overlap(tmp_path: Path) -> None:
+    cfg = RunConfig.from_dict(_base_payload(tmp_path))
+    run_dir = Path(cfg.paths.output_root) / cfg.name
+    truth_dir = run_dir / "truth"
+    truth_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "variant_id": ["chr1:10", "chr1:20", "chr1:10", "chr1:20"],
+            "population": ["EUR", "EUR", "AFR", "AFR"],
+            "beta": [0.5, -0.4, 0.5, -0.4],
+            "dosage_effect_allele": ["A", "G", "A", "G"],
+            "dosage_other_allele": ["C", "A", "C", "A"],
+            "architecture": ["a1"] * 4,
+            "cohort": ["c1"] * 4,
+            "replicate": [1] * 4,
+        }
+    ).to_csv(truth_dir / "effect_sizes.tsv", sep="\t", index=False)
+    pd.DataFrame(
+        {
+            "causal_id": ["chr1:10", "chr1:20"],
+            "replicate": [1, 1],
+            "architecture": ["a1", "a1"],
+            "cohort": ["c1", "c1"],
+        }
+    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
+    assoc_path = run_dir / "assoc.tsv"
+    pd.DataFrame(
+        {"ID": ["chr1:30"], "A1": ["T"], "BETA": [0.1], "P": [0.5]}
+    ).to_csv(assoc_path, sep="\t", index=False)
+    manifest_path = run_dir / "gwas_manifest.tsv"
+    pd.DataFrame(
+        {
+            "run_name": [cfg.name],
+            "replicate": [1],
+            "architecture": ["a1"],
+            "cohort": ["c1"],
+            "engine": ["plink2"],
+            "status": ["success"],
+            "primary_output": [str(assoc_path)],
+        }
+    ).to_csv(manifest_path, sep="\t", index=False)
+
+    with pytest.raises(RuntimeError, match="No harmonized causal overlap"):
+        build_roundtrip_report(
+            run_cfg=cfg,
+            run_dir=run_dir,
+            gwas_manifest_path=manifest_path,
+        )

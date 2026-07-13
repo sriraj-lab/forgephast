@@ -80,6 +80,7 @@ def fake_adapter() -> HapStoreAdapter:
         root_dir="/tmp/hapstores",
         file_pattern="{population}/chr{chrom}.hapstore.zarr",
         missing_sentinel=255,
+        missing_policy="fill",
         missing_fill_value=0.25,
     )
     return HapStoreAdapter(cfg)
@@ -192,6 +193,11 @@ def test_export_dosages_reads_per_pop_per_chr_and_tracks_alt(fake_adapter: HapSt
         "chr1:30": "A",
         "chr2:15": "C",
     }
+    assert fake_adapter.last_export_other_allele_by_variant == {
+        "chr1:10": "A",
+        "chr1:30": "G",
+        "chr2:15": "T",
+    }
 
 
 def test_export_dosages_preserves_requested_sample_order(fake_adapter: HapStoreAdapter) -> None:
@@ -244,6 +250,7 @@ def test_export_haplotypes_reads_per_pop_per_chr(fake_adapter: HapStoreAdapter) 
 
 
 def test_export_genotypes_u8_matches_export_dosages(fake_adapter: HapStoreAdapter) -> None:
+    fake_adapter.missing_fill_value = 0.0
     stores = {
         ("EUR", 1): FakeStore(
             sample_ids=["id1", "id3"],
@@ -278,6 +285,35 @@ def test_export_genotypes_u8_matches_export_dosages(fake_adapter: HapStoreAdapte
     expected = dosage[["chr1:10", "chr1:30"]].to_numpy(dtype=np.float32, copy=False)
     expected[expected == np.float32(fake_adapter.missing_fill_value)] = 0.0
     assert np.array_equal(geno, expected.astype(np.uint8))
+
+
+def test_missing_genotypes_fail_without_explicit_fill_policy() -> None:
+    adapter = HapStoreAdapter(
+        HapStoreInputConfig(
+            root_dir="/tmp/hapstores",
+            file_pattern="{population}/chr{chrom}.hapstore.zarr",
+        )
+    )
+    _wire_fake_stores(
+        adapter,
+        {
+            ("EUR", 1): FakeStore(
+                sample_ids=["id1"],
+                positions=[10],
+                refs=["A"],
+                alts=["G"],
+                genotypes=[[255]],
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="missing genotype values"):
+        adapter.export_dosages(
+            sample_ids=["id1"],
+            sample_populations=["EUR"],
+            variant_ids=["chr1:10"],
+            out_dir=Path("/tmp"),
+        )
 
 
 def test_high_fraction_genotype_read_uses_contiguous_store_read(fake_adapter: HapStoreAdapter) -> None:

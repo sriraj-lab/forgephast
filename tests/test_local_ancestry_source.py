@@ -145,3 +145,42 @@ def test_source_object_errors_on_missing_coverage(tmp_path: Path) -> None:
             sample_ids=["s1"],
             positions_bp=np.asarray([10, 60], dtype=np.int64),
         )
+
+
+def test_source_writer_rejects_out_of_range_haplotype_index(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="outside"):
+        write_local_ancestry_source_from_tract_rows(
+            tmp_path / "bad.local_ancestry.zarr",
+            sample_ids=["s1"],
+            tract_rows=[
+                {
+                    "haplotype_index": 2,
+                    "start_bp": 0,
+                    "end_bp": 100,
+                    "source_population": "EUR",
+                }
+            ],
+            ancestry_order=["EUR"],
+            chrom=1,
+        )
+
+
+def test_source_open_rejects_invalid_offsets(tmp_path: Path) -> None:
+    source_path = tmp_path / "bad_offsets.local_ancestry.zarr"
+    write_local_ancestry_source(
+        source_path,
+        sample_ids=["s1"],
+        tracts_by_sample_hap={
+            ("s1", 0): [LocalAncestryTract(0, 100, "EUR")],
+            ("s1", 1): [LocalAncestryTract(0, 100, "EUR")],
+        },
+        ancestry_order=["EUR"],
+        chrom=1,
+    )
+    import zarr
+
+    group = zarr.open_group(str(source_path), mode="a")
+    group["hap_offsets"][:] = np.asarray([0, 2, 1], dtype=np.int64)
+
+    with pytest.raises(ValueError, match="hap_offsets"):
+        LocalAncestrySource.open(source_path)

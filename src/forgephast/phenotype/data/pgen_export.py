@@ -13,12 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
 from hapstore.ids import align_by_ids, read_sample_ids
 
 from ..._internal.cache import bump_counter, canonical_hash
+from ..._internal.resources import require_slurm_cpu_budget
 from ..config import CohortConfig, RunConfig
 from .genotypes import build_genotype_adapter
 from .global_pcs import normalize_psam_fid_column
@@ -50,6 +52,50 @@ class ExportArtifacts:
 def _pgen_triplet_exists(prefix: str | Path) -> bool:
     base = Path(prefix)
     return all(Path(f"{base}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
+
+
+def _pgen_metadata_path(prefix: str | Path) -> Path:
+    return Path(f"{Path(prefix)}.forgephast.json")
+
+
+def _remove_pgen_artifacts(prefix: str | Path) -> None:
+    base = Path(prefix)
+    for ext in (".pgen", ".pvar", ".psam", ".log", ".forgephast.json"):
+        Path(f"{base}{ext}").unlink(missing_ok=True)
+
+
+def _pgen_artifact_matches(prefix: str | Path, artifact_key: str) -> bool:
+    if not _pgen_triplet_exists(prefix):
+        return False
+    try:
+        payload = json.loads(_pgen_metadata_path(prefix).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return payload.get("schema_version") == 1 and payload.get("artifact_key") == artifact_key
+
+
+def _write_pgen_metadata(prefix: str | Path, artifact_key: str, *, kind: str) -> None:
+    if not _pgen_triplet_exists(prefix):
+        raise RuntimeError(f"Cannot mark incomplete PGEN artifact as complete: {prefix}")
+    base = Path(prefix)
+    path = _pgen_metadata_path(base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "artifact_key": str(artifact_key),
+        "kind": str(kind),
+        "prefix": str(base),
+        "sizes": {
+            ext.lstrip("."): Path(f"{base}{ext}").stat().st_size
+            for ext in (".pgen", ".pvar", ".psam")
+        },
+    }
+    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _normalize_fid_for_exported_pgen(path: str) -> None:
@@ -587,21 +633,24 @@ def _merge_filtered_chrom_pgens(
     chrom_prefixes: dict[int, str],
     out_prefix: Path,
     run_cfg: RunConfig,
+    artifact_key: str,
 ) -> str:
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     if not chrom_prefixes:
         raise ValueError("No chromosome-level PGEN prefixes available for merge")
 
     ordered = [Path(chrom_prefixes[chrom]) for chrom in sorted(chrom_prefixes)]
-    if _pgen_triplet_exists(out_prefix):
+    if bool(run_cfg.pgen_export.reuse_exports) and _pgen_artifact_matches(out_prefix, artifact_key):
         normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
         return str(out_prefix)
+    _remove_pgen_artifacts(out_prefix)
 
     if len(ordered) == 1:
         src = ordered[0]
         for ext in (".pgen", ".pvar", ".psam"):
             shutil.copy2(f"{src}{ext}", f"{out_prefix}{ext}")
         normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
+        _write_pgen_metadata(out_prefix, artifact_key, kind="merged")
         return str(out_prefix)
 
     with tempfile.NamedTemporaryFile(
@@ -643,17 +692,24 @@ def _merge_filtered_chrom_pgens(
         merge_list.unlink(missing_ok=True)
 
     normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
+    if not _pgen_triplet_exists(out_prefix):
+        raise RuntimeError(f"Merged PGEN is missing output artifacts: {out_prefix}")
+    _write_pgen_metadata(out_prefix, artifact_key, kind="merged")
     return str(out_prefix)
 
 
 def _export_one_task_legacy(task: ExportTask, run_cfg: RunConfig, merge_cfg: SimpleNamespace) -> str:
+    artifact_key = canonical_hash({"export_cache_key": task.cache_key, "kind": "legacy"})
+    if bool(run_cfg.pgen_export.reuse_exports) and _pgen_artifact_matches(task.out_prefix, artifact_key):
+        return str(task.out_prefix)
+    _remove_pgen_artifacts(task.out_prefix)
     adapter = build_genotype_adapter(
         hapstore_cfg=run_cfg.genotype_input.hapstore,
     )
     adapter.validate_files()
     legacy_export_cfg = SimpleNamespace(**vars(merge_cfg))
     legacy_export_cfg.filter_monomorphic = False
-    return adapter.export_to_pgen(
+    prefix = adapter.export_to_pgen(
         sample_ids=task.sample_ids,
         sample_populations=task.sample_populations,
         out_prefix=task.out_prefix,
@@ -661,6 +717,8 @@ def _export_one_task_legacy(task: ExportTask, run_cfg: RunConfig, merge_cfg: Sim
         variant_ids=task.variant_ids,
         export_cfg=legacy_export_cfg,
     )
+    _write_pgen_metadata(prefix, artifact_key, kind="legacy")
+    return prefix
 
 
 def _export_one_task_per_chrom(
@@ -678,10 +736,16 @@ def _export_one_task_per_chrom(
         if task.variant_ids is not None and not requested_ids:
             continue
         chrom_prefix = _expected_chrom_prefix(task.out_prefix, chrom, run_cfg)
-        if _pgen_triplet_exists(chrom_prefix):
+        chrom_artifact_key = canonical_hash(
+            {"export_cache_key": task.cache_key, "kind": "chromosome", "chromosome": chrom}
+        )
+        if bool(run_cfg.pgen_export.reuse_exports) and _pgen_artifact_matches(
+            chrom_prefix, chrom_artifact_key
+        ):
             normalize_psam_fid_column(Path(f"{chrom_prefix}.psam"))
             chrom_prefixes[chrom] = str(chrom_prefix)
             continue
+        _remove_pgen_artifacts(chrom_prefix)
 
         adapter.export_to_pgen(
             sample_ids=task.sample_ids,
@@ -691,12 +755,21 @@ def _export_one_task_per_chrom(
             variant_ids=None if requested_ids is None else list(requested_ids),
             export_cfg=merge_cfg,
         )
+        _write_pgen_metadata(chrom_prefix, chrom_artifact_key, kind="chromosome")
         chrom_prefixes[chrom] = str(chrom_prefix)
 
+    merged_artifact_key = canonical_hash(
+        {
+            "export_cache_key": task.cache_key,
+            "kind": "merged",
+            "chromosomes": sorted(chrom_prefixes),
+        }
+    )
     merged_prefix = _merge_filtered_chrom_pgens(
         chrom_prefixes=chrom_prefixes,
         out_prefix=_expected_merged_prefix(task.out_prefix, run_cfg),
         run_cfg=run_cfg,
+        artifact_key=merged_artifact_key,
     )
     return ExportArtifacts(pgen_prefix=merged_prefix, chrom_pgen_manifest=chrom_prefixes)
 
@@ -843,6 +916,15 @@ def export_manifest_pgens(
             pending_unique[task.cache_key] = task
 
     pending_tasks = [pending_unique[key] for key in sorted(pending_unique.keys())]
+    if pending_tasks:
+        require_slurm_cpu_budget(
+            workers=min(max(1, int(run_cfg.pgen_export.task_workers)), len(pending_tasks)),
+            threads_per_worker=max(
+                int(run_cfg.pgen_export.concat_workers),
+                int(run_cfg.pgen_export.pgen_shard_workers),
+            ),
+            context="HapStore PGEN export",
+        )
     logger.info(
         "[hapstore-export] planned exports total=%d unique=%d cached=%d",
         len(tasks),

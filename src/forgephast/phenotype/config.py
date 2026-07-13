@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -138,13 +138,22 @@ class RunConfig:
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "RunConfig":
         """Build a validated config object from a dictionary."""
+        allowed_top_level = {item.name for item in fields(cls)}
+        unknown_top_level = sorted(set(payload).difference(allowed_top_level))
+        if unknown_top_level:
+            raise ValueError(
+                f"Unknown top-level phenotype config key(s): {unknown_top_level}"
+            )
+
         geno_payload = dict(payload["genotype_input"])
-        for removed_key in ("temp_dir", "pgen_dosage_backend"):
+        for removed_key in (
+            "temp_dir",
+            "pgen_dosage_backend",
+            "path_prefix",
+            "conversion_enabled",
+        ):
             if removed_key in geno_payload:
                 raise ValueError(f"genotype_input.{removed_key} was removed from the public config contract")
-        # Legacy: silently drop keys removed from GenotypeInputConfig.
-        for legacy_key in ("path_prefix", "conversion_enabled"):
-            geno_payload.pop(legacy_key, None)
         hapstore_payload = geno_payload.get("hapstore")
         if hapstore_payload is not None:
             geno_payload["hapstore"] = HapStoreInputConfig(**hapstore_payload)
@@ -215,6 +224,18 @@ class RunConfig:
         pgen_export = PgenExportConfig(**pgen_payload)
 
         gwas_payload = dict(payload.get("gwas", {}))
+        allowed_gwas_keys = {
+            "engines",
+            "task_workers",
+            "snp_scope",
+            "adjustment_profile",
+            "global_pcs",
+            "plink2",
+            "regenie",
+        }
+        unknown_gwas_keys = sorted(set(gwas_payload).difference(allowed_gwas_keys))
+        if unknown_gwas_keys:
+            raise ValueError(f"Unknown gwas config key(s): {unknown_gwas_keys}")
         global_pcs_payload = dict(gwas_payload.get("global_pcs", {}))
         if global_pcs_payload.get("mode") == "compute":
             raise ValueError("gwas.global_pcs.mode=compute was removed; use mode=plink2_pca")
