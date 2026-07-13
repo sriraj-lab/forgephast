@@ -92,6 +92,25 @@ def _keep_file_suffix(keep_file: str | Path | None) -> str:
     return f".keep_{digest}"
 
 
+def _maf_filter_suffix(min_maf: float) -> str:
+    value = float(min_maf)
+    if value == 1e-12:
+        return ".maf_gt0"
+    token = repr(value).replace("+", "").replace("-", "m").replace(".", "p")
+    return f".maf_ge_{token}"
+
+
+def _keep_matches_pgen_samples(prefix: str | Path, keep_file: str | Path | None) -> bool:
+    if keep_file is None or not str(keep_file).strip():
+        return True
+    try:
+        pgen_ids = read_sample_ids(Path(f"{prefix}.psam"))
+        keep_ids = read_sample_ids(keep_file)
+    except (OSError, ValueError):
+        return False
+    return len(pgen_ids) == len(keep_ids) and set(pgen_ids) == set(keep_ids)
+
+
 def _filter_zero_maf_pgen(
     prefix: str | Path,
     *,
@@ -99,16 +118,24 @@ def _filter_zero_maf_pgen(
     threads: int,
     memory_mb: int | None = None,
     keep_file: str | Path | None = None,
+    min_maf: float = 1e-12,
 ) -> str:
     """Create a filtered PGEN with monomorphic variants removed."""
     input_prefix = Path(prefix)
     keep_suffix = _keep_file_suffix(keep_file)
-    if input_prefix.name.endswith(".maf_gt0") or (
-        keep_suffix and input_prefix.name.endswith(f".maf_gt0{keep_suffix}")
-    ):
+    filter_suffix = _maf_filter_suffix(float(min_maf))
+    if keep_suffix and input_prefix.name.endswith(f"{filter_suffix}{keep_suffix}"):
+        return str(input_prefix)
+    already_filtered = input_prefix.name.endswith(filter_suffix)
+    if already_filtered and not keep_suffix:
         return str(input_prefix)
 
-    filtered_prefix = input_prefix.parent / f"{input_prefix.name}.maf_gt0{keep_suffix}"
+    filtered_name = (
+        f"{input_prefix.name}{keep_suffix}"
+        if already_filtered
+        else f"{input_prefix.name}{filter_suffix}{keep_suffix}"
+    )
+    filtered_prefix = input_prefix.parent / filtered_name
     if _pgen_triplet_exists(filtered_prefix):
         normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
         return str(filtered_prefix)
@@ -127,7 +154,7 @@ def _filter_zero_maf_pgen(
     cmd.extend(
         [
         "--maf",
-        "1e-12",
+        str(float(min_maf)),
         "--make-pgen",
         "--threads",
         str(max(1, int(threads))),
@@ -170,24 +197,21 @@ def _filter_zero_maf_pgen(
     return str(filtered_prefix)
 
 
-def _filter_zero_maf_pgen_for_config(prefix: str | Path, run_cfg: RunConfig) -> str:
-    return _filter_zero_maf_pgen(
-        prefix,
-        plink2_path=str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path),
-        threads=max(1, int(run_cfg.gwas.plink2.threads)),
-        memory_mb=getattr(run_cfg.gwas.plink2, "memory_mb", None),
-    )
-
-
 def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.DataFrame) -> pd.DataFrame:
     """Rewrite manifest PGEN prefixes to monomorphic-filtered exports."""
     if "pgen_prefix" not in manifest_df.columns:
         raise ValueError("Manifest missing pgen_prefix for monomorphic filtering")
     filtered_df = manifest_df.copy()
+    if not bool(run_cfg.pgen_export.filter_monomorphic):
+        return filtered_df
     if "merged_pgen_prefix" not in filtered_df.columns:
         filtered_df["merged_pgen_prefix"] = filtered_df["pgen_prefix"].fillna("").astype(str)
     if "filtered_pgen_prefix" not in filtered_df.columns:
         filtered_df["filtered_pgen_prefix"] = ""
+    if "pgen_filter_mode" not in filtered_df.columns:
+        filtered_df["pgen_filter_mode"] = ""
+    if "pgen_filter_min_maf" not in filtered_df.columns:
+        filtered_df["pgen_filter_min_maf"] = np.nan
 
     prefixes = filtered_df["pgen_prefix"].fillna("").astype(str).str.strip()
     keep_files = (
@@ -195,14 +219,69 @@ def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.Da
         if "keep_file" in filtered_df.columns
         else pd.Series([""] * len(filtered_df), index=filtered_df.index, dtype="string")
     )
-    non_empty = sorted(
+    filter_modes = filtered_df["pgen_filter_mode"].fillna("").astype(str)
+    recorded_min_mafs = pd.to_numeric(
+        filtered_df["pgen_filter_min_maf"], errors="coerce"
+    )
+    configured_min_maf = float(run_cfg.pgen_export.min_maf)
+    known_filter_modes = {
+        "native_hapstore",
+        "native_hapstore_keep_fallback",
+        "plink2_fallback",
+    }
+    too_strict = [
+        prefix
+        for prefix, mode, recorded_min_maf in zip(
+            prefixes.tolist(),
+            filter_modes.tolist(),
+            recorded_min_mafs.tolist(),
+            strict=False,
+        )
+        if prefix
+        and mode in known_filter_modes
+        and np.isfinite(recorded_min_maf)
+        and float(recorded_min_maf) > configured_min_maf
+    ]
+    if too_strict:
+        raise ValueError(
+            "Manifest PGEN was previously filtered at a stricter min_maf and cannot "
+            "recover excluded variants; re-export from HapStore for prefixes: "
+            f"{too_strict[:3]}"
+        )
+    filter_threshold_matches = [
+        mode in known_filter_modes
+        and np.isfinite(recorded_min_maf)
+        and float(recorded_min_maf) == configured_min_maf
+        for mode, recorded_min_maf in zip(
+            filter_modes.tolist(),
+            recorded_min_mafs.tolist(),
+            strict=False,
+        )
+    ]
+    filter_ready = [
+        bool(prefix)
+        and threshold_matches
+        and _keep_matches_pgen_samples(prefix, keep_file or None)
+        for prefix, keep_file, threshold_matches in zip(
+            prefixes.tolist(),
+            keep_files.tolist(),
+            filter_threshold_matches,
+            strict=False,
+        )
+    ]
+    fallback_pairs = sorted(
         {
             (prefix, keep_file)
-            for prefix, keep_file in zip(prefixes.tolist(), keep_files.tolist(), strict=False)
-            if prefix
+            for prefix, keep_file, is_filter_ready in zip(
+                prefixes.tolist(),
+                keep_files.tolist(),
+                filter_ready,
+                strict=False,
+            )
+            if prefix and not is_filter_ready
         }
     )
-    if not non_empty:
+    if not prefixes.ne("").any():
         return filtered_df
 
     plink2_path = str(run_cfg.gwas.plink2.path or run_cfg.genotype_input.plink2_path)
@@ -212,15 +291,43 @@ def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.Da
             prefix,
             plink2_path=plink2_path,
             threads=threads,
+            memory_mb=getattr(run_cfg.gwas.plink2, "memory_mb", None),
             keep_file=(keep_file or None),
+            min_maf=configured_min_maf,
         )
-        for prefix, keep_file in non_empty
+        for prefix, keep_file in fallback_pairs
     }
 
     filtered_df["filtered_pgen_prefix"] = [
-        prefix_map.get((prefix, keep_file), prefix)
-        for prefix, keep_file in zip(prefixes.tolist(), keep_files.tolist(), strict=False)
+        prefix if is_filter_ready else prefix_map.get((prefix, keep_file), prefix)
+        for prefix, keep_file, is_filter_ready in zip(
+            prefixes.tolist(),
+            keep_files.tolist(),
+            filter_ready,
+            strict=False,
+        )
     ]
+    filtered_df["pgen_filter_mode"] = [
+        ""
+        if not prefix
+        else (
+            mode
+            if is_filter_ready
+            else (
+                "native_hapstore_keep_fallback"
+                if mode == "native_hapstore" and threshold_matches
+                else "plink2_fallback"
+            )
+        )
+        for prefix, mode, threshold_matches, is_filter_ready in zip(
+            prefixes.tolist(),
+            filter_modes.tolist(),
+            filter_threshold_matches,
+            filter_ready,
+            strict=False,
+        )
+    ]
+    filtered_df.loc[prefixes.ne(""), "pgen_filter_min_maf"] = configured_min_maf
     changed = filtered_df["filtered_pgen_prefix"].astype(str) != prefixes
     filtered_df["pgen_prefix"] = filtered_df["filtered_pgen_prefix"]
     if changed.any() and "global_pcs_file" in filtered_df.columns:
@@ -426,6 +533,13 @@ def _build_export_cache_key(
             "prep_mode": str(run_cfg.pgen_export.prep_mode),
             "concat_workers": int(run_cfg.pgen_export.concat_workers),
             "pgen_shard_workers": int(run_cfg.pgen_export.pgen_shard_workers),
+            "filter_monomorphic": bool(run_cfg.pgen_export.filter_monomorphic),
+            "min_maf": float(run_cfg.pgen_export.min_maf),
+            "shard_tmp_dir": (
+                None
+                if run_cfg.pgen_export.shard_tmp_dir is None
+                else str(run_cfg.pgen_export.shard_tmp_dir)
+            ),
         }
     )
 
@@ -445,10 +559,27 @@ def _variant_ids_by_chrom(
     return by_chrom
 
 
-def _expected_filtered_chrom_prefix(out_prefix: Path, chrom: int) -> Path:
+def _expected_chrom_prefix(
+    out_prefix: Path,
+    chrom: int,
+    run_cfg: RunConfig,
+) -> Path:
     chrom_root = out_prefix.parent / "chrom"
     chrom_root.mkdir(parents=True, exist_ok=True)
-    return chrom_root / f"{out_prefix.name}.chr{int(chrom)}.maf_gt0"
+    suffix = (
+        _maf_filter_suffix(float(run_cfg.pgen_export.min_maf))
+        if bool(run_cfg.pgen_export.filter_monomorphic)
+        else ""
+    )
+    return chrom_root / f"{out_prefix.name}.chr{int(chrom)}{suffix}"
+
+
+def _expected_merged_prefix(out_prefix: Path, run_cfg: RunConfig) -> Path:
+    if not bool(run_cfg.pgen_export.filter_monomorphic):
+        return out_prefix
+    return out_prefix.with_name(
+        f"{out_prefix.name}{_maf_filter_suffix(float(run_cfg.pgen_export.min_maf))}"
+    )
 
 
 def _merge_filtered_chrom_pgens(
@@ -520,13 +651,15 @@ def _export_one_task_legacy(task: ExportTask, run_cfg: RunConfig, merge_cfg: Sim
         hapstore_cfg=run_cfg.genotype_input.hapstore,
     )
     adapter.validate_files()
+    legacy_export_cfg = SimpleNamespace(**vars(merge_cfg))
+    legacy_export_cfg.filter_monomorphic = False
     return adapter.export_to_pgen(
         sample_ids=task.sample_ids,
         sample_populations=task.sample_populations,
         out_prefix=task.out_prefix,
         chromosomes=run_cfg.chromosomes,
         variant_ids=task.variant_ids,
-        export_cfg=merge_cfg,
+        export_cfg=legacy_export_cfg,
     )
 
 
@@ -544,27 +677,25 @@ def _export_one_task_per_chrom(
         requested_ids = variant_ids_by_chrom.get(chrom) if task.variant_ids is not None else None
         if task.variant_ids is not None and not requested_ids:
             continue
-        filtered_prefix = _expected_filtered_chrom_prefix(task.out_prefix, chrom)
-        if _pgen_triplet_exists(filtered_prefix):
-            normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
-            chrom_prefixes[chrom] = str(filtered_prefix)
+        chrom_prefix = _expected_chrom_prefix(task.out_prefix, chrom, run_cfg)
+        if _pgen_triplet_exists(chrom_prefix):
+            normalize_psam_fid_column(Path(f"{chrom_prefix}.psam"))
+            chrom_prefixes[chrom] = str(chrom_prefix)
             continue
 
-        raw_prefix = filtered_prefix.with_name(filtered_prefix.name.removesuffix(".maf_gt0"))
-        if not _pgen_triplet_exists(raw_prefix):
-            adapter.export_to_pgen(
-                sample_ids=task.sample_ids,
-                sample_populations=task.sample_populations,
-                out_prefix=raw_prefix,
-                chromosomes=[chrom],
-                variant_ids=None if requested_ids is None else list(requested_ids),
-                export_cfg=merge_cfg,
-            )
-        chrom_prefixes[chrom] = _filter_zero_maf_pgen_for_config(raw_prefix, run_cfg)
+        adapter.export_to_pgen(
+            sample_ids=task.sample_ids,
+            sample_populations=task.sample_populations,
+            out_prefix=chrom_prefix,
+            chromosomes=[chrom],
+            variant_ids=None if requested_ids is None else list(requested_ids),
+            export_cfg=merge_cfg,
+        )
+        chrom_prefixes[chrom] = str(chrom_prefix)
 
     merged_prefix = _merge_filtered_chrom_pgens(
         chrom_prefixes=chrom_prefixes,
-        out_prefix=task.out_prefix,
+        out_prefix=_expected_merged_prefix(task.out_prefix, run_cfg),
         run_cfg=run_cfg,
     )
     return ExportArtifacts(pgen_prefix=merged_prefix, chrom_pgen_manifest=chrom_prefixes)
@@ -593,6 +724,10 @@ def export_manifest_pgens(
         manifest_df["chrom_pgen_manifest"] = ""
     if "filtered_pgen_prefix" not in manifest_df.columns:
         manifest_df["filtered_pgen_prefix"] = ""
+    if "pgen_filter_mode" not in manifest_df.columns:
+        manifest_df["pgen_filter_mode"] = ""
+    if "pgen_filter_min_maf" not in manifest_df.columns:
+        manifest_df["pgen_filter_min_maf"] = np.nan
 
     truth_membership_path = manifest_path.parent / "truth" / "causal_membership.tsv"
     if not truth_membership_path.exists():
@@ -610,11 +745,15 @@ def export_manifest_pgens(
     )
     export_root.mkdir(parents=True, exist_ok=True)
     logger.info(
-        "[hapstore-export] start rows=%d variant_scope=%s task_workers=%d reuse_exports=%s",
+        "[hapstore-export] start rows=%d variant_scope=%s task_workers=%d "
+        "reuse_exports=%s filter_monomorphic=%s min_maf=%g shard_tmp_dir=%s",
         int(len(manifest_df)),
         str(run_cfg.pgen_export.variant_scope),
         int(run_cfg.pgen_export.task_workers),
         bool(run_cfg.pgen_export.reuse_exports),
+        bool(run_cfg.pgen_export.filter_monomorphic),
+        float(run_cfg.pgen_export.min_maf),
+        run_cfg.pgen_export.shard_tmp_dir,
     )
 
     default_pop = run_cfg.effect_model.population_order[0]
@@ -667,6 +806,9 @@ def export_manifest_pgens(
         threads=max(1, int(run_cfg.gwas.plink2.threads)),
         concat_workers=max(1, int(run_cfg.pgen_export.concat_workers)),
         pgen_shard_workers=max(1, int(run_cfg.pgen_export.pgen_shard_workers)),
+        filter_monomorphic=bool(run_cfg.pgen_export.filter_monomorphic),
+        min_maf=float(run_cfg.pgen_export.min_maf),
+        shard_tmp_dir=run_cfg.pgen_export.shard_tmp_dir,
     )
 
     export_cache: dict[str, Any] | None = None
@@ -785,12 +927,25 @@ def export_manifest_pgens(
         manifest_df.loc[mask, "exported_pgen_prefix"] = str(exported_prefix)
         manifest_df.loc[mask, "merged_pgen_prefix"] = str(exported_prefix)
         manifest_df.loc[mask, "filtered_pgen_prefix"] = str(exported_prefix)
+        manifest_df.loc[mask, "pgen_filter_mode"] = (
+            "native_hapstore"
+            if bool(run_cfg.pgen_export.filter_monomorphic)
+            and run_cfg.pgen_export.prep_mode == "per_chrom_plink_merge"
+            else "none"
+        )
+        if bool(run_cfg.pgen_export.filter_monomorphic):
+            manifest_df.loc[mask, "pgen_filter_min_maf"] = float(
+                run_cfg.pgen_export.min_maf
+            )
         manifest_df.loc[mask, "chrom_pgen_manifest"] = json.dumps(
             {str(chrom): prefix for chrom, prefix in sorted(artifacts.chrom_pgen_manifest.items())},
             sort_keys=True,
         )
 
-    if run_cfg.pgen_export.prep_mode == "legacy_whole_store":
+    if (
+        run_cfg.pgen_export.prep_mode == "legacy_whole_store"
+        and bool(run_cfg.pgen_export.filter_monomorphic)
+    ):
         manifest_df = ensure_manifest_non_monomorphic_pgens(run_cfg, manifest_df)
         if "pgen_prefix" in manifest_df.columns:
             manifest_df["merged_pgen_prefix"] = manifest_df["pgen_prefix"]

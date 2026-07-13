@@ -815,6 +815,13 @@ class HapStoreAdapter:
         merge_threads = int(getattr(export_cfg, "threads", 1))
         concat_workers = int(getattr(export_cfg, "concat_workers", 1))
         pgen_shard_workers = int(getattr(export_cfg, "pgen_shard_workers", 1))
+        filter_monomorphic = bool(getattr(export_cfg, "filter_monomorphic", False))
+        min_maf = (
+            float(getattr(export_cfg, "min_maf", 1e-12))
+            if filter_monomorphic
+            else None
+        )
+        shard_tmp_dir = getattr(export_cfg, "shard_tmp_dir", None)
 
         if self.layout == "single_store":
             if self.store_path is None:
@@ -841,10 +848,13 @@ class HapStoreAdapter:
                     chrom=chrom,
                     sample_ids=list(sample_ids),
                     variant_ids=list(requested_ids) if requested_ids is not None else None,
+                    min_maf=min_maf,
+                    filter_monomorphic=filter_monomorphic,
                     on_partial_missing="missing",
                     n_workers=max(1, pgen_shard_workers),
                     plink2_workers=max(1, merge_threads),
                     plink2_path=plink2_path,
+                    shard_tmp_dir=shard_tmp_dir,
                 )
                 normalize_psam_fid_column(Path(f"{chr_prefix}.psam"))
                 chrom_prefixes.append(chr_prefix)
@@ -973,10 +983,13 @@ class HapStoreAdapter:
                     chrom=chrom,
                     sample_ids=sample_ids,
                     variant_ids=requested_ids,
+                    min_maf=min_maf,
+                    filter_monomorphic=filter_monomorphic,
                     on_partial_missing="missing",
                     n_workers=max(1, pgen_shard_workers),
                     plink2_workers=max(1, merge_threads),
                     plink2_path=plink2_path,
+                    shard_tmp_dir=shard_tmp_dir,
                 )
                 normalize_psam_fid_column(Path(f"{chr_prefix}.psam"))
                 shutil.rmtree(merged_store_path, ignore_errors=True)

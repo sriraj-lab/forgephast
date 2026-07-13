@@ -95,6 +95,9 @@ def test_valid_config_builds() -> None:
     cfg = RunConfig.from_dict(payload)
     assert cfg.name == "unit_test"
     assert cfg.pgen_export.prep_mode == "per_chrom_plink_merge"
+    assert cfg.pgen_export.filter_monomorphic is True
+    assert cfg.pgen_export.min_maf == 1e-12
+    assert cfg.pgen_export.shard_tmp_dir is None
     assert cfg.gwas.global_pcs.prune_before_pca is True
     assert cfg.causal_selection.maf_bucket_column == "maf_eur"
     assert cfg.causal_selection.effect_scale_maf_column == "maf_eur"
@@ -472,6 +475,22 @@ def test_rejects_non_boolean_global_pcs_reuse_cache() -> None:
     payload = _base_payload()
     payload["gwas"]["global_pcs"]["reuse_cache"] = "yes"
     with pytest.raises(ValueError, match="reuse_cache"):
+        RunConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("filter_monomorphic", "yes", "filter_monomorphic"),
+        ("min_maf", 0.0, "min_maf"),
+        ("min_maf", 0.6, "min_maf"),
+        ("shard_tmp_dir", "", "shard_tmp_dir"),
+    ],
+)
+def test_rejects_invalid_pgen_filter_config(field: str, value: object, match: str) -> None:
+    payload = _base_payload()
+    payload.setdefault("pgen_export", {})[field] = value
+    with pytest.raises(ValueError, match=match):
         RunConfig.from_dict(payload)
 
 

@@ -89,6 +89,59 @@ def _wire_fake_stores(adapter: HapStoreAdapter, stores: dict[tuple[str, int], Fa
     adapter._open_store = lambda population, chrom: stores[(str(population), int(chrom))]  # type: ignore[method-assign]
 
 
+def test_export_to_pgen_passes_native_filter_and_scratch_settings(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_export_pgen(**kwargs):
+        calls.append(dict(kwargs))
+        prefix = Path(str(kwargs["out_prefix"]))
+        Path(f"{prefix}.pgen").write_bytes(b"pgen")
+        Path(f"{prefix}.pvar").write_text(
+            "#CHROM\tPOS\tID\tREF\tALT\n1\t10\tv1\tA\tG\n",
+            encoding="utf-8",
+        )
+        Path(f"{prefix}.psam").write_text(
+            "#FID\tIID\n0\ts1\n0\ts2\n",
+            encoding="utf-8",
+        )
+        return prefix
+
+    monkeypatch.setattr("hapstore.pgen.export_pgen", fake_export_pgen)
+    adapter = HapStoreAdapter(
+        HapStoreInputConfig(
+            layout="single_store",
+            store_path=str(tmp_path / "source.zarr"),
+        )
+    )
+    scratch = tmp_path / "scratch"
+    out_prefix = tmp_path / "cohort.maf_gt0"
+    result = adapter.export_to_pgen(
+        sample_ids=["s1", "s2"],
+        sample_populations=["EUR", "EUR"],
+        out_prefix=out_prefix,
+        chromosomes=[1],
+        export_cfg=SimpleNamespace(
+            plink2_path="plink2",
+            threads=3,
+            concat_workers=2,
+            pgen_shard_workers=4,
+            filter_monomorphic=True,
+            min_maf=0.01,
+            shard_tmp_dir=str(scratch),
+        ),
+    )
+
+    assert result == str(out_prefix)
+    assert len(calls) == 1
+    assert calls[0]["filter_monomorphic"] is True
+    assert calls[0]["min_maf"] == 0.01
+    assert calls[0]["shard_tmp_dir"] == str(scratch)
+    assert calls[0]["n_workers"] == 4
+    assert calls[0]["plink2_workers"] == 3
+
+
 def test_export_dosages_reads_per_pop_per_chr_and_tracks_alt(fake_adapter: HapStoreAdapter) -> None:
     stores = {
         ("EUR", 1): FakeStore(

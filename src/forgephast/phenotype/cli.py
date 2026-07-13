@@ -442,19 +442,20 @@ def _prepare_manifest_for_gwas(
         )
         logger.info("PREP_STAGE_DONE run=%s stage=hapstore_export", config.name)
         manifest_df = pd.read_csv(current, sep="\t")
-    t_filter = time.perf_counter()
-    filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
-    if not filtered_manifest_df.equals(manifest_df):
-        current = current.parent / "run_manifest_pgen.tsv"
-        filtered_manifest_df.to_csv(current, sep="\t", index=False)
-        manifest_df = filtered_manifest_df
-        stage_rows.append(
-            {
-                "stage": "ensure_non_monomorphic_pgen",
-                "elapsed_seconds": float(time.perf_counter() - t_filter),
-            }
-        )
-        logger.info("PREP_STAGE_DONE run=%s stage=ensure_non_monomorphic_pgen", config.name)
+    if bool(config.pgen_export.filter_monomorphic):
+        t_filter = time.perf_counter()
+        filtered_manifest_df = ensure_manifest_non_monomorphic_pgens(config, manifest_df)
+        if not filtered_manifest_df.equals(manifest_df):
+            current = current.parent / "run_manifest_pgen.tsv"
+            filtered_manifest_df.to_csv(current, sep="\t", index=False)
+            manifest_df = filtered_manifest_df
+            stage_rows.append(
+                {
+                    "stage": "ensure_non_monomorphic_pgen",
+                    "elapsed_seconds": float(time.perf_counter() - t_filter),
+                }
+            )
+            logger.info("PREP_STAGE_DONE run=%s stage=ensure_non_monomorphic_pgen", config.name)
     if config.gwas.global_pcs.canonical_mode() in {"plink2_pca", "precomputed"}:
         if _manifest_has_ready_global_pcs(manifest_df):
             logger.info("[prep] detected ready global PCs in manifest=%s; skipping PCA refresh", current)

@@ -789,6 +789,9 @@ class PgenExportConfig:
     task_workers: int = 1
     concat_workers: int = 1
     pgen_shard_workers: int = 1
+    filter_monomorphic: bool = True
+    min_maf: float = 1e-12
+    shard_tmp_dir: Optional[str] = None
     variant_scope: str = "all"
     variant_list_file: Optional[str] = None
     target_n_variants: Optional[int] = None
@@ -814,6 +817,12 @@ class PgenExportConfig:
         _check_positive(self.pgen_shard_workers, "pgen_export.pgen_shard_workers")
         if not isinstance(self.reuse_exports, bool):
             raise ValueError("pgen_export.reuse_exports must be a boolean")
+        if not isinstance(self.filter_monomorphic, bool):
+            raise ValueError("pgen_export.filter_monomorphic must be a boolean")
+        if not np.isfinite(float(self.min_maf)) or not 0.0 < float(self.min_maf) <= 0.5:
+            raise ValueError("pgen_export.min_maf must be finite and in (0.0, 0.5]")
+        if self.shard_tmp_dir is not None and not str(self.shard_tmp_dir).strip():
+            raise ValueError("pgen_export.shard_tmp_dir cannot be empty when provided")
 
 
 @dataclass
