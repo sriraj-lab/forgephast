@@ -15,6 +15,59 @@ from .metrics.fst import (
 from .policy_support import pair_key
 
 
+def normalized_donor_weights(
+    donor_ids: list[str],
+    weights_by_donor: dict[str, float] | None,
+) -> np.ndarray:
+    """Return donor probabilities in the same order as the loaded genotype rows."""
+    if not donor_ids:
+        raise ValueError("donor_ids cannot be empty")
+    if not weights_by_donor:
+        return np.full(len(donor_ids), 1.0 / float(len(donor_ids)), dtype=np.float64)
+
+    weights = np.asarray(
+        [float(weights_by_donor.get(str(sample_id), 0.0)) for sample_id in donor_ids],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("donor sampling weights must be finite and non-negative")
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        raise ValueError("donor sampling weights must sum to a positive value")
+    return weights / total
+
+
+def weighted_genotype_counts(
+    genotypes: np.ndarray,
+    donor_weights: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert weighted donor genotypes to Hudson-FST allele counts.
+
+    Kish effective sample size preserves the existing unweighted result when
+    all donors are equally weighted while supporting configured donor mixtures.
+    """
+    geno = np.asarray(genotypes, dtype=np.float64)
+    weights = np.asarray(donor_weights, dtype=np.float64)
+    if geno.ndim != 2:
+        raise ValueError("genotypes must be a two-dimensional diploid matrix")
+    if weights.ndim != 1 or weights.shape[0] != geno.shape[0]:
+        raise ValueError("donor_weights must have one value per genotype row")
+    if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+        raise ValueError("donor_weights must be finite and non-negative")
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        raise ValueError("donor_weights must sum to a positive value")
+    weights = weights / total
+
+    effective_n = 1.0 / float(np.sum(np.square(weights)))
+    allele_number = 2.0 * effective_n
+    alt_frequency = np.sum(geno * weights[:, None], axis=0, dtype=np.float64) / 2.0
+    return (
+        alt_frequency * allele_number,
+        np.full(geno.shape[1], allele_number, dtype=np.float64),
+    )
+
+
 def pairwise_fst_from_counts_map_impl(
     *,
     pairs: list[tuple[str, str]],
@@ -52,6 +105,7 @@ def donor_baseline_fst_impl(
 ) -> dict[str, float]:
     manifest = load_manifest_fn(config)
     donors = manifest.donors_by_population
+    donor_weights = manifest.donor_weights_by_population
     pops = sorted(donors.keys())
     if pairs is None:
         pairs = resolve_pairwise_sets_fn(config, pops)
@@ -63,18 +117,24 @@ def donor_baseline_fst_impl(
     needed_pops = sorted({pop for pair in pairs for pop in pair})
     per_pop_pos: dict[str, np.ndarray] = {}
     per_pop_genotypes: dict[str, np.ndarray] = {}
+    per_pop_weights: dict[str, np.ndarray] = {}
     for pop in needed_pops:
+        donor_ids = list(donors[pop])
         source_kind, source_path = resolve_donor_panel_source_for_population_fn(config, chrom, pop)
         donor_pos, donor_haps = load_sample_haplotypes_from_panel_fn(
             config=config,
             source_path=source_path,
             chrom=chrom,
-            sample_ids=donors[pop],
+            sample_ids=donor_ids,
             source_kind=source_kind,
         )
         per_pop_pos[pop] = np.asarray(donor_pos, dtype=np.int64)
         per_pop_genotypes[pop] = (
             donor_haps[0::2, :].astype(np.uint8, copy=False) + donor_haps[1::2, :].astype(np.uint8, copy=False)
+        )
+        per_pop_weights[pop] = normalized_donor_weights(
+            donor_ids,
+            donor_weights.get(pop),
         )
 
     common_pos = per_pop_pos[needed_pops[0]]
@@ -92,9 +152,9 @@ def donor_baseline_fst_impl(
         if idx.size != common_pos.size or not np.array_equal(pop_pos[idx], common_pos):
             raise RuntimeError(f"donor baseline variant alignment mismatch for population {pop!r}")
         geno = np.asarray(per_pop_genotypes[pop][:, idx], dtype=np.uint8, copy=False)
-        counts_by_pop[pop] = (
-            np.sum(geno, axis=0, dtype=np.float64),
-            np.full(n_variants, 2.0 * float(geno.shape[0]), dtype=np.float64),
+        counts_by_pop[pop] = weighted_genotype_counts(
+            geno,
+            per_pop_weights[pop],
         )
 
     return pairwise_fst_from_counts_map_impl(
@@ -161,6 +221,7 @@ def compute_stochastic_donor_fst_gate_impl(
     pairs: list[tuple[str, str]],
     pairwise_fst: dict[str, float],
     donors_by_population: dict[str, list[str]],
+    donor_weights_by_population: dict[str, dict[str, float]],
     sampled_diploids_by_population: dict[str, int],
     numba_threads: int | None,
     resolve_donor_panel_source_for_population_fn: Callable[[RunConfig, int, str], tuple[str, Any]],
@@ -181,6 +242,7 @@ def compute_stochastic_donor_fst_gate_impl(
     n_target_by_pop: dict[str, int] = {}
     per_pop_pos: dict[str, np.ndarray] = {}
     per_pop_genotypes: dict[str, np.ndarray] = {}
+    per_pop_weights: dict[str, np.ndarray] = {}
     for pop in pop_names:
         donor_ids_all = sorted({str(x) for x in donors_by_population.get(pop, [])})
         donor_n = len(donor_ids_all)
@@ -236,6 +298,10 @@ def compute_stochastic_donor_fst_gate_impl(
         )
         per_pop_pos[pop] = np.asarray(donor_pos, dtype=np.int64)
         per_pop_genotypes[pop] = np.asarray(donor_genotypes, dtype=np.uint8, copy=False)
+        per_pop_weights[pop] = normalized_donor_weights(
+            donor_ids_all,
+            donor_weights_by_population.get(pop),
+        )
 
     common_pos = per_pop_pos[pop_names[0]]
     for pop in pop_names[1:]:
@@ -274,9 +340,9 @@ def compute_stochastic_donor_fst_gate_impl(
     baseline_counts_by_pop: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for pop in pop_names:
         geno = per_pop_genotypes_common[pop]
-        baseline_counts_by_pop[pop] = (
-            np.sum(geno, axis=0, dtype=np.float64),
-            np.full(n_variants, 2.0 * float(geno.shape[0]), dtype=np.float64),
+        baseline_counts_by_pop[pop] = weighted_genotype_counts(
+            geno,
+            per_pop_weights[pop],
         )
     baseline_pairwise_fst = pairwise_fst_from_counts_map_impl(
         pairs=pairs,
@@ -309,7 +375,12 @@ def compute_stochastic_donor_fst_gate_impl(
         for pop in pop_names:
             geno = per_pop_genotypes_common[pop]
             n_target = n_target_by_pop[pop]
-            sampled_rows = rng.choice(geno.shape[0], size=int(n_target), replace=bool(replace))
+            sampled_rows = rng.choice(
+                geno.shape[0],
+                size=int(n_target),
+                replace=bool(replace),
+                p=per_pop_weights[pop],
+            )
             sub = geno[sampled_rows, :]
             rep_counts_by_pop[pop] = (
                 np.sum(sub, axis=0, dtype=np.float64),

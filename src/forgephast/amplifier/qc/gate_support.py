@@ -184,6 +184,7 @@ def evaluate_main_qc_gates(
                     pairs=pairs,
                     pairwise_fst=pairwise,
                     donors_by_population=manifest.donors_by_population,
+                    donor_weights_by_population=manifest.donor_weights_by_population,
                     sampled_diploids_by_population=fst_stochastic_gate_activation.get("sampled_diploids_by_population", {}),
                     numba_threads=python_qc_numba_threads,
                 )
