@@ -206,7 +206,7 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert all("--qt" in cmd for cmd in (step1_cmd, step2_cmd))
     assert all("--bt" not in cmd for cmd in (step1_cmd, step2_cmd))
     assert result.metadata["step1_variant_count"] == 1
-    assert result.metadata["step1_pre_cap_variant_count"] == 1
+    assert result.metadata["step1_variant_warning_exceeded"] is False
     assert result.metadata["step1_variant_cache_hit"] is False
 
 
@@ -295,12 +295,16 @@ def test_regenie_engine_reuses_identity_keyed_step1_variant_list(
 
     assert sum("--indep-pairwise" in cmd for cmd in commands) == 1
     assert first.metadata["step1_variant_count"] == 2
-    assert first.metadata["step1_pre_cap_variant_count"] == 2
+    assert first.metadata["step1_variant_warning_exceeded"] is False
     assert first.metadata["step1_variant_cache_hit"] is False
     assert second.metadata["step1_variant_cache_hit"] is True
 
 
-def test_regenie_engine_caps_step1_variant_list_evenly(monkeypatch, tmp_path: Path) -> None:
+def test_regenie_engine_warns_without_capping_step1_variant_list(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+) -> None:
     task = _make_task(tmp_path)
 
     def fake_run(cmd, capture_output, text):
@@ -319,15 +323,25 @@ def test_regenie_engine_caps_step1_variant_list_evenly(monkeypatch, tmp_path: Pa
 
     monkeypatch.setattr("subprocess.run", fake_run)
     engine = RegenieEngine(
-        RegenieEngineConfig(path="regenie", threads=1, step1_max_variants=3)
+        RegenieEngineConfig(
+            path="regenie",
+            threads=1,
+            step1_variant_warning_threshold=3,
+        )
     )
     result = engine.run(task, tmp_path / "run")
 
     variant_list = Path(result.metadata["step1_variant_list"])
-    assert variant_list.read_text(encoding="utf-8").splitlines() == ["v1", "v3", "v5"]
-    assert variant_list.with_name("step1_variants.prune.full.in").exists()
-    assert result.metadata["step1_variant_count"] == 3
-    assert result.metadata["step1_pre_cap_variant_count"] == 5
+    assert variant_list.read_text(encoding="utf-8").splitlines() == [
+        "v1",
+        "v2",
+        "v3",
+        "v4",
+        "v5",
+    ]
+    assert result.metadata["step1_variant_count"] == 5
+    assert result.metadata["step1_variant_warning_exceeded"] is True
+    assert "above advisory threshold 3" in caplog.text
 
 
 def test_merge_covariates_for_gwas_coerces_id_types(tmp_path: Path) -> None:

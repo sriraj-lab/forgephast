@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class Step1VariantList:
     path: Path
     variant_count: int
-    pre_cap_variant_count: int
+    warning_threshold_exceeded: bool
     cache_hit: bool
 
 
@@ -70,39 +70,20 @@ def _metadata_path(variant_list: Path) -> Path:
     return variant_list.with_suffix(variant_list.suffix + ".forgephast.json")
 
 
-def _cap_variant_list(path: Path, *, variant_count: int, max_variants: int) -> int:
-    if variant_count <= max_variants:
-        return variant_count
-    full_path = path.with_name(f"{path.stem}.full{path.suffix}")
-    path.replace(full_path)
-    tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    try:
-        target_number = 0
-        target_index = 0
-        with full_path.open("r", encoding="utf-8") as source, tmp_path.open(
-            "w",
-            encoding="utf-8",
-        ) as destination:
-            for index, line in enumerate(source):
-                if index != target_index:
-                    continue
-                destination.write(line)
-                target_number += 1
-                if target_number == max_variants:
-                    break
-                if max_variants > 1:
-                    target_index = (target_number * (variant_count - 1)) // (
-                        max_variants - 1
-                    )
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
-    capped_count = _count_variant_ids(path)
-    if capped_count != max_variants:
-        raise RuntimeError(
-            f"Expected {max_variants} capped REGENIE step-1 variants, found {capped_count}"
+def _warn_if_large_variant_list(
+    *,
+    variant_count: int,
+    threshold: int | None,
+) -> bool:
+    exceeded = threshold is not None and variant_count > threshold
+    if exceeded:
+        logger.warning(
+            "REGENIE step-1 variant list contains %d variants, above advisory threshold %d; "
+            "continuing without truncation; review the count and tighten QC/LD pruning if needed",
+            variant_count,
+            threshold,
         )
-    return capped_count
+    return bool(exceeded)
 
 
 def _write_metadata(path: Path, payload: dict[str, object]) -> None:
@@ -133,7 +114,7 @@ def prepare_regenie_step1_variant_list(
     plink2_memory_mb = getattr(plink2_cfg, "memory_mb", None)
     cache_key = canonical_hash(
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "pgen": _pgen_identity(task.pgen_prefix),
             "keep_file": {
                 **_file_identity(keep_path),
@@ -148,7 +129,6 @@ def prepare_regenie_step1_variant_list(
             "ld_window_variants": int(regenie_cfg.step1_ld_window_variants),
             "ld_step_variants": int(regenie_cfg.step1_ld_step_variants),
             "ld_r2": float(regenie_cfg.step1_ld_r2),
-            "max_variants": int(regenie_cfg.step1_max_variants),
         }
     )
 
@@ -169,6 +149,10 @@ def prepare_regenie_step1_variant_list(
             metadata = {}
         variant_count = _count_variant_ids(variant_list)
         if metadata.get("cache_key") == cache_key and variant_count > 0:
+            warning_exceeded = _warn_if_large_variant_list(
+                variant_count=variant_count,
+                threshold=regenie_cfg.step1_variant_warning_threshold,
+            )
             logger.info(
                 "Reusing REGENIE step-1 variant list path=%s variants=%d",
                 variant_list,
@@ -177,7 +161,7 @@ def prepare_regenie_step1_variant_list(
             return Step1VariantList(
                 variant_list,
                 variant_count,
-                int(metadata.get("pre_cap_variant_count", variant_count)),
+                warning_exceeded,
                 True,
             )
 
@@ -219,37 +203,36 @@ def prepare_regenie_step1_variant_list(
 
     if not variant_list.exists():
         raise RuntimeError(f"PLINK2 did not produce REGENIE step-1 variant list: {variant_list}")
-    pre_cap_variant_count = _count_variant_ids(variant_list)
-    if pre_cap_variant_count == 0:
+    variant_count = _count_variant_ids(variant_list)
+    if variant_count == 0:
         raise RuntimeError(
             "REGENIE step-1 common/QC/LD-pruned variant list is empty; "
             "relax gwas.regenie step1 filters for this cohort"
         )
-    variant_count = _cap_variant_list(
-        variant_list,
-        variant_count=pre_cap_variant_count,
-        max_variants=int(regenie_cfg.step1_max_variants),
+    warning_exceeded = _warn_if_large_variant_list(
+        variant_count=variant_count,
+        threshold=regenie_cfg.step1_variant_warning_threshold,
     )
     logger.info(
-        "Prepared REGENIE step-1 variant list path=%s pre_cap=%d final=%d",
+        "Prepared REGENIE step-1 variant list path=%s variants=%d warning_exceeded=%s",
         variant_list,
-        pre_cap_variant_count,
         variant_count,
+        warning_exceeded,
     )
     _write_metadata(
         metadata_path,
         {
-            "schema_version": 3,
+            "schema_version": 4,
             "cache_key": cache_key,
             "variant_count": variant_count,
-            "pre_cap_variant_count": pre_cap_variant_count,
+            "warning_threshold_exceeded": warning_exceeded,
             "variant_list": str(variant_list),
         },
     )
     return Step1VariantList(
         variant_list,
         variant_count,
-        pre_cap_variant_count,
+        warning_exceeded,
         False,
     )
 

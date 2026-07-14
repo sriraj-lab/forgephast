@@ -105,7 +105,7 @@ def test_valid_config_builds() -> None:
     assert cfg.gwas.regenie.step1_ld_window_variants == 1000
     assert cfg.gwas.regenie.step1_ld_step_variants == 100
     assert cfg.gwas.regenie.step1_ld_r2 == 0.2
-    assert cfg.gwas.regenie.step1_max_variants == 500_000
+    assert cfg.gwas.regenie.step1_variant_warning_threshold == 500_000
     assert cfg.causal_selection.maf_bucket_column == "maf_eur"
     assert cfg.causal_selection.effect_scale_maf_column == "maf_eur"
 
@@ -496,7 +496,7 @@ def test_rejects_non_boolean_global_pcs_reuse_cache() -> None:
         ("step1_ld_window_variants", 0, "step1_ld_window_variants"),
         ("step1_ld_step_variants", 0, "step1_ld_step_variants"),
         ("step1_ld_r2", 1.0, "step1_ld_r2"),
-        ("step1_max_variants", 1_000_001, "step1_max_variants"),
+        ("step1_variant_warning_threshold", 0, "step1_variant_warning_threshold"),
         ("step1_reuse_variant_list", "yes", "step1_reuse_variant_list"),
     ],
 )
@@ -520,6 +520,13 @@ def test_rejects_regenie_step1_extract_collision(extract_arg: str) -> None:
     }
     with pytest.raises(ValueError, match="cannot contain --extract"):
         RunConfig.from_dict(payload)
+
+
+def test_allows_disabled_regenie_step1_variant_warning() -> None:
+    payload = _base_payload()
+    payload["gwas"]["regenie"] = {"step1_variant_warning_threshold": None}
+    cfg = RunConfig.from_dict(payload)
+    assert cfg.gwas.regenie.step1_variant_warning_threshold is None
 
 
 @pytest.mark.parametrize(
