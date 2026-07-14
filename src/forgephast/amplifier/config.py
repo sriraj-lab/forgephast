@@ -288,6 +288,15 @@ class OutputConfig:
 
 
 @dataclass
+class RuntimeConfig:
+    synthetic_premerge_rr_enabled: bool = False
+
+    def validate(self) -> None:
+        if not isinstance(self.synthetic_premerge_rr_enabled, bool):
+            raise ValueError("runtime.synthetic_premerge_rr_enabled must be a boolean")
+
+
+@dataclass
 class QcConfig:
     pairwise_fst_sets: list[list[str]] | None = None
     within_pop_split_checks: list[str] | None = None
@@ -498,6 +507,7 @@ class RunConfig:
     simulation: SimulationConfig
     outputs: OutputConfig
     qc: QcConfig = field(default_factory=QcConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     def validate(self) -> None:
         if not self.name:
@@ -531,6 +541,7 @@ class RunConfig:
         self.simulation.validate()
         self.outputs.validate()
         self.qc.validate()
+        self.runtime.validate()
 
     @property
     def run_root(self) -> Path:
@@ -630,6 +641,7 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
         "simulation",
         "outputs",
         "qc",
+        "runtime",
         "calibration",
         "benchmark",
     }
@@ -708,6 +720,7 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
         if key in qc_raw:
             raise ValueError(message)
     qc_cfg = _construct_dataclass("qc", QcConfig, qc_raw)
+    runtime_cfg = _construct_dataclass("runtime", RuntimeConfig, _optional_section(data, "runtime"))
 
     cfg = RunConfig(
         name=data.get("name", "population_amplifier_run"),
@@ -716,6 +729,7 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
         simulation=sim_cfg,
         outputs=outputs_cfg,
         qc=qc_cfg,
+        runtime=runtime_cfg,
     )
     cfg.validate()
     return cfg

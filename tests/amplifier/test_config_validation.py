@@ -18,6 +18,38 @@ def test_config_parses_k_populations(tmp_path):
     assert cfg.simulation.chromosomes == [21]
 
 
+def test_config_parses_scheduler_neutral_runtime_settings(tmp_path):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["runtime"] = {"synthetic_premerge_rr_enabled": True}
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    cfg = from_yaml(cfg_path)
+
+    assert cfg.runtime.synthetic_premerge_rr_enabled is True
+
+
+@pytest.mark.parametrize(
+    "runtime",
+    [
+        {"synthetic_premerge_rr_enabled": "yes"},
+        {"scheduler": "slurm"},
+    ],
+)
+def test_config_rejects_invalid_runtime_settings(tmp_path, runtime):
+    cfg_path = write_test_config(tmp_path)
+    with open(cfg_path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    payload["runtime"] = runtime
+    with open(cfg_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+    with pytest.raises(ValueError, match="runtime"):
+        from_yaml(cfg_path)
+
+
 def test_config_rejects_donor_only_msprime_population(tmp_path):
     cfg_path = write_test_config(tmp_path)
     with open(cfg_path, "r", encoding="utf-8") as handle:
