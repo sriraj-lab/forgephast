@@ -104,7 +104,8 @@ def test_valid_config_builds() -> None:
     assert cfg.gwas.regenie.step1_min_mac == 100
     assert cfg.gwas.regenie.step1_ld_window_variants == 1000
     assert cfg.gwas.regenie.step1_ld_step_variants == 100
-    assert cfg.gwas.regenie.step1_ld_r2 == 0.9
+    assert cfg.gwas.regenie.step1_ld_r2 == 0.2
+    assert cfg.gwas.regenie.step1_max_variants == 500_000
     assert cfg.causal_selection.maf_bucket_column == "maf_eur"
     assert cfg.causal_selection.effect_scale_maf_column == "maf_eur"
 
@@ -495,6 +496,7 @@ def test_rejects_non_boolean_global_pcs_reuse_cache() -> None:
         ("step1_ld_window_variants", 0, "step1_ld_window_variants"),
         ("step1_ld_step_variants", 0, "step1_ld_step_variants"),
         ("step1_ld_r2", 1.0, "step1_ld_r2"),
+        ("step1_max_variants", 1_000_001, "step1_max_variants"),
         ("step1_reuse_variant_list", "yes", "step1_reuse_variant_list"),
     ],
 )

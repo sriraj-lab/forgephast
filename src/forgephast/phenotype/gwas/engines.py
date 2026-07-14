@@ -317,6 +317,11 @@ class RegenieEngine(GwasEngine):
                 "step1_variant_count": (
                     int(step1_variant_list.variant_count) if step1_variant_list is not None else ""
                 ),
+                "step1_pre_cap_variant_count": (
+                    int(step1_variant_list.pre_cap_variant_count)
+                    if step1_variant_list is not None
+                    else ""
+                ),
                 "step1_variant_cache_hit": (
                     bool(step1_variant_list.cache_hit) if step1_variant_list is not None else ""
                 ),

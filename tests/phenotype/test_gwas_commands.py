@@ -194,7 +194,7 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert prune_cmd[prune_idx + 1 : prune_idx + 4] == [
         "1000",
         "100",
-        "0.9",
+        "0.2",
     ]
     assert prune_cmd[prune_cmd.index("--maf") + 1] == "0.01"
     assert prune_cmd[prune_cmd.index("--mac") + 1] == "100"
@@ -206,6 +206,7 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert all("--qt" in cmd for cmd in (step1_cmd, step2_cmd))
     assert all("--bt" not in cmd for cmd in (step1_cmd, step2_cmd))
     assert result.metadata["step1_variant_count"] == 1
+    assert result.metadata["step1_pre_cap_variant_count"] == 1
     assert result.metadata["step1_variant_cache_hit"] is False
 
 
@@ -294,8 +295,39 @@ def test_regenie_engine_reuses_identity_keyed_step1_variant_list(
 
     assert sum("--indep-pairwise" in cmd for cmd in commands) == 1
     assert first.metadata["step1_variant_count"] == 2
+    assert first.metadata["step1_pre_cap_variant_count"] == 2
     assert first.metadata["step1_variant_cache_hit"] is False
     assert second.metadata["step1_variant_cache_hit"] is True
+
+
+def test_regenie_engine_caps_step1_variant_list_evenly(monkeypatch, tmp_path: Path) -> None:
+    task = _make_task(tmp_path)
+
+    def fake_run(cmd, capture_output, text):
+        out_prefix = Path(cmd[cmd.index("--out") + 1])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        if "--indep-pairwise" in cmd:
+            Path(f"{out_prefix}.prune.in").write_text(
+                "v1\nv2\nv3\nv4\nv5\n",
+                encoding="utf-8",
+            )
+        elif cmd[cmd.index("--step") + 1] == "1":
+            Path(f"{out_prefix}_pred.list").write_text("pred\n")
+        else:
+            Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    engine = RegenieEngine(
+        RegenieEngineConfig(path="regenie", threads=1, step1_max_variants=3)
+    )
+    result = engine.run(task, tmp_path / "run")
+
+    variant_list = Path(result.metadata["step1_variant_list"])
+    assert variant_list.read_text(encoding="utf-8").splitlines() == ["v1", "v3", "v5"]
+    assert variant_list.with_name("step1_variants.prune.full.in").exists()
+    assert result.metadata["step1_variant_count"] == 3
+    assert result.metadata["step1_pre_cap_variant_count"] == 5
 
 
 def test_merge_covariates_for_gwas_coerces_id_types(tmp_path: Path) -> None:

@@ -900,7 +900,8 @@ class RegenieEngineConfig:
     step1_hwe_p: float = 1e-15
     step1_ld_window_variants: int = 1000
     step1_ld_step_variants: int = 100
-    step1_ld_r2: float = 0.9
+    step1_ld_r2: float = 0.2
+    step1_max_variants: int = 500_000
     step1_reuse_variant_list: bool = True
     extra_args_step1: List[str] = field(default_factory=list)
     extra_args_step2: List[str] = field(default_factory=list)
@@ -940,6 +941,9 @@ class RegenieEngineConfig:
             )
         if not 0.0 < float(self.step1_ld_r2) < 1.0:
             raise ValueError("gwas.regenie.step1_ld_r2 must be in (0, 1)")
+        _check_positive(self.step1_max_variants, "gwas.regenie.step1_max_variants")
+        if int(self.step1_max_variants) > 1_000_000:
+            raise ValueError("gwas.regenie.step1_max_variants must be <= 1000000")
         if not isinstance(self.step1_reuse_variant_list, bool):
             raise ValueError("gwas.regenie.step1_reuse_variant_list must be a boolean")
         has_extract_arg = any(
