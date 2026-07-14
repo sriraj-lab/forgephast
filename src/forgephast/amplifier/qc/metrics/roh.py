@@ -78,7 +78,7 @@ def compute_roh_metrics(
     ext_data_error: str | None = None,
 ) -> tuple[dict[str, Any], list[Path]]:
     """Compute ROH summary stats for donors and synthetic samples."""
-    from ..pipeline import _resolve_map_path_for_population  # local import avoids heavy QC module import unless needed
+    from ..data_support import resolve_map_path
     from ..plots import save_roh_total_cm_png
 
     enabled = bool(config.qc.roh_enabled)
@@ -124,7 +124,7 @@ def compute_roh_metrics(
         donor_haps = donor_haps_all[: 2 * roh_n_donor, :]
         synth_haps = synth_haps_all[: 2 * roh_n_synth, :]
 
-        map_path = _resolve_map_path_for_population(config, chrom=chrom, pop=pop)
+        map_path = resolve_map_path(config, chrom=chrom, pop=pop)
         map_bp, map_cm = load_genetic_map(map_path)
         cm_positions = interpolate_cm(sampled_pos.astype(np.int64, copy=False), map_bp, map_cm)
         if cm_positions.size != sampled_pos.shape[0]:

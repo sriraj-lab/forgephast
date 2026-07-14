@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from forgephast.amplifier.config import from_yaml
-from forgephast.amplifier.qc.pipeline import _resolve_python_qc_numba_threads
+from forgephast.amplifier.qc.policy_support import resolve_python_qc_numba_threads
 from forgephast.amplifier.qc.matrix_backend import _threads_per_matrix_worker
 from forgephast.amplifier.qc.metrics.ld_decay import ld_curve_from_genotypes
 from forgephast.amplifier.qc.metrics.fst import hudson_fst_from_counts
@@ -16,10 +16,10 @@ def test_resolve_python_qc_numba_threads_precedence(tmp_path):
     cfg = from_yaml(cfg_path)
     cfg.qc.matrix_workers = 9
     cfg.qc.numba_threads = None
-    assert _resolve_python_qc_numba_threads(cfg) == 9
+    assert resolve_python_qc_numba_threads(cfg) == 9
 
     cfg.qc.numba_threads = 7
-    assert _resolve_python_qc_numba_threads(cfg) == 7
+    assert resolve_python_qc_numba_threads(cfg) == 7
 
 
 def test_matrix_worker_thread_budget_is_not_multiplied():

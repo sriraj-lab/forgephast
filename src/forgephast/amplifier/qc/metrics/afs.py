@@ -12,6 +12,7 @@ import pandas as pd
 from forgephast._internal.qc_kernels import maf_from_haplotypes as _utils_maf_from_haplotypes
 
 from ...config import RunConfig
+from .statistics import histogram_probabilities as _hist_probs
 
 logger = logging.getLogger(__name__)
 
@@ -22,20 +23,6 @@ def _maf_from_haplotypes(haps: np.ndarray) -> np.ndarray:
     maf = _utils_maf_from_haplotypes(haps, missing_sentinel=int(_MISSING_SENTINEL), min_an=4)
     maf = maf[np.isfinite(maf)]
     return np.clip(maf.astype(np.float64, copy=False), 0.0, 0.5)
-
-
-def _hist_probs(values: np.ndarray, *, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(values, dtype=np.float64)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return np.zeros(edges.size - 1, dtype=np.float64), np.zeros(edges.size - 1, dtype=np.int64)
-    counts, _ = np.histogram(x, bins=edges)
-    total = float(np.sum(counts))
-    if total <= 0:
-        probs = np.zeros(edges.size - 1, dtype=np.float64)
-    else:
-        probs = counts.astype(np.float64) / total
-    return probs, counts.astype(np.int64, copy=False)
 
 
 def _kl_div(p: np.ndarray, q: np.ndarray) -> float:

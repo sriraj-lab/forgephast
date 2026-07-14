@@ -17,13 +17,15 @@ from uuid import uuid4
 
 import numpy as np
 import pandas as pd
-from hapstore.ids import align_by_ids, read_sample_ids
+from hapstore.ids import read_sample_ids
 
 from ..._internal.cache import bump_counter, canonical_hash
 from ..._internal.resources import require_cpu_budget
 from ..config import CohortConfig, RunConfig
+from .cohort_support import load_population_labels
 from .genotypes import build_genotype_adapter
 from .global_pcs import normalize_psam_fid_column
+from .plink_support import pgen_triplet_exists, plink_memory_args
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +51,6 @@ class ExportArtifacts:
     chrom_pgen_manifest: dict[int, str]
 
 
-def _pgen_triplet_exists(prefix: str | Path) -> bool:
-    base = Path(prefix)
-    return all(Path(f"{base}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
-
-
 def _pgen_metadata_path(prefix: str | Path) -> Path:
     return Path(f"{Path(prefix)}.forgephast.json")
 
@@ -65,7 +62,7 @@ def _remove_pgen_artifacts(prefix: str | Path) -> None:
 
 
 def _pgen_artifact_matches(prefix: str | Path, artifact_key: str) -> bool:
-    if not _pgen_triplet_exists(prefix):
+    if not pgen_triplet_exists(prefix):
         return False
     try:
         payload = json.loads(_pgen_metadata_path(prefix).read_text(encoding="utf-8"))
@@ -75,7 +72,7 @@ def _pgen_artifact_matches(prefix: str | Path, artifact_key: str) -> bool:
 
 
 def _write_pgen_metadata(prefix: str | Path, artifact_key: str, *, kind: str) -> None:
-    if not _pgen_triplet_exists(prefix):
+    if not pgen_triplet_exists(prefix):
         raise RuntimeError(f"Cannot mark incomplete PGEN artifact as complete: {prefix}")
     base = Path(prefix)
     path = _pgen_metadata_path(base)
@@ -118,13 +115,6 @@ def _count_pvar_variants(pvar_path: Path) -> int:
         for count, _ in enumerate(handle):
             pass
     return max(0, count)
-
-
-def _plink_memory_args(run_cfg: RunConfig) -> list[str]:
-    memory_mb = getattr(run_cfg.gwas.plink2, "memory_mb", None)
-    if memory_mb is None:
-        return []
-    return ["--memory", str(int(memory_mb))]
 
 
 def _keep_file_suffix(keep_file: str | Path | None) -> str:
@@ -182,7 +172,7 @@ def _filter_zero_maf_pgen(
         else f"{input_prefix.name}{filter_suffix}{keep_suffix}"
     )
     filtered_prefix = input_prefix.parent / filtered_name
-    if _pgen_triplet_exists(filtered_prefix):
+    if pgen_triplet_exists(filtered_prefix):
         normalize_psam_fid_column(Path(f"{filtered_prefix}.psam"))
         return str(filtered_prefix)
 
@@ -381,38 +371,6 @@ def ensure_manifest_non_monomorphic_pgens(run_cfg: RunConfig, manifest_df: pd.Da
     if changed.any() and "merged_covariates_file" in filtered_df.columns:
         filtered_df.loc[changed, "merged_covariates_file"] = ""
     return filtered_df
-
-
-def _load_population_labels(
-    cohort: CohortConfig,
-    sample_ids: List[str],
-    default_population: str,
-) -> List[str]:
-    """Load per-sample population labels aligned to IID order."""
-    if not cohort.population_map_file:
-        return [default_population] * len(sample_ids)
-
-    pop_df = pd.read_csv(cohort.population_map_file, sep="\t")
-    id_col = "IID" if "IID" in pop_df.columns else "#IID" if "#IID" in pop_df.columns else None
-    if id_col is None:
-        raise ValueError(
-            f"cohort {cohort.name}: population_map_file must contain IID or #IID column"
-        )
-
-    pop_col = "population" if "population" in pop_df.columns else None
-    if pop_col is None:
-        other = [c for c in pop_df.columns if c != id_col]
-        if not other:
-            raise ValueError(f"cohort {cohort.name}: no population column found")
-        pop_col = other[0]
-
-    aligned = align_by_ids(
-        pop_df[[id_col, pop_col]].copy(),
-        id_column=id_col,
-        ids=sample_ids,
-        context=f"cohort {cohort.name} population map alignment",
-    )
-    return aligned[pop_col].astype(str).tolist()
 
 
 def _pick_tag_column(df: pd.DataFrame, causal_col: str) -> str | None:
@@ -674,7 +632,7 @@ def _merge_filtered_chrom_pgens(
         "--indiv-sort",
         "none",
         "--make-pgen",
-        *(_plink_memory_args(run_cfg)),
+        *(plink_memory_args(run_cfg)),
         "--out",
         str(out_prefix),
     ]
@@ -692,33 +650,10 @@ def _merge_filtered_chrom_pgens(
         merge_list.unlink(missing_ok=True)
 
     normalize_psam_fid_column(Path(f"{out_prefix}.psam"))
-    if not _pgen_triplet_exists(out_prefix):
+    if not pgen_triplet_exists(out_prefix):
         raise RuntimeError(f"Merged PGEN is missing output artifacts: {out_prefix}")
     _write_pgen_metadata(out_prefix, artifact_key, kind="merged")
     return str(out_prefix)
-
-
-def _export_one_task_legacy(task: ExportTask, run_cfg: RunConfig, merge_cfg: SimpleNamespace) -> str:
-    artifact_key = canonical_hash({"export_cache_key": task.cache_key, "kind": "legacy"})
-    if bool(run_cfg.pgen_export.reuse_exports) and _pgen_artifact_matches(task.out_prefix, artifact_key):
-        return str(task.out_prefix)
-    _remove_pgen_artifacts(task.out_prefix)
-    adapter = build_genotype_adapter(
-        hapstore_cfg=run_cfg.genotype_input.hapstore,
-    )
-    adapter.validate_files()
-    legacy_export_cfg = SimpleNamespace(**vars(merge_cfg))
-    legacy_export_cfg.filter_monomorphic = False
-    prefix = adapter.export_to_pgen(
-        sample_ids=task.sample_ids,
-        sample_populations=task.sample_populations,
-        out_prefix=task.out_prefix,
-        chromosomes=run_cfg.chromosomes,
-        variant_ids=task.variant_ids,
-        export_cfg=legacy_export_cfg,
-    )
-    _write_pgen_metadata(prefix, artifact_key, kind="legacy")
-    return prefix
 
 
 def _export_one_task_per_chrom(
@@ -844,7 +779,7 @@ def export_manifest_pgens(
             raise ValueError(f"Manifest cohort {cohort_name!r} not found in config cohorts")
 
         sample_ids = read_sample_ids(cohort.sample_ids_file)
-        sample_populations = _load_population_labels(
+        sample_populations = load_population_labels(
             cohort=cohort,
             sample_ids=sample_ids,
             default_population=default_pop,
@@ -904,10 +839,10 @@ def export_manifest_pgens(
                     },
                 )
             chrom_ready = all(
-                _pgen_triplet_exists(prefix)
+                pgen_triplet_exists(prefix)
                 for prefix in cached_artifacts.chrom_pgen_manifest.values()
             )
-            if _pgen_triplet_exists(cached_artifacts.pgen_prefix) and chrom_ready:
+            if pgen_triplet_exists(cached_artifacts.pgen_prefix) and chrom_ready:
                 bump_counter(runtime_cache, hit=True, name="pgen_export")
                 resolved_artifacts_by_key[task.cache_key] = cached_artifacts
                 continue
@@ -941,21 +876,14 @@ def export_manifest_pgens(
                     task.cohort,
                     "all" if task.variant_ids is None else len(task.variant_ids),
                 )
-                if run_cfg.pgen_export.prep_mode == "legacy_whole_store":
-                    prefix = _export_one_task_legacy(task, run_cfg, merge_cfg)
-                    resolved_artifacts_by_key[task.cache_key] = ExportArtifacts(
-                        pgen_prefix=prefix,
-                        chrom_pgen_manifest={},
-                    )
-                else:
-                    resolved_artifacts_by_key[task.cache_key] = _export_one_task_per_chrom(
-                        task, run_cfg, merge_cfg
-                    )
+                resolved_artifacts_by_key[task.cache_key] = _export_one_task_per_chrom(
+                    task, run_cfg, merge_cfg
+                )
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 future_map = {
                     executor.submit(
-                        _export_one_task_legacy if run_cfg.pgen_export.prep_mode == "legacy_whole_store" else _export_one_task_per_chrom,
+                        _export_one_task_per_chrom,
                         task,
                         run_cfg,
                         merge_cfg,
@@ -970,14 +898,7 @@ def export_manifest_pgens(
                         task.cohort,
                         "all" if task.variant_ids is None else len(task.variant_ids),
                     )
-                    result = future.result()
-                    if isinstance(result, str):
-                        resolved_artifacts_by_key[task.cache_key] = ExportArtifacts(
-                            pgen_prefix=result,
-                            chrom_pgen_manifest={},
-                        )
-                    else:
-                        resolved_artifacts_by_key[task.cache_key] = result
+                    resolved_artifacts_by_key[task.cache_key] = future.result()
 
     for key, artifacts in resolved_artifacts_by_key.items():
         if export_cache is not None:
@@ -1012,7 +933,6 @@ def export_manifest_pgens(
         manifest_df.loc[mask, "pgen_filter_mode"] = (
             "native_hapstore"
             if bool(run_cfg.pgen_export.filter_monomorphic)
-            and run_cfg.pgen_export.prep_mode == "per_chrom_plink_merge"
             else "none"
         )
         if bool(run_cfg.pgen_export.filter_monomorphic):
@@ -1023,14 +943,6 @@ def export_manifest_pgens(
             {str(chrom): prefix for chrom, prefix in sorted(artifacts.chrom_pgen_manifest.items())},
             sort_keys=True,
         )
-
-    if (
-        run_cfg.pgen_export.prep_mode == "legacy_whole_store"
-        and bool(run_cfg.pgen_export.filter_monomorphic)
-    ):
-        manifest_df = ensure_manifest_non_monomorphic_pgens(run_cfg, manifest_df)
-        if "pgen_prefix" in manifest_df.columns:
-            manifest_df["merged_pgen_prefix"] = manifest_df["pgen_prefix"]
 
     out_manifest = manifest_path.parent / "run_manifest_pgen.tsv"
     manifest_df.to_csv(out_manifest, sep="\t", index=False)

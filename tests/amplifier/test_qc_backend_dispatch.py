@@ -31,6 +31,7 @@ def test_qc_ld_decay_gate_updates_overall_gate(monkeypatch, tmp_path):
     simulate_chromosome_population_shard_pool(cfg, chrom=21, n_shards=2, task_workers=2, threads_per_task=1, task_start_method="fork")
     merge_chromosome(cfg, chrom=21, n_shards=2)
 
+    matrix_backend = importlib.import_module("forgephast.amplifier.qc.matrix_backend")
     qc_module = importlib.import_module("forgephast.amplifier.qc.pipeline")
 
     def _fake_matrix_backend(**kwargs):
@@ -52,7 +53,7 @@ def test_qc_ld_decay_gate_updates_overall_gate(monkeypatch, tmp_path):
             ld_json,
         )
 
-    monkeypatch.setattr(qc_module, "_run_qc_matrix_hapstore", _fake_matrix_backend)
+    monkeypatch.setattr(matrix_backend, "run_qc_matrix_hapstore_impl", _fake_matrix_backend)
     monkeypatch.setattr(qc_module, "_compute_ld_decay_qc", _fake_ld_decay)
     report = run_qc(cfg, chrom=21, n_shards=2)
 
@@ -80,7 +81,8 @@ def test_qc_stochastic_fst_gate_replaces_standard_gate_when_available(monkeypatc
     simulate_chromosome_population_shard_pool(cfg, chrom=21, n_shards=2, task_workers=2, threads_per_task=1, task_start_method="fork")
     merge_chromosome(cfg, chrom=21, n_shards=2)
 
-    qc_module = importlib.import_module("forgephast.amplifier.qc.pipeline")
+    matrix_backend = importlib.import_module("forgephast.amplifier.qc.matrix_backend")
+    run_support = importlib.import_module("forgephast.amplifier.qc.run_support")
 
     def _fake_matrix_backend(**kwargs):
         return (
@@ -98,9 +100,9 @@ def test_qc_stochastic_fst_gate_replaces_standard_gate_when_available(monkeypatc
             "summary": {"p_ge_observed_abs_diff_mean": 0.9},
         }
 
-    monkeypatch.setattr(qc_module, "_run_qc_matrix_hapstore", _fake_matrix_backend)
-    monkeypatch.setattr(qc_module, "donor_baseline_fst", _fake_donor_baseline)
-    monkeypatch.setattr(qc_module, "_compute_stochastic_donor_fst_gate", _fake_stochastic_gate)
+    monkeypatch.setattr(matrix_backend, "run_qc_matrix_hapstore_impl", _fake_matrix_backend)
+    monkeypatch.setattr(run_support, "donor_baseline_fst", _fake_donor_baseline)
+    monkeypatch.setattr(run_support, "_compute_stochastic_donor_fst_gate", _fake_stochastic_gate)
 
     report = run_qc(cfg, chrom=21, n_shards=2)
     assert report.gate_pass is True
@@ -113,7 +115,7 @@ def test_qc_stochastic_fst_gate_replaces_standard_gate_when_available(monkeypatc
 
 
 def test_apply_admixed_non_gating_metric_helper():
-    qc_module = importlib.import_module("forgephast.amplifier.qc.pipeline")
+    qc_module = importlib.import_module("forgephast.amplifier.qc.admixed_support")
     payload = {
         "gate_pass": False,
         "population_summary": {
@@ -121,7 +123,7 @@ def test_apply_admixed_non_gating_metric_helper():
             "P3": {"gate_pass": False},
         },
     }
-    out = qc_module._apply_admixed_non_gating_to_metric(  # type: ignore[attr-defined]
+    out = qc_module.apply_admixed_non_gating_to_metric(
         payload,
         admixed_pop_names={"P3"},
         reason="non_gating_admixed_policy",

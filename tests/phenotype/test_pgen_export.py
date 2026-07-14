@@ -561,59 +561,11 @@ def test_filtered_prefix_is_rewritten_for_keep_subset(monkeypatch, tmp_path: Pat
     assert len(commands) == 1
 
 
-def test_export_manifest_pgens_legacy_path_still_filters_merged_prefix(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_pgen_export_rejects_removed_legacy_whole_store_mode(tmp_path: Path) -> None:
     payload = _payload(tmp_path)
     payload["pgen_export"]["prep_mode"] = "legacy_whole_store"
-    cfg = RunConfig.from_dict(payload)
-    run_dir = Path(cfg.paths.output_root) / cfg.name
-    truth_dir = run_dir / "truth"
-    truth_dir.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(
-        {
-            "causal_id": ["chr1:10", "chr1:20"],
-            "replicate": [1, 1],
-            "architecture": ["a1", "a1"],
-            "cohort": ["c1", "c1"],
-        }
-    ).to_csv(truth_dir / "causal_membership.tsv", sep="\t", index=False)
-
-    out_dir = run_dir / "replicate_1" / "architecture_a1" / "cohort_c1"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    manifest = pd.DataFrame(
-        {
-            "run_name": [cfg.name],
-            "replicate": [1],
-            "architecture": ["a1"],
-            "cohort": ["c1"],
-            "pgen_prefix": [""],
-            "output_dir": [str(out_dir)],
-        }
-    )
-    manifest_path = run_dir / "run_manifest.tsv"
-    manifest.to_csv(manifest_path, sep="\t", index=False)
-
-    fake = _FakeAdapter()
-    monkeypatch.setattr("forgephast.phenotype.data.pgen_export.build_genotype_adapter", lambda **_: fake)
-
-    def _fake_filter(prefix: str, *, plink2_path: str, threads: int, memory_mb=None, keep_file=None, min_maf=1e-12) -> str:  # noqa: ANN001
-        out_prefix = Path(f"{prefix}.maf_gt0")
-        Path(f"{out_prefix}.pgen").write_text("", encoding="utf-8")
-        Path(f"{out_prefix}.pvar").write_text("#CHROM\tPOS\tID\tREF\tALT\n", encoding="utf-8")
-        Path(f"{out_prefix}.psam").write_text("#FID\tIID\ns1\ts1\ns2\ts2\n", encoding="utf-8")
-        return str(out_prefix)
-
-    monkeypatch.setattr("forgephast.phenotype.data.pgen_export._filter_zero_maf_pgen", _fake_filter)
-
-    out_manifest = export_manifest_pgens(cfg, manifest_path)
-    out = pd.read_csv(out_manifest, sep="\t")
-
-    assert out.loc[0, "pgen_prefix"].endswith(".maf_gt0")
-    assert out.loc[0, "exported_pgen_prefix"] != out.loc[0, "pgen_prefix"]
-    assert out.loc[0, "chrom_pgen_manifest"] == "{}"
-    assert out.loc[0, "pgen_filter_mode"] == "plink2_fallback"
-    assert out.loc[0, "pgen_filter_min_maf"] == 1e-12
+    with pytest.raises(ValueError, match="legacy_whole_store was removed"):
+        RunConfig.from_dict(payload)
 
 
 def test_normalize_fid_for_exported_pgen_sets_fid_to_iid(tmp_path: Path) -> None:

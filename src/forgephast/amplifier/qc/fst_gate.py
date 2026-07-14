@@ -12,10 +12,7 @@ from .metrics.fst import (
     hudson_fst_from_counts as matrix_hudson_fst_from_counts,
     sample_variant_indices,
 )
-
-
-def _pair_key(a: str, b: str) -> str:
-    return f"{a}__{b}" if a <= b else f"{b}__{a}"
+from .policy_support import pair_key
 
 
 def pairwise_fst_from_counts_map_impl(
@@ -26,7 +23,7 @@ def pairwise_fst_from_counts_map_impl(
 ) -> dict[str, float]:
     out: dict[str, float] = {}
     for a, b in pairs:
-        key = _pair_key(a, b)
+        key = pair_key(a, b)
         if a not in counts_by_population or b not in counts_by_population:
             out[key] = float("nan")
             continue
@@ -85,7 +82,7 @@ def donor_baseline_fst_impl(
         common_pos = np.intersect1d(common_pos, per_pop_pos[pop], assume_unique=False)
 
     if common_pos.size < 2:
-        return {_pair_key(a, b): float("nan") for a, b in pairs}
+        return {pair_key(a, b): float("nan") for a, b in pairs}
 
     counts_by_pop: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     n_variants = int(common_pos.size)
@@ -289,7 +286,7 @@ def compute_stochastic_donor_fst_gate_impl(
 
     observed_pair_abs_diff: dict[str, float] = {}
     for a, b in pairs:
-        key = _pair_key(a, b)
+        key = pair_key(a, b)
         obs = pairwise_fst.get(key, float("nan"))
         base = baseline_pairwise_fst.get(key, float("nan"))
         if np.isfinite(obs) and np.isfinite(base):

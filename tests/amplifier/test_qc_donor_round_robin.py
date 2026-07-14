@@ -18,6 +18,7 @@ def test_donor_round_robin_qc_outputs(monkeypatch, tmp_path):
     cfg = from_yaml(cfg_path)
     build_manifest_from_config(cfg)
 
+    data_support = importlib.import_module("forgephast.amplifier.qc.data_support")
     qc_module = importlib.import_module("forgephast.amplifier.qc.pipeline")
     call_counter = {"count": 0}
 
@@ -37,8 +38,8 @@ def test_donor_round_robin_qc_outputs(monkeypatch, tmp_path):
         call_counter["count"] += 1
         return value
 
-    monkeypatch.setattr(qc_module, "_resolve_donor_panel_source_for_population", _fake_resolve_source)
-    monkeypatch.setattr(qc_module, "_load_sample_haplotypes_from_panel", _fake_load_panel)
+    monkeypatch.setattr(data_support, "resolve_donor_panel_source", _fake_resolve_source)
+    monkeypatch.setattr(data_support, "load_sample_haplotypes_from_panel", _fake_load_panel)
     monkeypatch.setattr(qc_module, "matrix_hudson_fst_from_counts", _fake_matrix_hudson)
 
     report = run_donor_within_pop_round_robin(

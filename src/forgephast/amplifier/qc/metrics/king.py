@@ -16,45 +16,11 @@ from ...utils import derived_seed
 
 from forgephast._internal.qc_kernels import king_cross_pairs as _utils_king_cross_pairs
 from forgephast._internal.qc_kernels import king_within_pairs as _utils_king_within_pairs
+from .statistics import auc_from_scores as _auc_from_scores
 
 logger = logging.getLogger(__name__)
 
 _MISSING_SENTINEL = np.uint8(255)
-
-def _auc_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
-    pos = np.asarray(pos_scores, dtype=np.float64)
-    neg = np.asarray(neg_scores, dtype=np.float64)
-    pos = pos[np.isfinite(pos)]
-    neg = neg[np.isfinite(neg)]
-    if pos.size == 0 or neg.size == 0:
-        return float("nan")
-
-    scores = np.concatenate([pos, neg], axis=0)
-    labels = np.concatenate(
-        [np.ones(pos.size, dtype=np.int8), np.zeros(neg.size, dtype=np.int8)],
-        axis=0,
-    )
-
-    order = np.argsort(scores, kind="mergesort")
-    sorted_scores = scores[order]
-    sorted_labels = labels[order]
-
-    n = sorted_scores.size
-    ranks = np.empty(n, dtype=np.float64)
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and sorted_scores[j] == sorted_scores[i]:
-            j += 1
-        avg_rank = 0.5 * ((i + 1) + j)
-        ranks[i:j] = avg_rank
-        i = j
-
-    pos_rank_sum = float(np.sum(ranks[sorted_labels == 1]))
-    u = pos_rank_sum - (pos.size * (pos.size + 1)) / 2.0
-    auc = u / float(pos.size * neg.size)
-    return float(np.clip(auc, 0.0, 1.0))
-
 
 def _summarize(values: np.ndarray) -> dict[str, float | int]:
     x = np.asarray(values, dtype=np.float64)

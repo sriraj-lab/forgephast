@@ -5,59 +5,85 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any
 
+from ..config import RunConfig
+from ..donors import load_manifest
+from ..telemetry import telemetry_span
+from ..utils import ensure_dir
+from . import (
+    admixed_support,
+    data_support,
+    fst_gate,
+    gate_support,
+    matrix_backend,
+    metric_support,
+    policy_support,
+    report_support,
+)
+from .registry import METRIC_REGISTRY
 from .types import QcReport
+
+
+def donor_baseline_fst(
+    config: RunConfig,
+    chrom: int,
+    *,
+    pairs: list[tuple[str, str]] | None = None,
+) -> dict[str, float]:
+    return fst_gate.donor_baseline_fst_impl(
+        config=config,
+        chrom=int(chrom),
+        pairs=pairs,
+        load_manifest_fn=load_manifest,
+        resolve_pairwise_sets_fn=policy_support.resolve_pairwise_sets,
+        resolve_donor_panel_source_for_population_fn=data_support.resolve_donor_panel_source,
+        load_sample_haplotypes_from_panel_fn=data_support.load_sample_haplotypes_from_panel,
+        resolve_python_qc_numba_threads_fn=policy_support.resolve_python_qc_numba_threads,
+    )
+
+
+def _compute_stochastic_donor_fst_gate(**kwargs: Any) -> dict[str, Any]:
+    return fst_gate.compute_stochastic_donor_fst_gate_impl(
+        **kwargs,
+        resolve_donor_panel_source_for_population_fn=data_support.resolve_donor_panel_source,
+        load_sample_haplotypes_from_panel_fn=data_support.load_sample_haplotypes_from_panel,
+    )
+
+
+def _compute_admixed_tract_length_gate(**kwargs: Any) -> dict[str, Any]:
+    return admixed_support.compute_admixed_tract_length_gate(
+        **kwargs,
+        resolve_map_path_fn=data_support.resolve_map_path,
+    )
+
+
+def _compute_admixed_pca_cline_diagnostic(**kwargs: Any) -> dict[str, Any]:
+    return admixed_support.compute_admixed_pca_cline_diagnostic(
+        **kwargs,
+        resolve_panel_source_fn=data_support.resolve_donor_panel_source,
+        load_sample_haplotypes_fn=data_support.load_sample_haplotypes_from_panel,
+        load_synthetic_population_haplotypes_fn=data_support.load_synthetic_population_haplotypes,
+        subsample_ids_fn=data_support.subsample_ids,
+    )
 
 
 def run_qc_impl(
     *,
-    config: Any,
+    config: RunConfig,
     chrom: int,
     n_shards: int,
     logger: logging.Logger,
-    t0: float,
-    stage_timings: dict[str, float],
-    resolve_synthetic_outputs_fn: Callable[[Any, int, int], Any],
-    sample_groups_from_manifest_fn: Callable[[Path], dict[str, list[str]]],
-    resolve_pairwise_sets_fn: Callable[[Any, list[str]], list[tuple[str, str]]],
-    resolve_within_split_checks_fn: Callable[[Any, list[str]], list[str]],
-    resolve_python_qc_numba_threads_fn: Callable[[Any], int],
-    is_admixed_qc_enabled_fn: Callable[[Any, dict[str, bool]], bool],
-    is_admixed_involved_pair_fn: Callable[[tuple[str, str], dict[str, bool]], bool],
-    run_qc_matrix_hapstore_fn: Callable[..., tuple[dict[str, float], dict[str, float]]],
-    evaluate_main_qc_gates_fn: Callable[..., Any],
-    prepare_extended_metric_context_fn: Callable[..., Any],
-    run_registered_metrics_fn: Callable[..., Any],
-    compute_admixed_optional_diagnostics_fn: Callable[..., tuple[dict[str, Any], dict[str, float]]],
-    build_population_status_fn: Callable[..., dict[str, dict[str, Any]]],
-    build_admixed_qc_summary_fn: Callable[..., tuple[dict[str, Any], bool | None]],
-    write_qc_diagnostics_and_finalize_fn: Callable[..., QcReport],
-    load_manifest_fn: Callable[[Any], Any],
-    apply_admixed_non_gating_fn: Callable[..., dict[str, Any]],
-    resolve_donor_panel_source_for_population_fn: Callable[[int, str], tuple[str, Path]],
-    load_sample_haplotypes_from_panel_fn: Callable[..., tuple[Any, Any]],
-    load_synthetic_population_haplotypes_fn: Callable[..., tuple[Any, Any]],
-    donor_baseline_fst_fn: Callable[..., dict[str, float]],
-    resolve_fst_stochastic_gate_activation_fn: Callable[..., dict[str, Any] | None],
-    compute_stochastic_donor_fst_gate_fn: Callable[..., dict[str, Any]],
-    compute_msprime_tract_composition_gate_fn: Callable[..., dict[str, Any]],
-    compute_admixed_tract_length_gate_fn: Callable[..., dict[str, Any]],
-    compute_admixed_ancestry_variance_gate_fn: Callable[..., dict[str, Any]],
-    compute_admixed_pca_cline_diagnostic_fn: Callable[..., dict[str, Any]],
-    compute_admixed_king_diagnostic_fn: Callable[..., dict[str, Any]],
-    telemetry_span_fn: Callable[..., Any],
-    ensure_dir_fn: Callable[[Path], Path],
-    subsample_ids_fn: Callable[[list[str], int, int], list[str]],
-    metric_registry: tuple[Any, ...],
 ) -> QcReport:
-    with telemetry_span_fn(logger, "qc.resolve_inputs", chrom=int(chrom), n_shards=int(n_shards)):
-        inputs = resolve_synthetic_outputs_fn(config, chrom=int(chrom), n_shards=int(n_shards))
-        groups = sample_groups_from_manifest_fn(inputs.sample_manifest)
+    t0 = perf_counter()
+    stage_timings: dict[str, float] = {}
+    with telemetry_span(logger, "qc.resolve_inputs", chrom=int(chrom), n_shards=int(n_shards)):
+        inputs = data_support.resolve_synthetic_outputs(config, chrom=int(chrom), n_shards=int(n_shards))
+        groups = data_support.sample_groups_from_manifest(inputs.sample_manifest)
         pop_names = sorted(groups.keys())
-        pairs = resolve_pairwise_sets_fn(config, pop_names)
-        within_checks = resolve_within_split_checks_fn(config, pop_names)
-        python_qc_numba_threads = resolve_python_qc_numba_threads_fn(config)
+        pairs = policy_support.resolve_pairwise_sets(config, pop_names)
+        within_checks = policy_support.resolve_within_split_checks(config, pop_names)
+        python_qc_numba_threads = policy_support.resolve_python_qc_numba_threads(config)
 
     population_spec_by_name = {str(pop.name): pop for pop in config.populations}
     population_engine = {
@@ -79,11 +105,19 @@ def run_qc_impl(
     }
     admixed_pop_names = [pop for pop in pop_names if bool(population_msprime_is_admixed.get(pop, False))]
     admixed_pop_set = set(admixed_pop_names)
-    admixed_qc_enabled = is_admixed_qc_enabled_fn(config, population_msprime_is_admixed)
-    source_source_pairs = [pair for pair in pairs if not is_admixed_involved_pair_fn(pair, population_msprime_is_admixed)]
-    admixed_involved_pairs = [pair for pair in pairs if is_admixed_involved_pair_fn(pair, population_msprime_is_admixed)]
+    admixed_qc_enabled = admixed_support.is_admixed_qc_enabled(config, population_msprime_is_admixed)
+    source_source_pairs = [
+        pair
+        for pair in pairs
+        if not admixed_support.is_admixed_involved_pair(pair, population_msprime_is_admixed)
+    ]
+    admixed_involved_pairs = [
+        pair
+        for pair in pairs
+        if admixed_support.is_admixed_involved_pair(pair, population_msprime_is_admixed)
+    ]
 
-    with telemetry_span_fn(
+    with telemetry_span(
         logger,
         "qc.compute_fst",
         chrom=int(chrom),
@@ -93,7 +127,7 @@ def run_qc_impl(
         n_within=int(len(within_checks)),
     ):
         t_pairwise = perf_counter()
-        pairwise, within = run_qc_matrix_hapstore_fn(
+        pairwise, within = matrix_backend.run_qc_matrix_hapstore_impl(
             config=config,
             chrom=int(chrom),
             inputs=inputs,
@@ -101,6 +135,7 @@ def run_qc_impl(
             pairs=pairs,
             within_checks=within_checks,
             numba_threads=python_qc_numba_threads,
+            logger=logger,
         )
         stage_timings["compute_pairwise_within_sec"] = perf_counter() - t_pairwise
     logger.info(
@@ -131,10 +166,10 @@ def run_qc_impl(
         and (inputs.combined_hapstore is not None or inputs.population_hapstores)
     ):
         fst_gate_tolerance = float(config.qc.sampled_gate_tolerance_relative)
-    diagnostics_dir = ensure_dir_fn(config.run_root / "diagnostics")
-    pair_key_to_pair = {f"{a}__{b}" if a <= b else f"{b}__{a}": (a, b) for a, b in pairs}
-    with telemetry_span_fn(logger, "qc.donor_gate", chrom=int(chrom)):
-        gate_eval = evaluate_main_qc_gates_fn(
+    diagnostics_dir = ensure_dir(config.run_root / "diagnostics")
+    pair_key_to_pair = {policy_support.pair_key(a, b): (a, b) for a, b in pairs}
+    with telemetry_span(logger, "qc.donor_gate", chrom=int(chrom)):
+        gate_eval = gate_support.evaluate_main_qc_gates(
             config=config,
             chrom=int(chrom),
             n_shards=int(n_shards),
@@ -151,14 +186,14 @@ def run_qc_impl(
             diagnostics_dir=diagnostics_dir,
             fst_gate_tolerance=fst_gate_tolerance,
             python_qc_numba_threads=python_qc_numba_threads,
-            donor_baseline_fst_fn=donor_baseline_fst_fn,
-            load_manifest_fn=load_manifest_fn,
-            stochastic_gate_activation_fn=resolve_fst_stochastic_gate_activation_fn,
-            stochastic_gate_fn=compute_stochastic_donor_fst_gate_fn,
-            msprime_tract_composition_gate_fn=compute_msprime_tract_composition_gate_fn,
-            admixed_tract_length_gate_fn=compute_admixed_tract_length_gate_fn,
-            admixed_ancestry_variance_gate_fn=compute_admixed_ancestry_variance_gate_fn,
-            is_admixed_involved_pair_fn=is_admixed_involved_pair_fn,
+            donor_baseline_fst_fn=donor_baseline_fst,
+            load_manifest_fn=load_manifest,
+            stochastic_gate_activation_fn=fst_gate.resolve_fst_stochastic_gate_activation_impl,
+            stochastic_gate_fn=_compute_stochastic_donor_fst_gate,
+            msprime_tract_composition_gate_fn=admixed_support.compute_msprime_tract_composition_gate,
+            admixed_tract_length_gate_fn=_compute_admixed_tract_length_gate,
+            admixed_ancestry_variance_gate_fn=admixed_support.compute_admixed_ancestry_variance_gate,
+            is_admixed_involved_pair_fn=admixed_support.is_admixed_involved_pair,
             logger=logger,
         )
         gate_pass = gate_eval.gate_pass
@@ -175,16 +210,18 @@ def run_qc_impl(
         admixed_ancestry_variance_gate = gate_eval.admixed_ancestry_variance_gate
         stage_timings.update(gate_eval.stage_timings)
 
-    ext_context = prepare_extended_metric_context_fn(
+    ext_context = metric_support.prepare_extended_metric_context(
         config=config,
         chrom=int(chrom),
         groups=groups,
         inputs=inputs,
-        load_manifest_fn=load_manifest_fn,
-        subsample_ids_fn=lambda ids, target_n, seed: subsample_ids_fn(list(ids), int(target_n), int(seed)),
-        resolve_panel_source_for_population_fn=lambda c, pop: resolve_donor_panel_source_for_population_fn(int(c), str(pop)),
+        load_manifest_fn=load_manifest,
+        subsample_ids_fn=data_support.subsample_ids,
+        resolve_panel_source_for_population_fn=lambda c, pop: data_support.resolve_donor_panel_source(
+            config, int(c), str(pop)
+        ),
         load_sample_haplotypes_from_panel_source_fn=lambda kind, source_path, c, sample_ids: (
-            load_sample_haplotypes_from_panel_fn(
+            data_support.load_sample_haplotypes_from_panel(
                 config=config,
                 source_path=Path(source_path),
                 chrom=int(c),
@@ -193,8 +230,7 @@ def run_qc_impl(
             )
         ),
         load_synthetic_population_haplotypes_fn=lambda inps, c, pop, sample_ids: (
-            load_synthetic_population_haplotypes_fn(
-                config=config,
+            data_support.load_synthetic_population_haplotypes(
                 inputs=inps,
                 chrom=int(c),
                 pop=str(pop),
@@ -203,18 +239,18 @@ def run_qc_impl(
         ),
         logger=logger,
     )
-    metric_eval = run_registered_metrics_fn(
+    metric_eval = metric_support.run_registered_metrics(
         config=config,
         chrom=int(chrom),
         inputs=inputs,
         groups=groups,
         diagnostics_dir=diagnostics_dir,
         numba_threads=python_qc_numba_threads,
-        metric_registry=metric_registry,
+        metric_registry=METRIC_REGISTRY,
         ext_context=ext_context,
         admixed_qc_enabled=admixed_qc_enabled,
         admixed_pop_set=admixed_pop_set,
-        apply_admixed_non_gating_fn=apply_admixed_non_gating_fn,
+        apply_admixed_non_gating_fn=admixed_support.apply_admixed_non_gating_to_metric,
         initial_gate_pass=gate_pass,
         logger=logger,
     )
@@ -223,7 +259,7 @@ def run_qc_impl(
     ld_decay_path = metric_eval.ld_decay_path
     stage_timings.update(metric_eval.stage_timings)
 
-    admixed_optional_diagnostics, admixed_diag_timings = compute_admixed_optional_diagnostics_fn(
+    admixed_optional_diagnostics, admixed_diag_timings = report_support.compute_admixed_optional_diagnostics(
         config=config,
         chrom=int(chrom),
         admixed_qc_enabled=admixed_qc_enabled,
@@ -233,18 +269,18 @@ def run_qc_impl(
         admixed_pop_names=admixed_pop_names,
         diagnostics_dir=diagnostics_dir,
         king_payload=metric_payloads["king"],
-        compute_pca_cline_fn=compute_admixed_pca_cline_diagnostic_fn,
-        compute_king_fn=compute_admixed_king_diagnostic_fn,
+        compute_pca_cline_fn=_compute_admixed_pca_cline_diagnostic,
+        compute_king_fn=admixed_support.compute_admixed_king_diagnostic,
     )
     stage_timings.update(admixed_diag_timings)
 
-    population_status = build_population_status_fn(
+    population_status = report_support.build_population_status(
         pop_names=pop_names,
         population_spec_by_name=population_spec_by_name,
         population_engine=population_engine,
         population_msprime_is_admixed=population_msprime_is_admixed,
     )
-    admixed_qc, hard_gate_pass = build_admixed_qc_summary_fn(
+    admixed_qc, hard_gate_pass = report_support.build_admixed_qc_summary(
         config=config,
         admixed_qc_enabled=admixed_qc_enabled,
         admixed_pop_names=admixed_pop_names,
@@ -260,7 +296,7 @@ def run_qc_impl(
     if hard_gate_pass is False:
         gate_pass = False
 
-    return write_qc_diagnostics_and_finalize_fn(
+    return report_support.write_qc_diagnostics_and_finalize(
         logger=logger,
         chrom=int(chrom),
         config=config,

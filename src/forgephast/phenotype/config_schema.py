@@ -804,9 +804,14 @@ class PgenExportConfig:
     random_seed: int = 42
 
     def validate(self) -> None:
+        if self.prep_mode == "legacy_whole_store":
+            raise ValueError(
+                "pgen_export.prep_mode=legacy_whole_store was removed; "
+                "use per_chrom_plink_merge"
+            )
         _check_one_of(
             self.prep_mode,
-            {"per_chrom_plink_merge", "legacy_whole_store"},
+            {"per_chrom_plink_merge"},
             "pgen_export.prep_mode",
         )
         _check_one_of(

@@ -81,13 +81,6 @@ def _write_plink2_keep_file(keep_file: Path, sample_ids: list[str], *, psam_path
                 handle.write(f"{iid}\n")
 
 
-def _plink_memory_args(run_cfg: RunConfig) -> list[str]:
-    memory_mb = getattr(run_cfg.gwas.plink2, "memory_mb", None)
-    if memory_mb is None:
-        return []
-    return ["--memory", str(int(memory_mb))]
-
-
 def _randomized_svd_compat(
     x: np.ndarray,
     *,

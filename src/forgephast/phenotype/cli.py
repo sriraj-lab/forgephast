@@ -32,6 +32,7 @@ from .config import RunConfig
 from .data.genotypes import build_genotype_adapter
 from .data.global_pcs import refresh_manifest_global_pcs
 from .data.pgen_export import ensure_manifest_non_monomorphic_pgens, export_manifest_pgens
+from .data.plink_support import pgen_triplet_exists
 from .grid import (
     build_grouped_cases,
     execute_group,
@@ -88,18 +89,13 @@ def _write_stage_timing(
     return out_path
 
 
-def _pgen_triplet_exists(prefix: str | Path) -> bool:
-    base = Path(prefix)
-    return all(Path(f"{base}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
-
-
 def _manifest_has_ready_pgens(manifest_df: pd.DataFrame) -> bool:
     if "pgen_prefix" not in manifest_df.columns:
         return False
     prefixes = manifest_df["pgen_prefix"].fillna("").astype(str).str.strip()
     if prefixes.empty or (prefixes == "").any():
         return False
-    return all(_pgen_triplet_exists(prefix) for prefix in prefixes.tolist())
+    return all(pgen_triplet_exists(prefix) for prefix in prefixes.tolist())
 
 
 def _manifest_has_ready_global_pcs(manifest_df: pd.DataFrame) -> bool:

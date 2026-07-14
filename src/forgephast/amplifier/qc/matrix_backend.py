@@ -17,10 +17,7 @@ from .metrics.fst import (
     sample_variant_indices,
 )
 from .types import QcInputs
-
-
-def _pair_key(a: str, b: str) -> str:
-    return f"{a}__{b}" if a <= b else f"{b}__{a}"
+from .policy_support import pair_key
 
 
 def _threads_per_matrix_worker(total_threads: int | None, workers: int) -> int | None:
@@ -188,7 +185,7 @@ def run_qc_matrix_hapstore_impl(
             raise ValueError(f"pairwise populations not available in HapStore counts: ({a}, {b})")
         ac_a, an_a = per_pop_counts[a]
         ac_b, an_b = per_pop_counts[b]
-        pairwise[_pair_key(a, b)] = matrix_hudson_fst_from_counts(
+        pairwise[pair_key(a, b)] = matrix_hudson_fst_from_counts(
             ac_a,
             an_a,
             ac_b,

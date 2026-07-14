@@ -16,8 +16,9 @@ from ...local_ancestry import LocalAncestrySource
 from ..architectures.base import ArchitectureInput, create_plugin
 from ..causal.hybrid_sampler import sample_membership_for_replicate
 from ..causal.selection import build_bucketed_pool
-from ..config import CohortConfig, GlobalPCConfig, RunConfig
+from ..config import GlobalPCConfig, RunConfig
 from ..covariates.model import build_covariate_effects
+from ..data.cohort_support import load_population_labels
 from ..data.genotypes import (
     GenotypeAdapter,
     build_genotype_adapter,
@@ -718,40 +719,6 @@ def _build_background_component(
     return _sample_mvnormal_from_cov(cov=cov, seed=replicate_seed)
 
 
-def _load_population_labels(
-    cohort: CohortConfig,
-    sample_ids: List[str],
-    default_population: str,
-) -> List[str]:
-    """Load per-sample population labels aligned to sample IDs."""
-    if not cohort.population_map_file:
-        return [default_population] * len(sample_ids)
-
-    pop_df = pd.read_csv(cohort.population_map_file, sep="\t")
-    id_col = "IID" if "IID" in pop_df.columns else "#IID" if "#IID" in pop_df.columns else None
-    if id_col is None:
-        raise ValueError(
-            f"cohort {cohort.name}: population_map_file must contain IID or #IID column"
-        )
-
-    pop_col = "population" if "population" in pop_df.columns else None
-    if pop_col is None:
-        candidates = [c for c in pop_df.columns if c != id_col]
-        if not candidates:
-            raise ValueError(
-                f"cohort {cohort.name}: could not infer population column from map file"
-            )
-        pop_col = candidates[0]
-
-    aligned = align_by_ids(
-        pop_df[[id_col, pop_col]].copy(),
-        id_column=id_col,
-        ids=sample_ids,
-        context=f"cohort {cohort.name} population map alignment",
-    )
-    return aligned[pop_col].astype(str).tolist()
-
-
 def _parse_chr_pos_variant_id(variant_id: str) -> tuple[int, int]:
     value = str(variant_id)
     if not value.startswith("chr") or ":" not in value:
@@ -936,7 +903,7 @@ def run_simulation(
             if cohort.name in sample_pops_cache:
                 sample_populations = sample_pops_cache[cohort.name]
             else:
-                sample_populations = _load_population_labels(
+                sample_populations = load_population_labels(
                     cohort=cohort,
                     sample_ids=sample_ids,
                     default_population=default_population,

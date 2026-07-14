@@ -21,45 +21,16 @@ from forgephast._internal.qc_kernels import (
 )
 
 from ...config import RunConfig
+from .statistics import (
+    histogram_probabilities as _hist_probs,
+    maf_from_genotype_counts as _maf_from_genotype_counts,
+    root_mean_square_error as _rmse,
+)
 
 logger = logging.getLogger(__name__)
 
 _MISSING_SENTINEL = np.uint8(255)
 _TAIL_ALPHAS = (1e-6, 1e-4)
-
-
-def _hist_probs(values: np.ndarray, *, edges: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(values, dtype=np.float64)
-    x = x[np.isfinite(x)]
-    if x.size == 0:
-        return np.zeros(edges.size - 1, dtype=np.float64), np.zeros(edges.size - 1, dtype=np.int64)
-    counts, _ = np.histogram(x, bins=edges)
-    total = float(np.sum(counts))
-    if total <= 0.0:
-        probs = np.zeros(edges.size - 1, dtype=np.float64)
-    else:
-        probs = counts.astype(np.float64) / total
-    return probs, counts.astype(np.int64, copy=False)
-
-
-def _rmse(a: np.ndarray, b: np.ndarray) -> float:
-    x = np.asarray(a, dtype=np.float64)
-    y = np.asarray(b, dtype=np.float64)
-    if x.shape != y.shape:
-        raise ValueError("rmse inputs must have identical shapes")
-    diff = x - y
-    return float(np.sqrt(np.mean(diff * diff)))
-
-
-def _maf_from_genotype_counts(n_obs: np.ndarray, n_het: np.ndarray, n_hom_alt: np.ndarray) -> np.ndarray:
-    obs = np.asarray(n_obs, dtype=np.float64)
-    het = np.asarray(n_het, dtype=np.float64)
-    hom_alt = np.asarray(n_hom_alt, dtype=np.float64)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        p = (2.0 * hom_alt + het) / (2.0 * obs)
-    maf = np.minimum(p, 1.0 - p)
-    maf = np.where(np.isfinite(maf), maf, np.nan)
-    return np.clip(maf.astype(np.float64, copy=False), 0.0, 0.5)
 
 
 def compute_hwe_metrics(
@@ -302,4 +273,3 @@ def compute_hwe_metrics(
     )
     logger.info("HWE QC complete chrom=%s pops=%s table=%s", chrom, len(pops), table_path)
     return payload, created
-

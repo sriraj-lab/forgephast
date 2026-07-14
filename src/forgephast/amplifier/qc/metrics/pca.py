@@ -13,48 +13,12 @@ import pandas as pd
 from ...config import RunConfig
 from ..io import haplotypes_to_genotypes_f32
 from ...utils import derived_seed
+from .statistics import auc_from_scores as _auc_from_scores
 
 logger = logging.getLogger(__name__)
 
 _SVD_FALLBACK_MAX_ELEMENTS = 2_000_000
 _SVD_FALLBACK_MAX_DIM = 2000
-
-
-def _auc_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
-    """Compute ROC AUC without external deps (Mann–Whitney U with tie handling)."""
-    pos = np.asarray(pos_scores, dtype=np.float64)
-    neg = np.asarray(neg_scores, dtype=np.float64)
-    pos = pos[np.isfinite(pos)]
-    neg = neg[np.isfinite(neg)]
-    if pos.size == 0 or neg.size == 0:
-        return float("nan")
-
-    scores = np.concatenate([pos, neg], axis=0)
-    labels = np.concatenate(
-        [np.ones(pos.size, dtype=np.int8), np.zeros(neg.size, dtype=np.int8)],
-        axis=0,
-    )
-
-    order = np.argsort(scores, kind="mergesort")
-    sorted_scores = scores[order]
-    sorted_labels = labels[order]
-
-    # Average ranks for ties.
-    n = sorted_scores.size
-    ranks = np.empty(n, dtype=np.float64)
-    i = 0
-    while i < n:
-        j = i + 1
-        while j < n and sorted_scores[j] == sorted_scores[i]:
-            j += 1
-        avg_rank = 0.5 * ((i + 1) + j)  # 1-based ranks i+1..j
-        ranks[i:j] = avg_rank
-        i = j
-
-    pos_rank_sum = float(np.sum(ranks[sorted_labels == 1]))
-    u = pos_rank_sum - (pos.size * (pos.size + 1)) / 2.0
-    auc = u / float(pos.size * neg.size)
-    return float(np.clip(auc, 0.0, 1.0))
 
 
 def _standardize_scores(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
