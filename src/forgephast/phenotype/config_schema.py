@@ -893,6 +893,15 @@ class RegenieEngineConfig:
     threads: int = 1
     bsize_step1: int = 1000
     bsize_step2: int = 400
+    step1_variant_mode: str = "ld_pruned_common"
+    step1_min_maf: float = 0.01
+    step1_min_mac: int = 100
+    step1_max_missing: float = 0.1
+    step1_hwe_p: float = 1e-15
+    step1_ld_window_variants: int = 1000
+    step1_ld_step_variants: int = 100
+    step1_ld_r2: float = 0.9
+    step1_reuse_variant_list: bool = True
     extra_args_step1: List[str] = field(default_factory=list)
     extra_args_step2: List[str] = field(default_factory=list)
 
@@ -900,6 +909,48 @@ class RegenieEngineConfig:
         _check_positive(self.threads, "gwas.regenie.threads")
         _check_positive(self.bsize_step1, "gwas.regenie.bsize_step1")
         _check_positive(self.bsize_step2, "gwas.regenie.bsize_step2")
+        _check_one_of(
+            self.step1_variant_mode,
+            {"ld_pruned_common", "all"},
+            "gwas.regenie.step1_variant_mode",
+        )
+        if not 0.0 < float(self.step1_min_maf) <= 0.5:
+            raise ValueError("gwas.regenie.step1_min_maf must be in (0, 0.5]")
+        _check_positive(self.step1_min_mac, "gwas.regenie.step1_min_mac")
+        _check_in_range(
+            self.step1_max_missing,
+            0.0,
+            1.0,
+            "gwas.regenie.step1_max_missing",
+        )
+        if not 0.0 < float(self.step1_hwe_p) <= 1.0:
+            raise ValueError("gwas.regenie.step1_hwe_p must be in (0, 1]")
+        _check_positive(
+            self.step1_ld_window_variants,
+            "gwas.regenie.step1_ld_window_variants",
+        )
+        _check_positive(
+            self.step1_ld_step_variants,
+            "gwas.regenie.step1_ld_step_variants",
+        )
+        if int(self.step1_ld_step_variants) > int(self.step1_ld_window_variants):
+            raise ValueError(
+                "gwas.regenie.step1_ld_step_variants cannot exceed "
+                "step1_ld_window_variants"
+            )
+        if not 0.0 < float(self.step1_ld_r2) < 1.0:
+            raise ValueError("gwas.regenie.step1_ld_r2 must be in (0, 1)")
+        if not isinstance(self.step1_reuse_variant_list, bool):
+            raise ValueError("gwas.regenie.step1_reuse_variant_list must be a boolean")
+        has_extract_arg = any(
+            str(arg) == "--extract" or str(arg).startswith("--extract=")
+            for arg in self.extra_args_step1
+        )
+        if self.step1_variant_mode != "all" and has_extract_arg:
+            raise ValueError(
+                "gwas.regenie.extra_args_step1 cannot contain --extract when "
+                "step1_variant_mode=ld_pruned_common"
+            )
 
 
 @dataclass

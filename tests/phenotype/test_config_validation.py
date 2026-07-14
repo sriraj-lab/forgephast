@@ -99,6 +99,12 @@ def test_valid_config_builds() -> None:
     assert cfg.pgen_export.min_maf == 1e-12
     assert cfg.pgen_export.shard_tmp_dir is None
     assert cfg.gwas.global_pcs.prune_before_pca is True
+    assert cfg.gwas.regenie.step1_variant_mode == "ld_pruned_common"
+    assert cfg.gwas.regenie.step1_min_maf == 0.01
+    assert cfg.gwas.regenie.step1_min_mac == 100
+    assert cfg.gwas.regenie.step1_ld_window_variants == 1000
+    assert cfg.gwas.regenie.step1_ld_step_variants == 100
+    assert cfg.gwas.regenie.step1_ld_r2 == 0.9
     assert cfg.causal_selection.maf_bucket_column == "maf_eur"
     assert cfg.causal_selection.effect_scale_maf_column == "maf_eur"
 
@@ -475,6 +481,42 @@ def test_rejects_non_boolean_global_pcs_reuse_cache() -> None:
     payload = _base_payload()
     payload["gwas"]["global_pcs"]["reuse_cache"] = "yes"
     with pytest.raises(ValueError, match="reuse_cache"):
+        RunConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("step1_variant_mode", "causal", "step1_variant_mode"),
+        ("step1_min_maf", 0.0, "step1_min_maf"),
+        ("step1_min_mac", 0, "step1_min_mac"),
+        ("step1_max_missing", 1.1, "step1_max_missing"),
+        ("step1_hwe_p", 0.0, "step1_hwe_p"),
+        ("step1_ld_window_variants", 0, "step1_ld_window_variants"),
+        ("step1_ld_step_variants", 0, "step1_ld_step_variants"),
+        ("step1_ld_r2", 1.0, "step1_ld_r2"),
+        ("step1_reuse_variant_list", "yes", "step1_reuse_variant_list"),
+    ],
+)
+def test_rejects_invalid_regenie_step1_variant_config(
+    field: str,
+    value: object,
+    match: str,
+) -> None:
+    payload = _base_payload()
+    payload["gwas"].setdefault("regenie", {})[field] = value
+    with pytest.raises(ValueError, match=match):
+        RunConfig.from_dict(payload)
+
+
+@pytest.mark.parametrize("extract_arg", ["--extract", "--extract=/tmp/variants.txt"])
+def test_rejects_regenie_step1_extract_collision(extract_arg: str) -> None:
+    payload = _base_payload()
+    payload["gwas"]["regenie"] = {
+        "step1_variant_mode": "ld_pruned_common",
+        "extra_args_step1": [extract_arg, "/tmp/variants.txt"],
+    }
+    with pytest.raises(ValueError, match="cannot contain --extract"):
         RunConfig.from_dict(payload)
 
 

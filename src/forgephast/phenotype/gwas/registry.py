@@ -25,7 +25,7 @@ _ENGINE_REGISTRY: dict[str, EngineRegistration] = {
     "regenie": EngineRegistration(
         name="regenie",
         config_attr="regenie",
-        factory=lambda cfg: RegenieEngine(cfg.gwas.regenie),
+        factory=lambda cfg: RegenieEngine(cfg.gwas.regenie, cfg.gwas.plink2),
     ),
 }
 

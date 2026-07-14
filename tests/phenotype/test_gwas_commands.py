@@ -70,13 +70,23 @@ def _make_task(tmp_path: Path) -> GwasTask:
     pcs.to_csv(pcs_path, sep="\t", index=False)
     pheno.to_csv(pheno_path, sep="\t", index=False)
     keep.to_csv(keep_path, sep="\t", index=False)
+    pgen_prefix = tmp_path / "fake_pgen_prefix"
+    Path(f"{pgen_prefix}.pgen").write_bytes(b"pgen")
+    Path(f"{pgen_prefix}.pvar").write_text(
+        "#CHROM\tPOS\tID\tREF\tALT\n1\t10\tv1\tA\tG\n",
+        encoding="utf-8",
+    )
+    Path(f"{pgen_prefix}.psam").write_text(
+        "#FID\tIID\ns1\ts1\ns2\ts2\n",
+        encoding="utf-8",
+    )
 
     return GwasTask(
         run_name="r",
         replicate=1,
         architecture="a",
         cohort="c",
-        pgen_prefix="/tmp/fake_pgen_prefix",
+        pgen_prefix=str(pgen_prefix),
         keep_file=str(keep_path),
         phenotype_file=str(pheno_path),
         covariates_file=str(cov_path),
@@ -148,7 +158,9 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
         out_idx = cmd.index("--out") + 1
         out_prefix = Path(cmd[out_idx])
         out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
+        if "--indep-pairwise" in cmd:
+            Path(f"{out_prefix}.prune.in").write_text("v1\n", encoding="utf-8")
+        elif "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
             Path(f"{out_prefix}_pred.list").write_text("pred\n")
         else:
             Path(f"{out_prefix}.regenie.Ydict").write_text("Y1 PHENO\n")
@@ -157,7 +169,10 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    engine = RegenieEngine(RegenieEngineConfig(path="regenie", threads=1))
+    engine = RegenieEngine(
+        RegenieEngineConfig(path="regenie", threads=1),
+        Plink2EngineConfig(path="plink2-custom", threads=2, memory_mb=2048),
+    )
     result = engine.run(task, tmp_path / "run")
     assert result.engine == "regenie"
     assert Path(result.primary_output).exists()
@@ -165,11 +180,29 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert result.metadata["monitor_step1_log"].endswith("step1.log")
     assert result.metadata["monitor_step1_pred_list"].endswith("step1_pred.list")
     assert "step2*.regenie*" in result.metadata["monitor_step2_glob"]
-    assert calls["n"] == 2
-    assert all("--chrList" in cmd for cmd in commands)
-    assert all(cmd[cmd.index("--chrList") + 1] == "1,3" for cmd in commands)
-    assert all("--qt" in cmd for cmd in commands)
-    assert all("--bt" not in cmd for cmd in commands)
+    assert calls["n"] == 3
+    prune_cmd, step1_cmd, step2_cmd = commands
+    assert prune_cmd[0] == "plink2-custom"
+    assert prune_cmd[prune_cmd.index("--threads") + 1] == "2"
+    assert prune_cmd[prune_cmd.index("--memory") + 1] == "2048"
+    assert "--indep-pairwise" in prune_cmd
+    prune_idx = prune_cmd.index("--indep-pairwise")
+    assert prune_cmd[prune_idx + 1 : prune_idx + 4] == [
+        "1000",
+        "100",
+        "0.9",
+    ]
+    assert prune_cmd[prune_cmd.index("--maf") + 1] == "0.01"
+    assert prune_cmd[prune_cmd.index("--mac") + 1] == "100"
+    assert "--extract" in step1_cmd
+    assert step1_cmd[step1_cmd.index("--extract") + 1].endswith("step1_variants.prune.in")
+    assert "--extract" not in step2_cmd
+    assert all("--chrList" in cmd for cmd in (step1_cmd, step2_cmd))
+    assert all(cmd[cmd.index("--chrList") + 1] == "1,3" for cmd in (step1_cmd, step2_cmd))
+    assert all("--qt" in cmd for cmd in (step1_cmd, step2_cmd))
+    assert all("--bt" not in cmd for cmd in (step1_cmd, step2_cmd))
+    assert result.metadata["step1_variant_count"] == 1
+    assert result.metadata["step1_variant_cache_hit"] is False
 
 
 def test_regenie_engine_uses_binary_trait_flag(monkeypatch, tmp_path: Path) -> None:
@@ -182,7 +215,9 @@ def test_regenie_engine_uses_binary_trait_flag(monkeypatch, tmp_path: Path) -> N
         out_idx = cmd.index("--out") + 1
         out_prefix = Path(cmd[out_idx])
         out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
+        if "--indep-pairwise" in cmd:
+            Path(f"{out_prefix}.prune.in").write_text("v1\n", encoding="utf-8")
+        elif "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
             Path(f"{out_prefix}_pred.list").write_text("pred\n")
         else:
             Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
@@ -194,9 +229,69 @@ def test_regenie_engine_uses_binary_trait_flag(monkeypatch, tmp_path: Path) -> N
     result = engine.run(task, tmp_path / "run")
 
     assert result.engine == "regenie"
+    regenie_commands = [cmd for cmd in commands if "--step" in cmd]
+    assert len(commands) == 3
+    assert all("--bt" in cmd for cmd in regenie_commands)
+    assert all("--qt" not in cmd for cmd in regenie_commands)
+
+
+def test_regenie_engine_all_mode_skips_step1_variant_selection(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    commands = []
+
+    def fake_run(cmd, capture_output, text):
+        commands.append(list(cmd))
+        out_prefix = Path(cmd[cmd.index("--out") + 1])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        if cmd[cmd.index("--step") + 1] == "1":
+            Path(f"{out_prefix}_pred.list").write_text("pred\n")
+        else:
+            Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    engine = RegenieEngine(
+        RegenieEngineConfig(path="regenie", threads=1, step1_variant_mode="all")
+    )
+    result = engine.run(task, tmp_path / "run")
+
     assert len(commands) == 2
-    assert all("--bt" in cmd for cmd in commands)
-    assert all("--qt" not in cmd for cmd in commands)
+    assert all("--extract" not in cmd for cmd in commands)
+    assert result.metadata["step1_variant_mode"] == "all"
+    assert result.metadata["step1_variant_list"] == ""
+
+
+def test_regenie_engine_reuses_identity_keyed_step1_variant_list(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    task = _make_task(tmp_path)
+    commands = []
+
+    def fake_run(cmd, capture_output, text):
+        commands.append(list(cmd))
+        out_prefix = Path(cmd[cmd.index("--out") + 1])
+        out_prefix.parent.mkdir(parents=True, exist_ok=True)
+        if "--indep-pairwise" in cmd:
+            Path(f"{out_prefix}.prune.in").write_text("v1\nv2\n", encoding="utf-8")
+        elif cmd[cmd.index("--step") + 1] == "1":
+            Path(f"{out_prefix}_pred.list").write_text("pred\n")
+        else:
+            Path(f"{out_prefix}_PHENO.regenie").write_text("# fake\n")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    engine = RegenieEngine(RegenieEngineConfig(path="regenie", threads=1))
+    first = engine.run(task, tmp_path / "run")
+    second = engine.run(task, tmp_path / "run")
+
+    assert sum("--indep-pairwise" in cmd for cmd in commands) == 1
+    assert first.metadata["step1_variant_count"] == 2
+    assert first.metadata["step1_variant_cache_hit"] is False
+    assert second.metadata["step1_variant_cache_hit"] is True
 
 
 def test_merge_covariates_for_gwas_coerces_id_types(tmp_path: Path) -> None:
@@ -401,7 +496,9 @@ def test_regenie_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path)
         out_idx = cmd.index("--out") + 1
         out_prefix = Path(cmd[out_idx])
         out_prefix.parent.mkdir(parents=True, exist_ok=True)
-        if "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
+        if "--indep-pairwise" in cmd:
+            Path(f"{out_prefix}.prune.in").write_text("v1\n", encoding="utf-8")
+        elif "--step" in cmd and cmd[cmd.index("--step") + 1] == "1":
             Path(f"{out_prefix}_pred.list").write_text("pred\n")
         else:
             Path(f"{out_prefix}.regenie.Ydict").write_text("Y1 PHENO\n")
@@ -414,8 +511,9 @@ def test_regenie_engine_omits_covar_flags_when_none(monkeypatch, tmp_path: Path)
     result = engine.run(task, tmp_path / "run")
 
     assert result.engine == "regenie"
-    assert all("--covarFile" not in cmd for cmd in commands)
-    assert all("--covarColList" not in cmd for cmd in commands)
+    regenie_commands = [cmd for cmd in commands if "--step" in cmd]
+    assert all("--covarFile" not in cmd for cmd in regenie_commands)
+    assert all("--covarColList" not in cmd for cmd in regenie_commands)
 
 
 def test_prepare_manifest_covariates_for_gwas_reuses_one_file_per_row(tmp_path: Path) -> None:

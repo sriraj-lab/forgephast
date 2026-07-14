@@ -14,6 +14,7 @@ from .base import (
     merge_covariates_for_gwas,
     read_prepared_covariate_columns,
 )
+from .regenie_step1 import prepare_regenie_step1_variant_list
 
 if TYPE_CHECKING:
     from ..config_schema import Plink2EngineConfig, RegenieEngineConfig
@@ -131,8 +132,13 @@ class Plink2Engine(GwasEngine):
 class RegenieEngine(GwasEngine):
     """Run quantitative trait GWAS using REGENIE step 1 + step 2."""
 
-    def __init__(self, cfg: "RegenieEngineConfig"):
+    def __init__(
+        self,
+        cfg: "RegenieEngineConfig",
+        plink2_cfg: "Plink2EngineConfig | None" = None,
+    ):
         self.cfg = cfg
+        self.plink2_cfg = plink2_cfg
 
     def name(self) -> str:
         return "regenie"
@@ -193,6 +199,12 @@ class RegenieEngine(GwasEngine):
             step2_glob,
         )
         trait_flag = "--bt" if str(task.trait_type) == "binary" else "--qt"
+        step1_variant_list = prepare_regenie_step1_variant_list(
+            task=task,
+            out_dir=out_dir,
+            regenie_cfg=self.cfg,
+            plink2_cfg=self.plink2_cfg,
+        )
         cmd1 = [
             self.cfg.path,
             "--step",
@@ -218,6 +230,8 @@ class RegenieEngine(GwasEngine):
             )
         if chr_list:
             cmd1.extend(["--chrList", chr_list])
+        if step1_variant_list is not None:
+            cmd1.extend(["--extract", str(step1_variant_list.path)])
         cmd1.extend(
             [
                 "--bsize",
@@ -296,6 +310,16 @@ class RegenieEngine(GwasEngine):
                 "monitor_step1_log": step1_log,
                 "monitor_step1_pred_list": step1_pred,
                 "monitor_step2_glob": step2_glob,
+                "step1_variant_mode": str(self.cfg.step1_variant_mode),
+                "step1_variant_list": (
+                    str(step1_variant_list.path) if step1_variant_list is not None else ""
+                ),
+                "step1_variant_count": (
+                    int(step1_variant_list.variant_count) if step1_variant_list is not None else ""
+                ),
+                "step1_variant_cache_hit": (
+                    bool(step1_variant_list.cache_hit) if step1_variant_list is not None else ""
+                ),
             },
         )
 
