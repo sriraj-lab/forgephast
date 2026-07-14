@@ -67,15 +67,28 @@ def environment_scratch_root() -> Path | None:
     for name in (
         "FORGEPHAST_SCRATCH_ROOT",
         "SLURM_TMPDIR",
-        "TMPDIR",
         "LOCAL_SCRATCH",
         "SCRATCH",
-        "TMP",
-        "TEMP",
     ):
         value = os.environ.get(name, "").strip()
         if value:
             return Path(value)
+
+    scheduler_job = any(
+        os.environ.get(name, "").strip()
+        for name in (
+            "SLURM_JOB_ID",
+            "PBS_JOBID",
+            "LSB_JOBID",
+            "JOB_ID",
+            "AWS_BATCH_JOB_ID",
+        )
+    )
+    if scheduler_job:
+        for name in ("TMPDIR", "TMP", "TEMP"):
+            value = os.environ.get(name, "").strip()
+            if value:
+                return Path(value)
 
     user = os.environ.get("USER", "").strip()
     cluster_scratch = Path("/scratch/tmp") / user if user else None

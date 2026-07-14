@@ -89,7 +89,7 @@ def test_cpu_budget_rejects_invalid_environment_value(monkeypatch):
         cpu_budget()
 
 
-def test_environment_scratch_root_is_scheduler_neutral(monkeypatch, tmp_path):
+def test_environment_scratch_root_uses_generic_temp_in_scheduler_job(monkeypatch, tmp_path):
     for name in (
         "FORGEPHAST_SCRATCH_ROOT",
         "SLURM_TMPDIR",
@@ -98,9 +98,43 @@ def test_environment_scratch_root_is_scheduler_neutral(monkeypatch, tmp_path):
         "SCRATCH",
         "TMP",
         "TEMP",
+        "SLURM_JOB_ID",
+        "PBS_JOBID",
+        "LSB_JOBID",
+        "JOB_ID",
+        "AWS_BATCH_JOB_ID",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PBS_JOBID", "123.server")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    assert environment_scratch_root() == tmp_path
+
+
+def test_environment_scratch_root_does_not_redirect_ordinary_local_tmpdir(monkeypatch, tmp_path):
+    for name in (
+        "FORGEPHAST_SCRATCH_ROOT",
+        "SLURM_TMPDIR",
+        "TMPDIR",
+        "LOCAL_SCRATCH",
+        "SCRATCH",
+        "TMP",
+        "TEMP",
+        "SLURM_JOB_ID",
+        "PBS_JOBID",
+        "LSB_JOBID",
+        "JOB_ID",
+        "AWS_BATCH_JOB_ID",
+        "USER",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    assert environment_scratch_root() is None
+
+
+def test_environment_scratch_root_accepts_explicit_portable_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("FORGEPHAST_SCRATCH_ROOT", str(tmp_path))
 
     assert environment_scratch_root() == tmp_path
 
