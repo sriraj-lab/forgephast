@@ -27,7 +27,7 @@ import pandas as pd
 import yaml
 
 from .._internal.cache import bump_counter, canonical_hash, counter_delta, snapshot_counters
-from .._internal.resources import require_slurm_cpu_budget, slurm_cpu_budget
+from .._internal.resources import cpu_budget, require_cpu_budget
 from .config import RunConfig
 from .data.genotypes import build_genotype_adapter
 from .data.global_pcs import refresh_manifest_global_pcs
@@ -438,7 +438,7 @@ def _run_gwas(
             int(config.gwas.regenie.threads) if "regenie" in engines else 1,
         ]
     )
-    require_slurm_cpu_budget(
+    require_cpu_budget(
         workers=min(workers, max(1, len(jobs))),
         threads_per_worker=engine_threads,
         context="phenotype GWAS",
@@ -777,7 +777,8 @@ def _run_grid(grid_path: str, engines_filter: List[str] | None) -> Path:
             out[i] += 1
         return out
 
-    total_cpus = int(slurm_cpu_budget() or (os.cpu_count() or 1))
+    available_cpus = cpu_budget()
+    total_cpus = int(available_cpus.cpus)
     budgets_enabled = str(os.environ.get("POLY_GRID_GROUP_CPU_BUDGETS", "1")).strip().lower() not in {
         "0",
         "false",
@@ -789,8 +790,9 @@ def _run_grid(grid_path: str, engines_filter: List[str] | None) -> Path:
         weights = [_group_weight(group) for group in groups]
         hapstore_budgets: list[int | None] = _allocate_budgets(total_cpus, weights, min_each=1)
         logger.info(
-            "grid hapstore_io_threads enabled=1 total_cpus=%d budgets=%s",
+            "grid hapstore_io_threads enabled=1 total_cpus=%d cpu_source=%s budgets=%s",
             total_cpus,
+            available_cpus.source,
             hapstore_budgets,
         )
     else:

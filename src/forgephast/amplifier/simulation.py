@@ -17,7 +17,11 @@ from hapstore import ingest_arrays as _hapstore_ingest_arrays
 import numpy as np
 import pandas as pd
 
-from .._internal.resources import require_slurm_cpu_budget
+from .._internal.resources import (
+    environment_scratch_root,
+    execution_token,
+    require_cpu_budget,
+)
 from ..local_ancestry import write_local_ancestry_source_from_tract_rows
 from .config import RunConfig
 from .donors import load_manifest
@@ -41,14 +45,7 @@ def _resolve_scratch_root(config: RunConfig) -> Path | None:
         return None
     if config.outputs.scratch_root is not None:
         return Path(config.outputs.scratch_root)
-    slurm_tmpdir = os.environ.get("SLURM_TMPDIR", "").strip()
-    if slurm_tmpdir:
-        return Path(slurm_tmpdir)
-    user = os.environ.get("USER", "").strip()
-    cluster_scratch = Path("/scratch/tmp") / user if user else None
-    if cluster_scratch is not None and cluster_scratch.is_dir() and os.access(cluster_scratch, os.W_OK):
-        return cluster_scratch
-    return None
+    return environment_scratch_root()
 
 
 def _scratch_dir(
@@ -62,7 +59,7 @@ def _scratch_dir(
     root = _resolve_scratch_root(config)
     if root is None:
         return None
-    job_token = os.environ.get("SLURM_JOB_ID", f"pid{os.getpid()}")
+    job_token = execution_token()
     path = (
         root
         / "forgephast"
@@ -1441,8 +1438,9 @@ def simulate_chromosome_population_shard_pool(
         threads_per_task = int(config.simulation.threads_per_task)
     if threads_per_task <= 0:
         raise ValueError("threads_per_task must be > 0")
-    require_slurm_cpu_budget(
-        workers=min(int(task_workers), max(1, int(n_shards) * len(config.populations))),
+    active_population_count = sum(not pop.donor_only for pop in config.populations)
+    require_cpu_budget(
+        workers=min(int(task_workers), max(1, int(n_shards) * active_population_count)),
         threads_per_worker=int(threads_per_task),
         context="amplifier simulation",
     )

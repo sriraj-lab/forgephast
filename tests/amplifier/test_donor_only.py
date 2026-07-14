@@ -11,7 +11,7 @@ from forgephast.amplifier.simulation import simulate_chromosome_population_shard
 from .conftest import write_test_config
 
 
-def test_donor_only_population_is_available_but_not_simulated(tmp_path):
+def test_donor_only_population_is_available_but_not_simulated(tmp_path, monkeypatch):
     cfg_path = write_test_config(tmp_path, name="donor_only")
     with open(cfg_path, "r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
@@ -27,11 +27,12 @@ def test_donor_only_population_is_available_but_not_simulated(tmp_path):
     assert set(donor_rows.loc[donor_rows["population"] == "P1", "sample_id"]) == {"A1", "A2"}
     assert donor_rows.loc[donor_rows["population"] == "P1", "donor_only"].all()
 
+    monkeypatch.setenv("FORGEPHAST_CPU_BUDGET", "2")
     batch = simulate_chromosome_population_shard_pool(
         cfg,
         chrom=21,
         n_shards=1,
-        task_workers=1,
+        task_workers=3,
         threads_per_task=1,
         task_start_method="fork",
     )

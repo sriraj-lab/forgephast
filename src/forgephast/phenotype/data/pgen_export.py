@@ -20,7 +20,7 @@ import pandas as pd
 from hapstore.ids import align_by_ids, read_sample_ids
 
 from ..._internal.cache import bump_counter, canonical_hash
-from ..._internal.resources import require_slurm_cpu_budget
+from ..._internal.resources import require_cpu_budget
 from ..config import CohortConfig, RunConfig
 from .genotypes import build_genotype_adapter
 from .global_pcs import normalize_psam_fid_column
@@ -917,7 +917,7 @@ def export_manifest_pgens(
 
     pending_tasks = [pending_unique[key] for key in sorted(pending_unique.keys())]
     if pending_tasks:
-        require_slurm_cpu_budget(
+        require_cpu_budget(
             workers=min(max(1, int(run_cfg.pgen_export.task_workers)), len(pending_tasks)),
             threads_per_worker=max(
                 int(run_cfg.pgen_export.concat_workers),

@@ -950,7 +950,7 @@ def run_simulation(
             la_enabled = bool(run_cfg.local_ancestry.enabled and local_ancestry_pattern)
 
             # Grid groups may set a per-group HapStore I/O thread budget to balance
-            # parallel groups within one SLURM allocation.
+            # parallel groups within one scheduler or local CPU allocation.
             if runtime_cache is not None and hasattr(adapter, "set_io_threads"):
                 adapter.set_io_threads(int(runtime_cache.get("hapstore_io_threads", 1)))
 
