@@ -20,16 +20,6 @@ logger = logging.getLogger(__name__)
 
 _MISSING_SENTINEL = np.uint8(255)
 
-try:
-    from numba import njit, prange
-
-    HAS_NUMBA = True
-except Exception:  # pragma: no cover
-    HAS_NUMBA = False
-    njit = None
-    prange = range
-
-
 def _stride_thin_indices(n: int, max_n: int) -> np.ndarray:
     if max_n <= 0:
         raise ValueError("max_n must be > 0")
@@ -58,81 +48,6 @@ def _summarize(values: np.ndarray) -> dict[str, float]:
         "min": float(np.min(x)),
         "max": float(np.max(x)),
     }
-
-
-if HAS_NUMBA:
-
-    @njit(parallel=True, fastmath=True)
-    def _roh_metrics_numba(
-        g: np.ndarray,
-        cm: np.ndarray,
-        missing_sentinel: int,
-        min_segment_cm: float,
-        max_gap_cm: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        n_samples, n_variants = g.shape
-        total_cm = np.zeros(n_samples, dtype=np.float64)
-        n_segments = np.zeros(n_samples, dtype=np.int64)
-        max_seg = np.zeros(n_samples, dtype=np.float64)
-
-        for i in prange(n_samples):
-            in_seg = False
-            seg_start_cm = 0.0
-            last_cm = 0.0
-            nseg = 0
-            tot = 0.0
-            maxs = 0.0
-
-            for j in range(n_variants):
-                gt = g[i, j]
-                cur_cm = cm[j]
-
-                # Variant-axis gap break: if we are currently in a segment, and the
-                # distance from the previous variant is too large, close the segment
-                # at the previous variant.
-                if in_seg and j > 0 and (cur_cm - cm[j - 1]) > max_gap_cm:
-                    seg_len = cm[j - 1] - seg_start_cm
-                    if seg_len >= min_segment_cm:
-                        tot += seg_len
-                        nseg += 1
-                        if seg_len > maxs:
-                            maxs = seg_len
-                    seg_start_cm = cur_cm
-                    last_cm = cur_cm
-                    continue
-
-                # Missing/het breaks ROH.
-                if gt == missing_sentinel or gt == 1:
-                    if in_seg:
-                        seg_len = last_cm - seg_start_cm
-                        if seg_len >= min_segment_cm:
-                            tot += seg_len
-                            nseg += 1
-                            if seg_len > maxs:
-                                maxs = seg_len
-                        in_seg = False
-                    last_cm = cur_cm
-                    continue
-
-                # Homozygous
-                if not in_seg:
-                    in_seg = True
-                    seg_start_cm = cur_cm
-                last_cm = cur_cm
-
-            if in_seg:
-                seg_len = last_cm - seg_start_cm
-                if seg_len >= min_segment_cm:
-                    tot += seg_len
-                    nseg += 1
-                    if seg_len > maxs:
-                        maxs = seg_len
-
-            total_cm[i] = tot
-            n_segments[i] = nseg
-            max_seg[i] = maxs
-
-        return total_cm, n_segments, max_seg
 
 
 def _roh_metrics(

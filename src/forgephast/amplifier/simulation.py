@@ -29,7 +29,7 @@ from .donor_panels import load_donor_haplotypes_from_source, subset_panel_donors
 from .merge import merge_chromosomes_sample_axis
 from .maps import load_genetic_map, switch_probs_from_positions
 from .msprime_tracts import simulate_msprime_tract_haplotypes
-from .mp_logging import install_queue_handler, setup_queue_listener_for_logger
+from forgephast._internal.mp_logging import install_queue_handler, setup_queue_listener_for_logger
 from .telemetry import RateLimitedProgress, telemetry_span
 from .utils import derived_seed, ensure_dir, shard_bounds
 from .vcfio import (

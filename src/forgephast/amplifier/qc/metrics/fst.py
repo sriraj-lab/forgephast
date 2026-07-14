@@ -10,8 +10,6 @@ import numpy as np
 
 from hapstore import HapStore
 
-from forgephast._internal.qc_stats import hudson_fst_from_counts as _utils_hudson_fst_from_counts
-
 try:
     from numba import njit, prange, set_num_threads
 
@@ -156,8 +154,6 @@ def hudson_fst_from_counts(
     if HAS_NUMBA:
         _configure_numba_threads(numba_threads)
         return float(_hudson_fst_from_counts_numba(ac_a_arr, an_a_arr, ac_b_arr, an_b_arr))
-    if _utils_hudson_fst_from_counts is not None:
-        return float(_utils_hudson_fst_from_counts(ac_a_arr, an_a_arr, ac_b_arr, an_b_arr))
     return _hudson_fst_from_counts_numpy(ac_a_arr, an_a_arr, ac_b_arr, an_b_arr)
 
 

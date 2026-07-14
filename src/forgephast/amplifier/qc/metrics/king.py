@@ -21,17 +21,6 @@ logger = logging.getLogger(__name__)
 
 _MISSING_SENTINEL = np.uint8(255)
 
-try:
-    from numba import njit, prange, set_num_threads
-
-    HAS_NUMBA = True
-except Exception:  # pragma: no cover
-    HAS_NUMBA = False
-    njit = None
-    prange = range
-    set_num_threads = None
-
-
 def _auc_from_scores(pos_scores: np.ndarray, neg_scores: np.ndarray) -> float:
     pos = np.asarray(pos_scores, dtype=np.float64)
     neg = np.asarray(neg_scores, dtype=np.float64)
@@ -172,87 +161,6 @@ def _sample_cross_pairs(
     out_a = idx // nb
     out_b = idx % nb
     return out_a, out_b
-
-
-if HAS_NUMBA:
-
-    @njit(parallel=True, fastmath=True)
-    def _king_within_pairs_numba(
-        g: np.ndarray,
-        pairs_i: np.ndarray,
-        pairs_j: np.ndarray,
-        missing_sentinel: int,
-    ) -> np.ndarray:
-        n_pairs = pairs_i.shape[0]
-        n_variants = g.shape[1]
-        out = np.empty(n_pairs, dtype=np.float64)
-        for p in prange(n_pairs):
-            i = pairs_i[p]
-            j = pairs_j[p]
-            hethet = 0.0
-            ibs0 = 0.0
-            het1 = 0.0
-            het2 = 0.0
-            for v in range(n_variants):
-                a = g[i, v]
-                b = g[j, v]
-                if a == missing_sentinel or b == missing_sentinel:
-                    continue
-                if a == 1:
-                    het1 += 1.0
-                if b == 1:
-                    het2 += 1.0
-                if a == 1 and b == 1:
-                    hethet += 1.0
-                if (a == 0 and b == 2) or (a == 2 and b == 0):
-                    ibs0 += 1.0
-            hmin = het1 if het1 < het2 else het2
-            hmax = het2 if het1 < het2 else het1
-            if hmin <= 0.0:
-                out[p] = np.nan
-            else:
-                out[p] = (2.0 * hethet - 4.0 * ibs0 + hmin - hmax) / (4.0 * hmin)
-        return out
-
-
-    @njit(parallel=True, fastmath=True)
-    def _king_cross_pairs_numba(
-        g_a: np.ndarray,
-        g_b: np.ndarray,
-        idx_a: np.ndarray,
-        idx_b: np.ndarray,
-        missing_sentinel: int,
-    ) -> np.ndarray:
-        n_pairs = idx_a.shape[0]
-        n_variants = g_a.shape[1]
-        out = np.empty(n_pairs, dtype=np.float64)
-        for p in prange(n_pairs):
-            i = idx_a[p]
-            j = idx_b[p]
-            hethet = 0.0
-            ibs0 = 0.0
-            het1 = 0.0
-            het2 = 0.0
-            for v in range(n_variants):
-                a = g_a[i, v]
-                b = g_b[j, v]
-                if a == missing_sentinel or b == missing_sentinel:
-                    continue
-                if a == 1:
-                    het1 += 1.0
-                if b == 1:
-                    het2 += 1.0
-                if a == 1 and b == 1:
-                    hethet += 1.0
-                if (a == 0 and b == 2) or (a == 2 and b == 0):
-                    ibs0 += 1.0
-            hmin = het1 if het1 < het2 else het2
-            hmax = het2 if het1 < het2 else het1
-            if hmin <= 0.0:
-                out[p] = np.nan
-            else:
-                out[p] = (2.0 * hethet - 4.0 * ibs0 + hmin - hmax) / (4.0 * hmin)
-        return out
 
 
 def _king_within_pairs(
