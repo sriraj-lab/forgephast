@@ -97,7 +97,7 @@ def prepare_regenie_step1_variant_list(
     plink2_memory_mb = getattr(plink2_cfg, "memory_mb", None)
     cache_key = canonical_hash(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "pgen": _pgen_identity(task.pgen_prefix),
             "keep_file": {
                 **_file_identity(keep_path),
@@ -117,6 +117,8 @@ def prepare_regenie_step1_variant_list(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     prune_prefix = out_dir / "step1_variants"
+    missing_id_exclude = out_dir / "step1_variants.missing_ids.exclude"
+    missing_id_exclude.write_text(".\n", encoding="utf-8")
     variant_list = Path(f"{prune_prefix}.prune.in")
     metadata_path = _metadata_path(variant_list)
     if (
@@ -143,6 +145,10 @@ def prepare_regenie_step1_variant_list(
         task.pgen_prefix,
         "--keep",
         task.keep_file,
+        "--exclude",
+        str(missing_id_exclude),
+        "--rm-dup",
+        "exclude-all",
     ]
     if task.chromosomes:
         cmd.extend(["--chr", ",".join(str(int(chrom)) for chrom in task.chromosomes)])
@@ -180,7 +186,7 @@ def prepare_regenie_step1_variant_list(
     _write_metadata(
         metadata_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "cache_key": cache_key,
             "variant_count": variant_count,
             "variant_list": str(variant_list),

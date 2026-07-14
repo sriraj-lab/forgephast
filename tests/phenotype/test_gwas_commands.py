@@ -183,6 +183,10 @@ def test_regenie_engine_outputs(monkeypatch, tmp_path: Path) -> None:
     assert calls["n"] == 3
     prune_cmd, step1_cmd, step2_cmd = commands
     assert prune_cmd[0] == "plink2-custom"
+    assert prune_cmd[prune_cmd.index("--exclude") + 1].endswith(
+        "step1_variants.missing_ids.exclude"
+    )
+    assert prune_cmd[prune_cmd.index("--rm-dup") + 1] == "exclude-all"
     assert prune_cmd[prune_cmd.index("--threads") + 1] == "2"
     assert prune_cmd[prune_cmd.index("--memory") + 1] == "2048"
     assert "--indep-pairwise" in prune_cmd
