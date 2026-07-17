@@ -39,22 +39,12 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
         ),
         "effects_df": pd.DataFrame({"variant_id": ["v1"], "beta": [0.3]}),
         "component_targets": {
-            "base_h2_fixed": 0.30,
-            "resolved_h2_fixed": 0.25,
-            "h2_jitter_delta": -0.05,
-            "h2_jitter_clipped": False,
-            "target_mode": "single_population",
-            "resolved_h2_fixed_by_population_json": '{"AFR": 0.28, "EUR": 0.25}',
-            "resolved_h2_bg_by_population_json": '{"AFR": 0.1, "EUR": 0.1}',
-            "resolved_covariate_by_population_json": '{"AFR": 0.15, "EUR": 0.15}',
-            "resolved_residual_by_population_json": '{"AFR": 0.47, "EUR": 0.5}',
-            "h2_jitter_delta_by_population_json": '{"AFR": -0.02, "EUR": -0.05}',
-            "h2_jitter_clipped_by_population_json": '{"AFR": false, "EUR": false}',
-            "genetic_fixed": 0.25,
+            "target_h2_fixed": 0.30,
+            "genetic_fixed": 0.30,
             "genetic_bg": 0.10,
-            "genetic_total": 0.35,
+            "genetic_total": 0.40,
             "covariate": 0.15,
-            "residual": 0.50,
+            "residual": 0.45,
         },
         "component_realized": {
             "genetic_fixed": 0.24,
@@ -99,12 +89,9 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
         sep="\t",
     )
 
-    assert float(component_df.loc[0, "base_h2_fixed"]) == 0.30
+    assert float(component_df.loc[0, "target_h2_fixed"]) == 0.30
     assert float(component_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.42
-    assert float(component_df.loc[0, "resolved_h2_fixed"]) == 0.25
-    assert float(component_df.loc[0, "h2_jitter_delta"]) == -0.05
-    assert bool(component_df.loc[0, "h2_jitter_clipped"]) is False
-    assert component_df.loc[0, "target_mode"] == "single_population"
+    assert float(component_df.loc[0, "target_var_genetic_fixed"]) == 0.30
     assert component_df.loc[0, "trait_type"] == "binary"
     assert manifest_df.loc[0, "trait_type"] == "binary"
     assert float(component_df.loc[0, "realized_var_liability"]) == 1.00
@@ -113,16 +100,11 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     assert component_df.loc[0, "binary_alpha_by_population"] == '{"__cohort__": -1.25}'
     assert int(manifest_df.loc[0, "binary_case_count"]) == 1
     assert int(manifest_df.loc[0, "binary_control_count"]) == 4
-    assert completion["schema_version"] == 1
+    assert completion["schema_version"] == 2
     assert completion["n_manifest_rows"] == 1
     assert float(manifest_df.loc[0, "binary_realized_prevalence"]) == 0.2
-    assert component_df.loc[0, "resolved_h2_fixed_by_population"] == '{"AFR": 0.28, "EUR": 0.25}'
-    assert component_df.loc[0, "resolved_h2_bg_by_population"] == '{"AFR": 0.1, "EUR": 0.1}'
-    assert component_df.loc[0, "resolved_covariate_by_population"] == '{"AFR": 0.15, "EUR": 0.15}'
-    assert component_df.loc[0, "resolved_residual_by_population"] == '{"AFR": 0.47, "EUR": 0.5}'
-    assert float(manifest_df.loc[0, "resolved_h2_fixed"]) == 0.25
+    assert float(manifest_df.loc[0, "target_h2_fixed"]) == 0.30
     assert float(manifest_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.42
-    assert manifest_df.loc[0, "target_mode"] == "single_population"
     assert geometry_df.loc[0, "population_corr_mode"] == "auto_from_fst"
     assert geometry_df.loc[0, "resolved_jitter_sd_by_population"] == '{"AFR": 0.3, "EUR": 0.2}'
     assert int(membership_summary_df.loc[0, "selected_causal_count"]) == 2
@@ -130,7 +112,7 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     assert float(membership_summary_df.loc[0, "annotation_hit_fraction"]) == 0.5
 
 
-def test_write_simulation_outputs_free_per_population_realized_h2_and_tightness(
+def test_write_simulation_outputs_population_variance_diagnostic_and_tightness(
     tmp_path,
 ) -> None:
     output_root = tmp_path / "outputs"
@@ -161,22 +143,12 @@ def test_write_simulation_outputs_free_per_population_realized_h2_and_tightness(
         ),
         "effects_df": pd.DataFrame({"variant_id": ["v1"], "beta": [0.3]}),
         "component_targets": {
-            "base_h2_fixed": 0.30,
-            "resolved_h2_fixed": float("nan"),
-            "h2_jitter_delta": float("nan"),
-            "h2_jitter_clipped": False,
-            "target_mode": "free_per_population",
-            "resolved_h2_fixed_by_population_json": '{"AFR": 0.33, "EUR": 0.28}',
-            "resolved_h2_bg_by_population_json": '{"AFR": 0.1, "EUR": 0.1}',
-            "resolved_covariate_by_population_json": '{"AFR": 0.15, "EUR": 0.15}',
-            "resolved_residual_by_population_json": '{"AFR": 0.42, "EUR": 0.47}',
-            "h2_jitter_delta_by_population_json": '{"AFR": 0.03, "EUR": -0.02}',
-            "h2_jitter_clipped_by_population_json": '{"AFR": false, "EUR": false}',
-            "genetic_fixed": float("nan"),
+            "target_h2_fixed": 0.30,
+            "genetic_fixed": 0.30,
             "genetic_bg": 0.10,
-            "genetic_total": float("nan"),
+            "genetic_total": 0.40,
             "covariate": 0.15,
-            "residual": float("nan"),
+            "residual": 0.45,
         },
         "component_realized": {
             "genetic_fixed": 0.21,
@@ -187,7 +159,7 @@ def test_write_simulation_outputs_free_per_population_realized_h2_and_tightness(
             "phenotype": 0.84,
         },
         "genetic_fixed_beta_scale_factor": 0.75,
-        "realized_fixed_by_population": {"EUR": 0.18, "AFR": 0.24},
+        "realized_fixed_variance_by_population": {"EUR": 0.18, "AFR": 0.24},
         "tightness_summary": {
             "tier": "moderate",
             "fold_change_cap": 5.0,
@@ -222,17 +194,17 @@ def test_write_simulation_outputs_free_per_population_realized_h2_and_tightness(
         output_root / "run_multi" / "truth" / "component_summary.tsv", sep="\t"
     )
 
-    assert component_df.loc[0, "target_mode"] == "free_per_population"
-    assert manifest_df.loc[0, "target_mode"] == "free_per_population"
+    assert float(component_df.loc[0, "target_h2_fixed"]) == 0.30
+    assert float(manifest_df.loc[0, "target_h2_fixed"]) == 0.30
     assert float(component_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.75
     assert float(manifest_df.loc[0, "genetic_fixed_beta_scale_factor"]) == 0.75
     # realized per-pop h2 is serialized with sorted keys
     assert (
-        component_df.loc[0, "realized_h2_fixed_by_population"]
+        component_df.loc[0, "realized_var_genetic_fixed_by_population"]
         == '{"AFR": 0.24, "EUR": 0.18}'
     )
     assert (
-        manifest_df.loc[0, "realized_h2_fixed_by_population"]
+        manifest_df.loc[0, "realized_var_genetic_fixed_by_population"]
         == '{"AFR": 0.24, "EUR": 0.18}'
     )
     assert component_df.loc[0, "shift_tightness_tier"] == "moderate"

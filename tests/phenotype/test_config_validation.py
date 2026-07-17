@@ -424,10 +424,10 @@ def test_rejects_invalid_variance_budget_sum_when_strict() -> None:
         RunConfig.from_dict(payload)
 
 
-def test_rejects_h2_jitter_sd() -> None:
+def test_rejects_removed_population_h2_settings() -> None:
     payload = _base_payload()
     payload["variance_budget"]["h2_jitter_sd"] = 0.05
-    with pytest.raises(ValueError, match="h2_jitter_sd is disabled"):
+    with pytest.raises(ValueError, match="Removed population-level h2 settings"):
         RunConfig.from_dict(payload)
 
 

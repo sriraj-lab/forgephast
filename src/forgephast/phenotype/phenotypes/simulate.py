@@ -55,47 +55,6 @@ def _scale_component_to_variance(component: np.ndarray, target_variance: float) 
     return component * np.sqrt(target_variance / observed)
 
 
-def _scale_component_to_shared_population_variance(
-    component: np.ndarray,
-    sample_populations: List[str],
-    target_variance: float,
-) -> np.ndarray:
-    """Scale component within each observed population to the same target variance."""
-    values = np.asarray(component, dtype=float)
-    populations = np.asarray(sample_populations, dtype=object)
-    scaled = np.zeros_like(values, dtype=float)
-    for pop in sorted({str(pop) for pop in sample_populations}):
-        row_idx = np.where(populations == pop)[0]
-        if row_idx.size == 0:
-            continue
-        scaled[row_idx] = _scale_component_to_variance(values[row_idx], target_variance)
-    return scaled
-
-
-def _scale_component_to_population_variance_map(
-    component: np.ndarray,
-    sample_populations: List[str],
-    target_variance_by_population: Dict[str, float],
-    fallback_target_variance: float | None = None,
-) -> np.ndarray:
-    """Scale component within each observed population to its resolved target variance."""
-    values = np.asarray(component, dtype=float)
-    populations = np.asarray(sample_populations, dtype=object)
-    scaled = np.zeros_like(values, dtype=float)
-    for pop in sorted({str(pop) for pop in sample_populations}):
-        row_idx = np.where(populations == pop)[0]
-        if row_idx.size == 0:
-            continue
-        if pop in target_variance_by_population:
-            target = float(target_variance_by_population[pop])
-        elif fallback_target_variance is not None:
-            target = float(fallback_target_variance)
-        else:
-            raise ValueError(f"Missing resolved target variance for population={pop}")
-        scaled[row_idx] = _scale_component_to_variance(values[row_idx], target)
-    return scaled
-
-
 def _scale_factor_to_variance(component: np.ndarray, target_variance: float) -> float:
     """Return multiplicative scale factor applied by _scale_component_to_variance."""
     if target_variance <= 0:
@@ -430,188 +389,39 @@ def _required_source_populations(
     return sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"})
 
 
-def _resolve_population_h2_targets(
+def _resolve_cohort_component_targets(
     run_cfg: RunConfig,
-    architecture_name: str,
     architecture_params: Dict[str, float],
-    replicate: int,
-    population_order: List[str],
-    observed_population_order: List[str] | None = None,
 ) -> Dict[str, Any]:
-    """Resolve per-population fixed-heritability targets for one replicate x architecture."""
-    base_h2_fixed = float(run_cfg.variance_budget.h2_fixed)
+    """Resolve one cohort-level variance budget for an architecture."""
+    target_h2_fixed = float(run_cfg.variance_budget.h2_fixed)
     if "h2" in architecture_params:
-        base_h2_fixed = float(architecture_params["h2"])
-    if not np.isclose(float(run_cfg.variance_budget.h2_jitter_sd), 0.0, atol=1e-12):
-        raise ValueError(
-            "variance_budget.h2_jitter_sd is disabled; set it to 0.0 and use "
-            "effect_model jitter settings for effect-size heterogeneity"
-        )
-    max_fixed = max(
-        0.0,
-        1.0
-        - float(run_cfg.variance_budget.h2_bg)
-        - float(run_cfg.covariates.target_variance if run_cfg.covariates.target_variance is not None else run_cfg.variance_budget.covariate),
-    )
-
-    resolved_by_population: Dict[str, float] = {}
-    delta_by_population: Dict[str, float] = {}
-    clipped_by_population: Dict[str, bool] = {}
-    jitter_enabled = False
-    resolved_bg_by_population: Dict[str, float] = {}
-    resolved_covariate_by_population: Dict[str, float] = {}
-    resolved_residual_by_population: Dict[str, float] = {}
-    shared_bg = float(run_cfg.variance_budget.h2_bg)
-    shared_covariate = float(
+        target_h2_fixed = float(architecture_params["h2"])
+    target_h2_bg = float(run_cfg.variance_budget.h2_bg)
+    target_covariate = float(
         run_cfg.covariates.target_variance
         if run_cfg.covariates.target_variance is not None
         else run_cfg.variance_budget.covariate
     )
-    if observed_population_order is None:
-        observed_population_order = list(population_order)
-    for pop in population_order:
-        delta = 0.0
-        clipped = False
-        resolved = float(np.clip(base_h2_fixed + delta, 0.0, max_fixed))
-        clipped = not np.isclose(resolved, base_h2_fixed + delta, atol=1e-12)
-        resolved_by_population[pop] = resolved
-        delta_by_population[pop] = float(delta)
-        clipped_by_population[pop] = bool(clipped)
-        resolved_bg_by_population[pop] = shared_bg
-        resolved_residual_by_population[pop] = max(0.0, 1.0 - resolved - shared_bg - shared_covariate)
-    for pop in observed_population_order:
-        resolved_covariate_by_population[str(pop)] = shared_covariate
-
+    max_h2_fixed = 1.0 - target_h2_bg - target_covariate
+    if not np.isfinite(target_h2_fixed) or target_h2_fixed < 0.0:
+        raise ValueError(
+            f"Cohort-level h2_fixed must be finite and non-negative; got {target_h2_fixed}"
+        )
+    if target_h2_fixed > max_h2_fixed + 1e-12:
+        raise ValueError(
+            "Cohort-level variance targets exceed 1.0: "
+            f"h2_fixed={target_h2_fixed}, h2_bg={target_h2_bg}, "
+            f"covariate={target_covariate}"
+        )
+    target_residual = max(0.0, 1.0 - target_h2_fixed - target_h2_bg - target_covariate)
     return {
-        "base_h2_fixed": float(base_h2_fixed),
-        "resolved_h2_fixed_by_population": resolved_by_population,
-        "resolved_h2_bg_by_population": resolved_bg_by_population,
-        "resolved_covariate_by_population": resolved_covariate_by_population,
-        "resolved_residual_by_population": resolved_residual_by_population,
-        "h2_jitter_delta_by_population": delta_by_population,
-        "h2_jitter_clipped_by_population": clipped_by_population,
-        "genetic_bg": shared_bg,
-        "covariate": shared_covariate,
-        "residual_baseline": float(run_cfg.variance_budget.residual),
-        "strict_sum_to_one": bool(run_cfg.variance_budget.strict_sum_to_one),
-        "h2_jitter_enabled": bool(jitter_enabled),
-    }
-
-
-def _resolve_cohort_component_targets(
-    population_targets: Dict[str, Any],
-    cohort_populations: List[str],
-) -> Dict[str, Any]:
-    """Resolve cohort-level reporting targets.
-
-    Single-population cohorts resolve a concrete cohort-level target that
-    matches the (single) population's h² target.  Multi-population cohorts
-    use ``target_mode="free_per_population"``: genetic_fixed is rescaled
-    *pooled* to ``base_h2_fixed`` (a single scalar preserving per-population
-    variance ratios), while each population's bg/covariate/residual is
-    scaled to its per-population target.  No per-population β rescaling is
-    applied.
-    """
-    resolved_h2_bg_by_population = dict(
-        population_targets.get(
-            "resolved_h2_bg_by_population",
-            {
-                str(pop): float(population_targets["genetic_bg"])
-                for pop in population_targets["resolved_h2_fixed_by_population"].keys()
-            },
-        )
-    )
-    resolved_covariate_by_population = dict(
-        population_targets.get(
-            "resolved_covariate_by_population",
-            {
-                str(pop): float(population_targets["covariate"])
-                for pop in population_targets["resolved_h2_fixed_by_population"].keys()
-            },
-        )
-    )
-    resolved_residual_by_population = dict(
-        population_targets.get(
-            "resolved_residual_by_population",
-            {
-                str(pop): max(
-                    0.0,
-                    1.0
-                    - float(population_targets["resolved_h2_fixed_by_population"][pop])
-                    - float(resolved_h2_bg_by_population[pop])
-                    - float(resolved_covariate_by_population[pop]),
-                )
-                for pop in population_targets["resolved_h2_fixed_by_population"].keys()
-            },
-        )
-    )
-    non_admix = sorted({str(pop) for pop in cohort_populations if str(pop).upper() != "ADMIX"})
-    has_single_source = len(non_admix) == 1
-    # For multi-pop, use base_h2_fixed as the cohort-level pooled target
-    # (genetic_fixed is rescaled pooled to this value, preserving per-pop
-    # ratios).  For single-pop, the population's resolved target is used.
-    target_fixed = float(population_targets["base_h2_fixed"])
-    resolved_h2_fixed = float("nan")
-    h2_jitter_delta = float("nan")
-    h2_jitter_clipped = False
-    target_mode = "free_per_population"
-    if has_single_source:
-        pop = non_admix[0]
-        target_fixed = float(population_targets["resolved_h2_fixed_by_population"][pop])
-        target_genetic_bg = float(resolved_h2_bg_by_population[pop])
-        target_covariate = float(resolved_covariate_by_population[pop])
-        target_residual = float(resolved_residual_by_population[pop])
-        resolved_h2_fixed = target_fixed
-        h2_jitter_delta = float(population_targets["h2_jitter_delta_by_population"][pop])
-        h2_jitter_clipped = bool(population_targets["h2_jitter_clipped_by_population"][pop])
-        target_mode = "single_population"
-    else:
-        target_genetic_bg = float(population_targets["genetic_bg"])
-        target_covariate = float(population_targets["covariate"])
-        target_residual = float("nan")
-
-    residual_target = float("nan")
-    if has_single_source:
-        residual_target = float(target_residual)
-    return {
-        "genetic_fixed": target_fixed,
-        "genetic_bg": float(target_genetic_bg),
-        "covariate": float(target_covariate),
-        "residual": residual_target,
-        "genetic_total": (
-            target_fixed + float(target_genetic_bg)
-            if np.isfinite(target_fixed)
-            else float("nan")
-        ),
-        "base_h2_fixed": float(population_targets["base_h2_fixed"]),
-        "resolved_h2_fixed": resolved_h2_fixed,
-        "h2_jitter_delta": h2_jitter_delta,
-        "h2_jitter_clipped": bool(h2_jitter_clipped),
-        "target_mode": target_mode,
-        "resolved_h2_fixed_by_population_json": json.dumps(
-            population_targets["resolved_h2_fixed_by_population"],
-            sort_keys=True,
-        ),
-        "resolved_h2_bg_by_population_json": json.dumps(
-            resolved_h2_bg_by_population,
-            sort_keys=True,
-        ),
-        "resolved_covariate_by_population_json": json.dumps(
-            resolved_covariate_by_population,
-            sort_keys=True,
-        ),
-        "resolved_residual_by_population_json": json.dumps(
-            resolved_residual_by_population,
-            sort_keys=True,
-        ),
-        "h2_jitter_delta_by_population_json": json.dumps(
-            population_targets["h2_jitter_delta_by_population"],
-            sort_keys=True,
-        ),
-        "h2_jitter_clipped_by_population_json": json.dumps(
-            population_targets["h2_jitter_clipped_by_population"],
-            sort_keys=True,
-        ),
+        "target_h2_fixed": target_h2_fixed,
+        "genetic_fixed": target_h2_fixed,
+        "genetic_bg": target_h2_bg,
+        "genetic_total": target_h2_fixed + target_h2_bg,
+        "covariate": target_covariate,
+        "residual": target_residual,
     }
 
 
@@ -1229,13 +1039,9 @@ def run_simulation(
                     architecture=str(architecture.name),
                     n_variants=int(len(variant_ids)),
                 )
-                population_targets = _resolve_population_h2_targets(
+                targets = _resolve_cohort_component_targets(
                     run_cfg=run_cfg,
-                    architecture_name=architecture.name,
                     architecture_params=architecture.params,
-                    replicate=replicate,
-                    population_order=sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"}),
-                    observed_population_order=sorted({str(pop) for pop in sample_populations}),
                 )
                 required_pops = _required_source_populations(
                     sample_populations=sample_populations,
@@ -1412,17 +1218,14 @@ def run_simulation(
                 # architecture-level h² target.  A single scalar is applied to
                 # the entire vector, preserving per-population variance ratios
                 # while giving realistic absolute h².
-                _target_h2_fixed = float(population_targets["base_h2_fixed"])
-                genetic_fixed = genetic_fixed_raw
-                genetic_fixed_beta_scale_factor = 1.0
-                if np.isfinite(_target_h2_fixed) and _target_h2_fixed > 0:
-                    genetic_fixed_beta_scale_factor = _scale_factor_to_variance(
-                        genetic_fixed_raw, _target_h2_fixed
-                    )
-                    genetic_fixed = genetic_fixed_raw * genetic_fixed_beta_scale_factor
-                    effects_detail = _scale_effects_detail_betas(
-                        effects_detail, genetic_fixed_beta_scale_factor
-                    )
+                _target_h2_fixed = float(targets["genetic_fixed"])
+                genetic_fixed_beta_scale_factor = _scale_factor_to_variance(
+                    genetic_fixed_raw, _target_h2_fixed
+                )
+                genetic_fixed = genetic_fixed_raw * genetic_fixed_beta_scale_factor
+                effects_detail = _scale_effects_detail_betas(
+                    effects_detail, genetic_fixed_beta_scale_factor
+                )
 
                 _timed(
                     "simulate.compute_genetic_fixed",
@@ -1434,16 +1237,17 @@ def run_simulation(
                     n_variants=int(len(variant_ids)),
                 )
 
-                # Per-population realized fixed-effect variance after pooled
-                # rescaling. Ratios reflect the causal MAF structure; absolute
-                # values are anchored to the target h².
+                # Population-stratified variance is diagnostic only; the target
+                # and scaling operation are defined over the full cohort.
                 populations_for_realized = np.asarray(sample_populations, dtype=object)
-                realized_fixed_by_population: Dict[str, float] = {}
+                realized_fixed_variance_by_population: Dict[str, float] = {}
                 for pop in sorted({str(pop) for pop in sample_populations}):
                     row_idx = np.where(populations_for_realized == pop)[0]
                     if row_idx.size == 0:
                         continue
-                    realized_fixed_by_population[pop] = float(np.var(genetic_fixed[row_idx]))
+                    realized_fixed_variance_by_population[pop] = float(
+                        np.var(genetic_fixed[row_idx])
+                    )
                 bg_seed = (
                     run_cfg.background_genetic.seed
                     + 2000 * replicate
@@ -1473,47 +1277,15 @@ def run_simulation(
                 t_scale = time.perf_counter()
                 rng = np.random.default_rng(run_cfg.phenotype.random_seed + replicate + _stable_string_seed(architecture.name))
                 residual_raw = rng.normal(0.0, 1.0, size=len(sample_ids))
-                targets = _resolve_cohort_component_targets(
-                    population_targets=population_targets,
-                    cohort_populations=sample_populations,
+                genetic_bg = _scale_component_to_variance(
+                    genetic_bg_raw, targets["genetic_bg"]
                 )
-
-                non_admix_source_pops = sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"})
-                has_single_source = len(non_admix_source_pops) == 1
-                if has_single_source:
-                    genetic_bg = _scale_component_to_variance(genetic_bg_raw, targets["genetic_bg"])
-                    covariate = _scale_component_to_variance(cov_out.contribution, targets["covariate"])
-                    residual = _scale_component_to_variance(residual_raw, targets["residual"])
-                else:
-                    populations_arr = np.asarray(sample_populations, dtype=object)
-                    genetic_bg = np.zeros(len(sample_ids), dtype=float)
-                    covariate = np.zeros(len(sample_ids), dtype=float)
-                    residual = np.zeros(len(sample_ids), dtype=float)
-                    for pop in sorted({str(pop) for pop in sample_populations}):
-                        row_idx = np.where(populations_arr == pop)[0]
-                        if row_idx.size == 0:
-                            continue
-                        if pop in population_targets["resolved_h2_bg_by_population"]:
-                            genetic_bg[row_idx] = _scale_component_to_variance(
-                                genetic_bg_raw[row_idx],
-                                float(population_targets["resolved_h2_bg_by_population"][pop]),
-                            )
-                        else:
-                            genetic_bg[row_idx] = genetic_bg_raw[row_idx]
-                        covariate[row_idx] = _scale_component_to_variance(
-                            cov_out.contribution[row_idx],
-                            float(population_targets["resolved_covariate_by_population"].get(pop, targets["covariate"])),
-                        )
-                        if pop in population_targets["resolved_residual_by_population"]:
-                            residual[row_idx] = _scale_component_to_variance(
-                                residual_raw[row_idx],
-                                float(population_targets["resolved_residual_by_population"][pop]),
-                            )
-                        else:
-                            residual[row_idx] = _scale_component_to_variance(
-                                residual_raw[row_idx],
-                                float(population_targets["residual_baseline"]),
-                            )
+                covariate = _scale_component_to_variance(
+                    cov_out.contribution, targets["covariate"]
+                )
+                residual = _scale_component_to_variance(
+                    residual_raw, targets["residual"]
+                )
 
                 genetic = genetic_fixed + genetic_bg
                 liability = genetic + covariate + residual
@@ -1622,7 +1394,9 @@ def run_simulation(
                         },
                         "binary_summary": dict(binary_summary),
                         "genetic_fixed_beta_scale_factor": float(genetic_fixed_beta_scale_factor),
-                        "realized_fixed_by_population": dict(realized_fixed_by_population),
+                        "realized_fixed_variance_by_population": dict(
+                            realized_fixed_variance_by_population
+                        ),
                         "tightness_summary": dict(bucketed_pool.tightness_summary),
                         "effect_geometry": effect_geometry,
                     }

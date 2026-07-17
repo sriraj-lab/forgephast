@@ -88,13 +88,18 @@ def write_simulation_outputs(
         targets = rec["component_targets"]
         realized = rec.get("component_realized", {})
         effect_geometry = rec.get("effect_geometry", {})
-        realized_fixed_by_population = rec.get("realized_fixed_by_population", {}) or {}
+        realized_fixed_variance_by_population = (
+            rec.get("realized_fixed_variance_by_population", {}) or {}
+        )
         tightness_summary = rec.get("tightness_summary", {}) or {}
         trait_type = str(rec.get("trait_type", "quantitative"))
         binary_summary = rec.get("binary_summary", {}) or {}
 
-        realized_h2_fixed_by_population_json = json.dumps(
-            {str(k): float(v) for k, v in realized_fixed_by_population.items()},
+        realized_var_genetic_fixed_by_population_json = json.dumps(
+            {
+                str(k): float(v)
+                for k, v in realized_fixed_variance_by_population.items()
+            },
             sort_keys=True,
         )
         shift_tightness_tier = str(tightness_summary.get("tier", "extreme"))
@@ -123,35 +128,7 @@ def write_simulation_outputs(
                 "cohort": cohort,
                 "trait_type": trait_type,
                 "genetic_fixed_beta_scale_factor": rec.get("genetic_fixed_beta_scale_factor", 1.0),
-                "base_h2_fixed": targets.get("base_h2_fixed", targets.get("genetic_fixed", 0.0)),
-                "resolved_h2_fixed": targets.get("resolved_h2_fixed", targets.get("genetic_fixed", 0.0)),
-                "h2_jitter_delta": targets.get("h2_jitter_delta", 0.0),
-                "h2_jitter_clipped": targets.get("h2_jitter_clipped", False),
-                "target_mode": targets.get("target_mode", "single_population"),
-                "resolved_h2_fixed_by_population": targets.get(
-                    "resolved_h2_fixed_by_population_json",
-                    "{}",
-                ),
-                "resolved_h2_bg_by_population": targets.get(
-                    "resolved_h2_bg_by_population_json",
-                    "{}",
-                ),
-                "resolved_covariate_by_population": targets.get(
-                    "resolved_covariate_by_population_json",
-                    "{}",
-                ),
-                "resolved_residual_by_population": targets.get(
-                    "resolved_residual_by_population_json",
-                    "{}",
-                ),
-                "h2_jitter_delta_by_population": targets.get(
-                    "h2_jitter_delta_by_population_json",
-                    "{}",
-                ),
-                "h2_jitter_clipped_by_population": targets.get(
-                    "h2_jitter_clipped_by_population_json",
-                    "{}",
-                ),
+                "target_h2_fixed": targets.get("target_h2_fixed", targets.get("genetic_fixed", 0.0)),
                 "target_var_genetic_fixed": targets.get("genetic_fixed", 0.0),
                 "target_var_genetic_bg": targets.get("genetic_bg", 0.0),
                 "target_var_genetic_total": targets.get("genetic_total", 0.0),
@@ -164,7 +141,9 @@ def write_simulation_outputs(
                 "realized_var_residual": realized.get("residual", 0.0),
                 "realized_var_phenotype": realized.get("phenotype", 0.0),
                 "realized_var_liability": realized.get("liability", realized.get("phenotype", 0.0)),
-                "realized_h2_fixed_by_population": realized_h2_fixed_by_population_json,
+                "realized_var_genetic_fixed_by_population": (
+                    realized_var_genetic_fixed_by_population_json
+                ),
                 "binary_prevalence_target": binary_summary.get("binary_prevalence_target", float("nan")),
                 "binary_liability_logit_scale": binary_summary.get("binary_liability_logit_scale", float("nan")),
                 "binary_alpha": binary_summary.get("binary_alpha", float("nan")),
@@ -220,41 +199,15 @@ def write_simulation_outputs(
                 "global_pcs_file": str(pcs_path),
                 "covariate_coefficients_file": str(coeff_path),
                 "output_dir": str(out_dir),
-                "base_h2_fixed": targets.get("base_h2_fixed", targets.get("genetic_fixed", 0.0)),
-                "resolved_h2_fixed": targets.get("resolved_h2_fixed", targets.get("genetic_fixed", 0.0)),
-                "h2_jitter_delta": targets.get("h2_jitter_delta", 0.0),
-                "h2_jitter_clipped": targets.get("h2_jitter_clipped", False),
-                "target_mode": targets.get("target_mode", "single_population"),
-                "resolved_h2_fixed_by_population": targets.get(
-                    "resolved_h2_fixed_by_population_json",
-                    "{}",
-                ),
-                "resolved_h2_bg_by_population": targets.get(
-                    "resolved_h2_bg_by_population_json",
-                    "{}",
-                ),
-                "resolved_covariate_by_population": targets.get(
-                    "resolved_covariate_by_population_json",
-                    "{}",
-                ),
-                "resolved_residual_by_population": targets.get(
-                    "resolved_residual_by_population_json",
-                    "{}",
-                ),
-                "h2_jitter_delta_by_population": targets.get(
-                    "h2_jitter_delta_by_population_json",
-                    "{}",
-                ),
-                "h2_jitter_clipped_by_population": targets.get(
-                    "h2_jitter_clipped_by_population_json",
-                    "{}",
-                ),
+                "target_h2_fixed": targets.get("target_h2_fixed", targets.get("genetic_fixed", 0.0)),
                 "target_var_genetic_fixed": targets.get("genetic_fixed", 0.0),
                 "target_var_genetic_bg": targets.get("genetic_bg", 0.0),
                 "target_var_genetic_total": targets.get("genetic_total", 0.0),
                 "target_var_covariate": targets.get("covariate", 0.0),
                 "target_var_residual": targets.get("residual", 0.0),
-                "realized_h2_fixed_by_population": realized_h2_fixed_by_population_json,
+                "realized_var_genetic_fixed_by_population": (
+                    realized_var_genetic_fixed_by_population_json
+                ),
                 "binary_prevalence_target": binary_summary.get("binary_prevalence_target", float("nan")),
                 "binary_liability_logit_scale": binary_summary.get("binary_liability_logit_scale", float("nan")),
                 "binary_alpha": binary_summary.get("binary_alpha", float("nan")),
@@ -347,7 +300,7 @@ def write_simulation_outputs(
     _atomic_to_csv(manifest_df, run_dir / "run_manifest.tsv")
     _atomic_write_json(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_name": run_name,
             "run_identity": str(run_identity),
             "manifest": "run_manifest.tsv",

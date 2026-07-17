@@ -730,14 +730,12 @@ class PhenotypeConfig:
 
 @dataclass
 class VarianceBudgetConfig:
-    """Variance decomposition targets for simulation components."""
+    """Cohort-level variance decomposition targets."""
 
     h2_fixed: float = 0.4
     h2_bg: float = 0.0
     covariate: float = 0.2
     residual: float = 0.4
-    h2_jitter_sd: float = 0.0
-    h2_jitter_seed: int = 42
     strict_sum_to_one: bool = True
 
     def validate(self) -> None:
@@ -748,14 +746,6 @@ class VarianceBudgetConfig:
             ("residual", self.residual),
         ]:
             _check_non_negative(val, f"variance_budget.{name}")
-        _check_non_negative(self.h2_jitter_sd, "variance_budget.h2_jitter_sd")
-        if not np.isclose(float(self.h2_jitter_sd), 0.0, atol=1e-12):
-            raise ValueError(
-                "variance_budget.h2_jitter_sd is disabled because per-population "
-                "h2 target jitter is not part of the supported phenotype contract; "
-                "set it to 0.0 and use effect_model jitter settings for effect-size "
-                "heterogeneity"
-            )
         total = float(self.h2_fixed + self.h2_bg + self.covariate + self.residual)
         if self.strict_sum_to_one:
             if not np.isclose(total, 1.0, atol=1e-6):

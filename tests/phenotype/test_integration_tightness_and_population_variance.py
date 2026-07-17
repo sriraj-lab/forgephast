@@ -1,4 +1,4 @@
-"""Integration smoke test: tightness filter → bucketed pool → write_outputs columns.
+"""Integration smoke test: tightness filter -> bucketed pool -> write_outputs columns.
 
 This test does NOT spin up a full ``run_simulation`` call (which would require a
 hapstore fixture, causal pool, and a cohort config). Instead it exercises the
@@ -8,7 +8,7 @@ end-to-end path that matters for this feature:
 2. Run ``build_bucketed_pool`` at each tier and verify the tightness summary
    threads into ``BucketedPool.tightness_summary`` with the expected counts.
 3. Simulate a records list (mirroring what ``run_simulation`` emits) with
-   per-population ``realized_fixed_by_population`` and the bucketed pool's
+   population-stratified fixed-component variance and the bucketed pool's
    tightness summary attached.
 4. Call ``write_simulation_outputs`` and verify the new columns land on
    ``component_summary.tsv`` and ``run_manifest.tsv``.
@@ -76,15 +76,14 @@ def test_tightness_tiers_yield_expected_pool_sizes(tmp_path: Path) -> None:
     assert extreme.tightness_summary["dropped"] == 0
 
 
-def test_write_outputs_flows_tightness_and_realized_h2_columns(tmp_path: Path) -> None:
+def test_write_outputs_flows_tightness_and_population_variance_columns(tmp_path: Path) -> None:
     pool_path = tmp_path / "pool.tsv"
     _write_fold_change_pool(pool_path)
 
     bucketed = build_bucketed_pool(_build_config(pool_path, "moderate"))
     tightness_summary = dict(bucketed.tightness_summary)
 
-    # Realized per-population h² — plausible unequal values for EUR/AFR, sitting
-    # in the (0.05, 0.80) window the plan calls for in the end-to-end smoke.
+    # Population-stratified fixed-component variance is diagnostic only.
     realized_by_pop = {"EUR": 0.18, "AFR": 0.24}
 
     record = {
@@ -114,22 +113,12 @@ def test_write_outputs_flows_tightness_and_realized_h2_columns(tmp_path: Path) -
         ),
         "effects_df": pd.DataFrame({"variant_id": ["v1"], "beta": [0.3]}),
         "component_targets": {
-            "base_h2_fixed": 0.30,
-            "resolved_h2_fixed": float("nan"),
-            "h2_jitter_delta": float("nan"),
-            "h2_jitter_clipped": False,
-            "target_mode": "free_per_population",
-            "resolved_h2_fixed_by_population_json": '{"AFR": 0.30, "EUR": 0.30}',
-            "resolved_h2_bg_by_population_json": '{"AFR": 0.0, "EUR": 0.0}',
-            "resolved_covariate_by_population_json": '{"AFR": 0.2, "EUR": 0.2}',
-            "resolved_residual_by_population_json": '{"AFR": 0.5, "EUR": 0.5}',
-            "h2_jitter_delta_by_population_json": '{"AFR": 0.0, "EUR": 0.0}',
-            "h2_jitter_clipped_by_population_json": '{"AFR": false, "EUR": false}',
-            "genetic_fixed": float("nan"),
+            "target_h2_fixed": 0.30,
+            "genetic_fixed": 0.30,
             "genetic_bg": 0.0,
-            "genetic_total": float("nan"),
+            "genetic_total": 0.30,
             "covariate": 0.2,
-            "residual": float("nan"),
+            "residual": 0.5,
         },
         "component_realized": {
             "genetic_fixed": 0.21,
@@ -139,7 +128,7 @@ def test_write_outputs_flows_tightness_and_realized_h2_columns(tmp_path: Path) -
             "residual": 0.5,
             "phenotype": 0.91,
         },
-        "realized_fixed_by_population": realized_by_pop,
+        "realized_fixed_variance_by_population": realized_by_pop,
         "tightness_summary": tightness_summary,
         "effect_geometry": {
             "population_corr_mode": "manual",
@@ -160,12 +149,12 @@ def test_write_outputs_flows_tightness_and_realized_h2_columns(tmp_path: Path) -
         sep="\t",
     )
 
-    # target_mode threads through as free_per_population
-    assert component_df.loc[0, "target_mode"] == "free_per_population"
-    assert manifest_df.loc[0, "target_mode"] == "free_per_population"
+    assert float(component_df.loc[0, "target_h2_fixed"]) == 0.30
+    assert float(manifest_df.loc[0, "target_h2_fixed"]) == 0.30
 
-    # realized per-pop h² lands as sorted JSON
-    realized_json = json.loads(component_df.loc[0, "realized_h2_fixed_by_population"])
+    realized_json = json.loads(
+        component_df.loc[0, "realized_var_genetic_fixed_by_population"]
+    )
     assert set(realized_json.keys()) == {"EUR", "AFR"}
     assert realized_json["EUR"] != realized_json["AFR"]  # not forced equal
     assert 0.05 < realized_json["EUR"] < 0.80

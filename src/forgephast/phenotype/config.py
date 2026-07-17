@@ -214,6 +214,16 @@ class RunConfig:
                 "residual": float(legacy_targets.get("residual", 0.4)),
                 "strict_sum_to_one": False,
             }
+        else:
+            variance_payload = dict(variance_payload)
+            removed_h2_keys = sorted(
+                {"h2_jitter_sd", "h2_jitter_seed"}.intersection(variance_payload)
+            )
+            if removed_h2_keys:
+                raise ValueError(
+                    "Removed population-level h2 settings in variance_budget: "
+                    + ", ".join(removed_h2_keys)
+                )
         variance_budget = VarianceBudgetConfig(**variance_payload)
 
         background_genetic = BackgroundGeneticConfig(**payload.get("background_genetic", {}))
