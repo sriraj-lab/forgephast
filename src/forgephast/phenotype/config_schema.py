@@ -762,7 +762,7 @@ class BackgroundGeneticConfig:
 
     mode: str = "none"
     kinship_file: Optional[str] = None
-    grm_variant_source: str = "selected_dosages"
+    variant_ids_file: Optional[str] = None
     seed: int = 42
 
     def validate(self) -> None:
@@ -771,7 +771,10 @@ class BackgroundGeneticConfig:
             raise ValueError(
                 "background_genetic.kinship_file is required for mode=precomputed_kinship"
             )
-        _check_one_of(self.grm_variant_source, {"selected_dosages"}, "background_genetic.grm_variant_source")
+        if self.mode == "compute_grm" and not self.variant_ids_file:
+            raise ValueError(
+                "background_genetic.variant_ids_file is required for mode=compute_grm"
+            )
 
 
 @dataclass

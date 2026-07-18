@@ -87,6 +87,8 @@ def write_simulation_outputs(
 
         targets = rec["component_targets"]
         realized = rec.get("component_realized", {})
+        component_diagnostics = rec.get("component_diagnostics", {}) or {}
+        realized_fractions = component_diagnostics.get("realized_fractions", {}) or {}
         effect_geometry = rec.get("effect_geometry", {})
         realized_fixed_variance_by_population = (
             rec.get("realized_fixed_variance_by_population", {}) or {}
@@ -94,6 +96,15 @@ def write_simulation_outputs(
         tightness_summary = rec.get("tightness_summary", {}) or {}
         trait_type = str(rec.get("trait_type", "quantitative"))
         binary_summary = rec.get("binary_summary", {}) or {}
+        pairwise_covariances_json = json.dumps(
+            {
+                str(k): float(v)
+                for k, v in (
+                    component_diagnostics.get("pairwise_covariances", {}) or {}
+                ).items()
+            },
+            sort_keys=True,
+        )
 
         realized_var_genetic_fixed_by_population_json = json.dumps(
             {
@@ -141,6 +152,46 @@ def write_simulation_outputs(
                 "realized_var_residual": realized.get("residual", 0.0),
                 "realized_var_phenotype": realized.get("phenotype", 0.0),
                 "realized_var_liability": realized.get("liability", realized.get("phenotype", 0.0)),
+                "realized_fraction_genetic_fixed": realized_fractions.get(
+                    "genetic_fixed", float("nan")
+                ),
+                "realized_fraction_genetic_bg": realized_fractions.get(
+                    "genetic_bg", float("nan")
+                ),
+                "realized_fraction_genetic_total": realized_fractions.get(
+                    "genetic_total", float("nan")
+                ),
+                "realized_fraction_covariate": realized_fractions.get(
+                    "covariate", float("nan")
+                ),
+                "realized_fraction_residual": realized_fractions.get(
+                    "residual", float("nan")
+                ),
+                "component_pairwise_covariances": pairwise_covariances_json,
+                "realized_component_variance_sum": component_diagnostics.get(
+                    "component_variance_sum", 0.0
+                ),
+                "component_covariance_contribution": component_diagnostics.get(
+                    "covariance_contribution", 0.0
+                ),
+                "component_covariance_relative_contribution": component_diagnostics.get(
+                    "covariance_relative_contribution", 0.0
+                ),
+                "component_covariance_warning_threshold": component_diagnostics.get(
+                    "covariance_warning_threshold", 0.05
+                ),
+                "component_covariance_warning": bool(
+                    component_diagnostics.get("covariance_warning", False)
+                ),
+                "background_genetic_mode": str(
+                    rec.get("background_genetic_mode", "none")
+                ),
+                "background_grm_variant_count": int(
+                    rec.get("background_grm_variant_count", 0)
+                ),
+                "background_grm_excluded_causal_count": int(
+                    rec.get("background_grm_excluded_causal_count", 0)
+                ),
                 "realized_var_genetic_fixed_by_population": (
                     realized_var_genetic_fixed_by_population_json
                 ),
@@ -205,6 +256,27 @@ def write_simulation_outputs(
                 "target_var_genetic_total": targets.get("genetic_total", 0.0),
                 "target_var_covariate": targets.get("covariate", 0.0),
                 "target_var_residual": targets.get("residual", 0.0),
+                "realized_fraction_genetic_fixed": realized_fractions.get(
+                    "genetic_fixed", float("nan")
+                ),
+                "realized_fraction_genetic_total": realized_fractions.get(
+                    "genetic_total", float("nan")
+                ),
+                "component_covariance_relative_contribution": component_diagnostics.get(
+                    "covariance_relative_contribution", 0.0
+                ),
+                "component_covariance_warning": bool(
+                    component_diagnostics.get("covariance_warning", False)
+                ),
+                "background_genetic_mode": str(
+                    rec.get("background_genetic_mode", "none")
+                ),
+                "background_grm_variant_count": int(
+                    rec.get("background_grm_variant_count", 0)
+                ),
+                "background_grm_excluded_causal_count": int(
+                    rec.get("background_grm_excluded_causal_count", 0)
+                ),
                 "realized_var_genetic_fixed_by_population": (
                     realized_var_genetic_fixed_by_population_json
                 ),

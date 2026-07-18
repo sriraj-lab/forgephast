@@ -33,6 +33,9 @@ from ..local_ancestry.tracts import load_tracts_tsv_gz, rasterize_tracts_to_vari
 
 logger = logging.getLogger(__name__)
 
+_COMPONENT_NAMES = ("genetic_fixed", "genetic_bg", "covariate", "residual")
+_COVARIANCE_WARNING_RELATIVE_THRESHOLD = 0.05
+
 
 def _stable_string_seed(value: str) -> int:
     """Deterministic seed component from string."""
@@ -73,6 +76,77 @@ def _scale_effects_detail_betas(effects_detail: pd.DataFrame, scale_factor: floa
             continue
         scaled[column] = pd.to_numeric(scaled[column], errors="coerce") * float(scale_factor)
     return scaled
+
+
+def _component_variance_diagnostics(
+    *,
+    genetic_fixed: np.ndarray,
+    genetic_bg: np.ndarray,
+    covariate: np.ndarray,
+    residual: np.ndarray,
+    liability: np.ndarray,
+) -> Dict[str, object]:
+    """Summarize realized component covariance without changing the simulation."""
+    components = {
+        "genetic_fixed": np.asarray(genetic_fixed, dtype=float),
+        "genetic_bg": np.asarray(genetic_bg, dtype=float),
+        "covariate": np.asarray(covariate, dtype=float),
+        "residual": np.asarray(residual, dtype=float),
+    }
+    lengths = {values.shape for values in components.values()}
+    if len(lengths) != 1 or any(values.ndim != 1 for values in components.values()):
+        raise ValueError("Phenotype components must be one-dimensional vectors with equal length")
+
+    n_samples = next(iter(components.values())).shape[0]
+    centered = np.column_stack(
+        [components[name] - float(np.mean(components[name])) for name in _COMPONENT_NAMES]
+    )
+    covariance_matrix = (
+        (centered.T @ centered) / float(n_samples)
+        if n_samples
+        else np.zeros((len(_COMPONENT_NAMES), len(_COMPONENT_NAMES)), dtype=float)
+    )
+    liability_variance = float(np.var(np.asarray(liability, dtype=float)))
+    component_variance_sum = float(np.trace(covariance_matrix))
+    covariance_contribution = float(liability_variance - component_variance_sum)
+    relative_contribution = (
+        abs(covariance_contribution) / component_variance_sum
+        if component_variance_sum > 0.0
+        else 0.0
+    )
+
+    pairwise_covariances = {
+        f"{left}|{right}": float(covariance_matrix[left_idx, right_idx])
+        for left_idx, left in enumerate(_COMPONENT_NAMES)
+        for right_idx, right in enumerate(_COMPONENT_NAMES)
+        if right_idx > left_idx
+    }
+    realized_fractions = {
+        name: (
+            float(covariance_matrix[idx, idx]) / liability_variance
+            if liability_variance > 0.0
+            else float("nan")
+        )
+        for idx, name in enumerate(_COMPONENT_NAMES)
+    }
+    realized_fractions["genetic_total"] = (
+        float(np.var(components["genetic_fixed"] + components["genetic_bg"]))
+        / liability_variance
+        if liability_variance > 0.0
+        else float("nan")
+    )
+
+    return {
+        "pairwise_covariances": pairwise_covariances,
+        "component_variance_sum": component_variance_sum,
+        "covariance_contribution": covariance_contribution,
+        "covariance_relative_contribution": float(relative_contribution),
+        "covariance_warning_threshold": _COVARIANCE_WARNING_RELATIVE_THRESHOLD,
+        "covariance_warning": bool(
+            relative_contribution > _COVARIANCE_WARNING_RELATIVE_THRESHOLD
+        ),
+        "realized_fractions": realized_fractions,
+    }
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -452,29 +526,67 @@ def _load_precomputed_kinship(
     return arr
 
 
-def _compute_grm_from_dosage(dosage_df: pd.DataFrame) -> np.ndarray:
-    """Compute a simple GRM from standardized dosage columns."""
-    variant_cols = [c for c in dosage_df.columns if c not in {"FID", "IID"}]
-    x = dosage_df[variant_cols].to_numpy(dtype=float)
-    return _compute_grm_from_matrix(x)
+def _read_background_variant_ids(path: str) -> List[str]:
+    """Read one variant ID from the first whitespace-delimited field per line."""
+    variant_ids: List[str] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            token = line.strip()
+            if token and not token.startswith("#"):
+                variant_ids.append(token.split()[0])
+    if variant_ids and variant_ids[0].lower() in {"variant_id", "id"}:
+        variant_ids = variant_ids[1:]
+    if not variant_ids:
+        raise ValueError(f"No background GRM variants found in {path}")
+    if len(set(variant_ids)) != len(variant_ids):
+        raise ValueError(f"Duplicate background GRM variant IDs found in {path}")
+    return variant_ids
 
 
-def _compute_grm_from_matrix(x: np.ndarray) -> np.ndarray:
-    """Compute a simple GRM from an additive genotype matrix."""
-    x = np.asarray(x, dtype=float)
+def _exclude_causal_grm_variants(
+    configured_variant_ids: List[str],
+    causal_variant_ids: List[str],
+) -> tuple[List[str], int]:
+    causal = set(causal_variant_ids)
+    retained = [variant_id for variant_id in configured_variant_ids if variant_id not in causal]
+    excluded_count = len(configured_variant_ids) - len(retained)
+    if not retained:
+        raise ValueError(
+            "No background GRM variants remain after excluding selected causal variants"
+        )
+    return retained, excluded_count
+
+
+def _standardize_grm_genotypes(x: np.ndarray) -> np.ndarray:
+    """Return standardized polymorphic genotypes as the implicit GRM factor."""
+    x = np.array(x, dtype=np.float32, copy=True)
     if x.ndim != 2 or x.shape[1] == 0:
         raise ValueError("Cannot compute GRM with zero dosage variants")
-    x = x - x.mean(axis=0, keepdims=True)
-    std = x.std(axis=0, keepdims=True)
+    x -= x.mean(axis=0, keepdims=True, dtype=np.float64).astype(np.float32)
+    std = x.std(axis=0, keepdims=True, dtype=np.float64).astype(np.float32)
     keep = (std > 1e-12).reshape(-1)
     if not np.any(keep):
         raise ValueError("Cannot compute GRM: all dosage variants are monomorphic")
     x = x[:, keep]
-    x = x / std[:, keep]
-    m = max(1, x.shape[1])
-    grm = (x @ x.T) / float(m)
-    grm = 0.5 * (grm + grm.T)
-    return grm
+    x /= std[:, keep]
+    return x.astype(np.float32, copy=False)
+
+
+def _sample_background_from_grm_factor(
+    grm_factor: np.ndarray,
+    seed: int,
+) -> np.ndarray:
+    """Sample N(0, ZZ'/M) without materializing the dense GRM."""
+    z = np.asarray(grm_factor, dtype=np.float32)
+    if z.ndim != 2 or z.shape[1] == 0:
+        raise ValueError("compute_grm mode requires standardized background genotypes")
+    rng = np.random.default_rng(int(seed))
+    marker_effects = rng.normal(
+        0.0,
+        1.0 / np.sqrt(float(z.shape[1])),
+        size=z.shape[1],
+    ).astype(np.float32)
+    return np.asarray(z @ marker_effects, dtype=float)
 
 
 def _sample_frame(sample_ids: List[str]) -> pd.DataFrame:
@@ -498,8 +610,7 @@ def _sample_mvnormal_from_cov(
 def _build_background_component(
     run_cfg: RunConfig,
     sample_ids: List[str],
-    dosage_df: pd.DataFrame | None,
-    genotype_matrix: np.ndarray | None,
+    grm_factor: np.ndarray | None,
     cache_key: str,
     replicate_seed: int,
     kinship_cache: Dict[str, np.ndarray],
@@ -517,12 +628,12 @@ def _build_background_component(
             )
         cov = kinship_cache[cache_key]
     elif mode == "compute_grm":
-        if genotype_matrix is not None:
-            cov = _compute_grm_from_matrix(genotype_matrix)
-        elif dosage_df is not None:
-            cov = _compute_grm_from_dosage(dosage_df)
-        else:
-            raise ValueError("compute_grm mode requires dosage_df or genotype_matrix")
+        if grm_factor is None:
+            raise ValueError("compute_grm mode requires an independent GRM variant set")
+        return _sample_background_from_grm_factor(
+            grm_factor=grm_factor,
+            seed=replicate_seed,
+        )
     else:
         raise ValueError(f"Unsupported background_genetic.mode={mode}")
 
@@ -610,6 +721,11 @@ def run_simulation(
     bucketed_pool = build_bucketed_pool(run_cfg.causal_selection)
     _timed("simulate.build_bucketed_pool", t_pool)
     records: List[Dict[str, object]] = []
+    configured_background_variant_ids: List[str] = []
+    if run_cfg.background_genetic.mode == "compute_grm":
+        configured_background_variant_ids = _read_background_variant_ids(
+            str(run_cfg.background_genetic.variant_ids_file)
+        )
 
     variant_col = run_cfg.causal_selection.variant_id_column
     default_population = run_cfg.effect_model.population_order[0]
@@ -979,6 +1095,49 @@ def run_simulation(
 
             check_id_alignment(sample_ids, sample_frame)
 
+            background_grm_factor: np.ndarray | None = None
+            background_grm_variant_count = 0
+            background_grm_excluded_causal_count = 0
+            if run_cfg.background_genetic.mode == "compute_grm":
+                grm_variant_ids, background_grm_excluded_causal_count = (
+                    _exclude_causal_grm_variants(
+                        configured_variant_ids=configured_background_variant_ids,
+                        causal_variant_ids=variant_ids,
+                    )
+                )
+                t_grm_export = time.perf_counter()
+                if hasattr(adapter, "export_genotypes_u8"):
+                    background_genotypes = adapter.export_genotypes_u8(
+                        sample_ids=sample_ids,
+                        sample_populations=sample_populations,
+                        variant_ids=grm_variant_ids,
+                        out_dir=cohort_tmp / "background_grm",
+                    )
+                else:
+                    background_dosages = adapter.export_dosages(
+                        sample_ids=sample_ids,
+                        sample_populations=sample_populations,
+                        variant_ids=grm_variant_ids,
+                        out_dir=cohort_tmp / "background_grm",
+                    )
+                    check_id_alignment(sample_ids, background_dosages)
+                    background_genotypes = background_dosages[grm_variant_ids].to_numpy(
+                        dtype=np.float32,
+                        copy=False,
+                    )
+                background_grm_factor = _standardize_grm_genotypes(background_genotypes)
+                background_grm_variant_count = int(background_grm_factor.shape[1])
+                _timed(
+                    "simulate.prepare_background_grm",
+                    t_grm_export,
+                    replicate=int(replicate),
+                    cohort=str(cohort.name),
+                    n_samples=int(len(sample_ids)),
+                    n_configured_variants=int(len(configured_background_variant_ids)),
+                    n_excluded_causal=int(background_grm_excluded_causal_count),
+                    n_polymorphic_variants=int(background_grm_variant_count),
+                )
+
             t_cov = time.perf_counter()
             cov_out = build_covariate_effects(
                 cfg=run_cfg.covariates,
@@ -1258,8 +1417,7 @@ def run_simulation(
                 genetic_bg_raw = _build_background_component(
                     run_cfg=run_cfg,
                     sample_ids=sample_ids,
-                    dosage_df=None,
-                    genotype_matrix=genotype_matrix,
+                    grm_factor=background_grm_factor,
                     cache_key=f"{cohort.name}",
                     replicate_seed=bg_seed,
                     kinship_cache=kinship_cache,
@@ -1289,6 +1447,25 @@ def run_simulation(
 
                 genetic = genetic_fixed + genetic_bg
                 liability = genetic + covariate + residual
+                component_diagnostics = _component_variance_diagnostics(
+                    genetic_fixed=genetic_fixed,
+                    genetic_bg=genetic_bg,
+                    covariate=covariate,
+                    residual=residual,
+                    liability=liability,
+                )
+                if component_diagnostics["covariance_warning"]:
+                    logger.warning(
+                        "PHENOTYPE_COMPONENT_COVARIANCE_WARNING "
+                        "replicate=%d cohort=%s architecture=%s "
+                        "covariance_contribution=%.6g relative_to_component_variance_sum=%.6g "
+                        "realized fractions may differ materially from configured variance targets",
+                        int(replicate),
+                        str(cohort.name),
+                        str(architecture.name),
+                        float(component_diagnostics["covariance_contribution"]),
+                        float(component_diagnostics["covariance_relative_contribution"]),
+                    )
                 phenotype: np.ndarray = liability
                 binary_probability: np.ndarray | None = None
                 binary_summary: Dict[str, Any] = {}
@@ -1392,7 +1569,13 @@ def run_simulation(
                             "phenotype": float(np.var(phenotype)),
                             "liability": float(np.var(liability)),
                         },
+                        "component_diagnostics": component_diagnostics,
                         "binary_summary": dict(binary_summary),
+                        "background_genetic_mode": str(run_cfg.background_genetic.mode),
+                        "background_grm_variant_count": int(background_grm_variant_count),
+                        "background_grm_excluded_causal_count": int(
+                            background_grm_excluded_causal_count
+                        ),
                         "genetic_fixed_beta_scale_factor": float(genetic_fixed_beta_scale_factor),
                         "realized_fixed_variance_by_population": dict(
                             realized_fixed_variance_by_population

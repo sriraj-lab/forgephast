@@ -55,6 +55,24 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
             "phenotype": 0.99,
             "liability": 1.00,
         },
+        "component_diagnostics": {
+            "pairwise_covariances": {
+                "genetic_fixed|genetic_bg": 0.01,
+                "genetic_fixed|covariate": 0.04,
+            },
+            "component_variance_sum": 0.96,
+            "covariance_contribution": 0.04,
+            "covariance_relative_contribution": 0.0416666667,
+            "covariance_warning_threshold": 0.05,
+            "covariance_warning": False,
+            "realized_fractions": {
+                "genetic_fixed": 0.24,
+                "genetic_bg": 0.09,
+                "genetic_total": 0.34,
+                "covariate": 0.14,
+                "residual": 0.49,
+            },
+        },
         "binary_summary": {
             "binary_prevalence_target": 0.20,
             "binary_liability_logit_scale": 1.5,
@@ -66,6 +84,9 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
             "binary_realized_prevalence": 0.2,
             "binary_mean_predicted_probability": 0.2,
         },
+        "background_genetic_mode": "compute_grm",
+        "background_grm_variant_count": 1200,
+        "background_grm_excluded_causal_count": 2,
         "genetic_fixed_beta_scale_factor": 0.42,
         "effect_geometry": {
             "population_corr_mode": "auto_from_fst",
@@ -95,6 +116,16 @@ def test_write_simulation_outputs_persists_h2_and_effect_geometry(tmp_path) -> N
     assert component_df.loc[0, "trait_type"] == "binary"
     assert manifest_df.loc[0, "trait_type"] == "binary"
     assert float(component_df.loc[0, "realized_var_liability"]) == 1.00
+    assert float(component_df.loc[0, "realized_fraction_genetic_fixed"]) == 0.24
+    assert bool(component_df.loc[0, "component_covariance_warning"]) is False
+    assert float(component_df.loc[0, "realized_component_variance_sum"]) == 0.96
+    assert float(component_df.loc[0, "component_covariance_contribution"]) == 0.04
+    assert float(component_df.loc[0, "component_covariance_warning_threshold"]) == 0.05
+    assert int(component_df.loc[0, "background_grm_variant_count"]) == 1200
+    assert int(manifest_df.loc[0, "background_grm_excluded_causal_count"]) == 2
+    assert json.loads(component_df.loc[0, "component_pairwise_covariances"])[
+        "genetic_fixed|covariate"
+    ] == 0.04
     assert float(component_df.loc[0, "binary_prevalence_target"]) == 0.20
     assert float(manifest_df.loc[0, "binary_liability_logit_scale"]) == 1.5
     assert component_df.loc[0, "binary_alpha_by_population"] == '{"__cohort__": -1.25}'

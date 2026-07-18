@@ -431,6 +431,33 @@ def test_rejects_removed_population_h2_settings() -> None:
         RunConfig.from_dict(payload)
 
 
+def test_compute_grm_requires_explicit_variant_ids_file() -> None:
+    payload = _base_payload()
+    payload["background_genetic"] = {"mode": "compute_grm"}
+    with pytest.raises(ValueError, match="variant_ids_file is required"):
+        RunConfig.from_dict(payload)
+
+
+def test_compute_grm_accepts_explicit_variant_ids_file() -> None:
+    payload = _base_payload()
+    payload["background_genetic"] = {
+        "mode": "compute_grm",
+        "variant_ids_file": "/tmp/grm_variants.txt",
+    }
+    cfg = RunConfig.from_dict(payload)
+    assert cfg.background_genetic.variant_ids_file == "/tmp/grm_variants.txt"
+
+
+def test_rejects_removed_causal_dosage_grm_source() -> None:
+    payload = _base_payload()
+    payload["background_genetic"] = {
+        "mode": "compute_grm",
+        "grm_variant_source": "selected_dosages",
+    }
+    with pytest.raises(ValueError, match="grm_variant_source was removed"):
+        RunConfig.from_dict(payload)
+
+
 def test_removed_global_pcs_compute_mode_raises() -> None:
     payload = _base_payload()
     payload["gwas"]["global_pcs"]["mode"] = "compute"

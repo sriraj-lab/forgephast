@@ -226,7 +226,13 @@ class RunConfig:
                 )
         variance_budget = VarianceBudgetConfig(**variance_payload)
 
-        background_genetic = BackgroundGeneticConfig(**payload.get("background_genetic", {}))
+        background_payload = dict(payload.get("background_genetic", {}))
+        if "grm_variant_source" in background_payload:
+            raise ValueError(
+                "background_genetic.grm_variant_source was removed; "
+                "mode=compute_grm now requires background_genetic.variant_ids_file"
+            )
+        background_genetic = BackgroundGeneticConfig(**background_payload)
         pgen_payload = dict(payload.get("pgen_export", {}))
         for legacy_key in ("ld_tag_mode", "ld_window_kb", "ld_r2"):
             if legacy_key in pgen_payload:
