@@ -95,6 +95,39 @@ def _assert_variant_axis_aligned(
     return ref
 
 
+def _warn_ignored_nonuniform_donor_weights(
+    *,
+    population_name: str,
+    source_order: list[str],
+    source_panels: dict[str, PanelChromData],
+) -> None:
+    for source_name in source_order:
+        panel = source_panels[source_name]
+        weights = panel.donor_hap_sampling_weights
+        if weights is None:
+            continue
+        values = np.asarray(weights, dtype=np.float64)
+        expected_shape = (int(panel.donor_haps.shape[0]),)
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"msprime source panel {source_name!r} donor weight shape mismatch: "
+                f"got {values.shape}, expected {expected_shape}"
+            )
+        uniform = np.full(values.shape, 1.0 / float(values.size), dtype=np.float64)
+        if np.allclose(values, uniform, rtol=1e-10, atol=1e-12):
+            continue
+        logger.warning(
+            "MSPRIME_TRACTS_DONOR_WEIGHTS_IGNORED "
+            "target_population=%s source_population=%s n_donor_haplotypes=%d; "
+            "source ancestry weights still control ancestry proportions, but donor "
+            "haplotypes are selected uniformly within each source ancestry tract. "
+            "Select the source donor pool to define the intended within-source sampling.",
+            str(population_name),
+            str(source_name),
+            int(values.size),
+        )
+
+
 def _stable_uniform01(*parts: Any) -> float:
     payload = "|".join(str(p) for p in parts).encode("utf-8")
     digest = hashlib.sha1(payload).digest()
@@ -227,6 +260,11 @@ def simulate_msprime_tract_haplotypes(
         raise ValueError("copy_workers must be > 0")
 
     reference_panel = _assert_variant_axis_aligned(source_order, source_panels)
+    _warn_ignored_nonuniform_donor_weights(
+        population_name=population_name,
+        source_order=source_order,
+        source_panels=source_panels,
+    )
     marker_positions = np.asarray(marker_positions, dtype=np.int64, order="C")
     n_markers = int(marker_positions.size)
     if n_markers <= 0:
