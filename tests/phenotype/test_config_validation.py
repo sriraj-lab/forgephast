@@ -388,6 +388,13 @@ def test_hapstore_config_accepts_required_fields() -> None:
     assert cfg.genotype_input.hapstore.root_dir == "/tmp/fake"
 
 
+def test_hapstore_rejects_noncanonical_missing_sentinel() -> None:
+    payload = _base_payload()
+    payload["genotype_input"]["hapstore"]["missing_sentinel"] = 254
+    with pytest.raises(ValueError, match="missing_sentinel must be 255"):
+        RunConfig.from_dict(payload)
+
+
 def test_hapstore_rejects_missing_population_map() -> None:
     payload = _base_payload()
     payload["cohorts"][0].pop("population_map_file", None)

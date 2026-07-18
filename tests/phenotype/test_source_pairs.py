@@ -44,6 +44,9 @@ class FakeStore:
     def has_chromosome(self, chrom):
         return True
 
+    def attrs(self, chrom):
+        return {"missing_sentinel": 255}
+
     def close(self):
         self.closed = True
 
@@ -130,6 +133,36 @@ def test_build_source_pairs_per_chr_computes_group_maf_from_genotypes(tmp_path: 
     total = qc.loc[qc["scope"] == "total"].iloc[0]
     assert int(total["n_variants_total"]) == 4
     assert int(total["n_variants_written"]) == 3
+
+
+def test_source_pairs_rejects_store_with_noncanonical_missing_sentinel(
+    tmp_path: Path,
+) -> None:
+    sample_path = _write_samples(tmp_path)
+    config = SourcePairBuildConfig.from_dict(_base_payload(tmp_path, sample_path))
+    store_path = tmp_path / "stores" / "chr1.hapstore.zarr"
+    store = FakeStore(
+        sample_ids=["s1", "s2", "s3"],
+        positions=[10],
+        vids=["rs10"],
+        genotypes=[[0], [1], [2]],
+    )
+    store.attrs = lambda chrom: {"missing_sentinel": 254}  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="missing_sentinel=254, expected 255"):
+        build_source_pairs_from_hapstore(
+            config,
+            opener=lambda path: {store_path: store}[path],
+        )
+
+
+def test_source_pairs_rejects_noncanonical_configured_missing_sentinel(
+    tmp_path: Path,
+) -> None:
+    payload = _base_payload(tmp_path, _write_samples(tmp_path))
+    payload["hapstore"]["missing_sentinel"] = 254
+    with pytest.raises(ValueError, match="missing_sentinel must be 255"):
+        SourcePairBuildConfig.from_dict(payload)
 
 
 def test_write_source_pairs_derives_population_groups_and_qc(tmp_path: Path) -> None:

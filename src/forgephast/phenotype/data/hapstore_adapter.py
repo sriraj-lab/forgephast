@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import HapStoreInputConfig
+from ..hapstore_contract import validate_hapstore_missing_sentinel
 from .global_pcs import compute_global_pcs_svd, normalize_psam_fid_column
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,11 @@ class HapStoreAdapter:
             if key in self._variant_cache:
                 return self._variant_cache[key]
         store = self._open_store(population, chrom)
+        validate_hapstore_missing_sentinel(
+            store,
+            chrom,
+            context=f"HapStore population={population} chrom={chrom}",
+        )
         pos = np.asarray(store.variant_positions(chrom), dtype=np.int64)
         info = store.variant_info(chrom)
         ref = [str(x) for x in info.get("ref", [])]

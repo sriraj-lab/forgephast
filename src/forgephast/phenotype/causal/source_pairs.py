@@ -14,6 +14,11 @@ import pandas as pd
 import yaml
 from rajlab_utils.popgen import normalize_chrom
 
+from ..hapstore_contract import (
+    HAPSTORE_MISSING_SENTINEL,
+    validate_hapstore_missing_sentinel,
+)
+
 logger = logging.getLogger(__name__)
 
 StoreOpener = Callable[[Path], object]
@@ -46,8 +51,10 @@ class SourcePairHapStoreConfig:
                 raise ValueError(
                     "hapstore.file_pattern must include {population} for layout=per_pop_per_chr"
                 )
-        if not 0 <= int(self.missing_sentinel) <= 255:
-            raise ValueError("hapstore.missing_sentinel must be in [0, 255]")
+        if int(self.missing_sentinel) != HAPSTORE_MISSING_SENTINEL:
+            raise ValueError(
+                "hapstore.missing_sentinel must be 255 to match the HapStore format contract"
+            )
 
 
 @dataclass
@@ -682,6 +689,11 @@ def _read_variant_reference(
     has_chromosome = getattr(store, "has_chromosome", None)
     if callable(has_chromosome) and not bool(has_chromosome(chrom_key)):
         raise ValueError(f"HapStore does not contain chromosome {chrom_key}")
+    validate_hapstore_missing_sentinel(
+        store,
+        chrom_key,
+        context=f"source-pair HapStore chrom={chrom_key}",
+    )
     info = store.variant_info(chrom_key)
     positions = np.asarray(info["pos"], dtype=np.int64)
     if positions.size == 0:

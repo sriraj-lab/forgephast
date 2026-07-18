@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from .gwas.registry import validate_engine_names
+from .hapstore_contract import HAPSTORE_MISSING_SENTINEL
 
 
 # ── Validation helpers ───────────────────────────────────────────────
@@ -125,7 +126,11 @@ class HapStoreInputConfig:
         elif self.layout == "single_store":
             if not self.store_path:
                 raise ValueError("genotype_input.hapstore.store_path is required for layout=single_store")
-        _check_in_range(int(self.missing_sentinel), 0, 255, "genotype_input.hapstore.missing_sentinel")
+        if int(self.missing_sentinel) != HAPSTORE_MISSING_SENTINEL:
+            raise ValueError(
+                "genotype_input.hapstore.missing_sentinel must be 255 "
+                "to match the HapStore format contract"
+            )
         _check_one_of(
             self.missing_policy,
             {"error", "fill"},

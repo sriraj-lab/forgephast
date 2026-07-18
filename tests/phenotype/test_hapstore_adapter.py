@@ -46,6 +46,9 @@ class FakeStore:
             "alt": list(self._alts),
         }
 
+    def attrs(self, chrom):
+        return {"missing_sentinel": 255}
+
     def genotypes(self, chrom, variant_slice=None, sample_mask=None):
         self.genotype_sample_masks.append(
             None if sample_mask is None else np.asarray(sample_mask, dtype=bool).copy()
@@ -309,6 +312,28 @@ def test_missing_genotypes_fail_without_explicit_fill_policy() -> None:
 
     with pytest.raises(ValueError, match="missing genotype values"):
         adapter.export_dosages(
+            sample_ids=["id1"],
+            sample_populations=["EUR"],
+            variant_ids=["chr1:10"],
+            out_dir=Path("/tmp"),
+        )
+
+
+def test_adapter_rejects_store_with_noncanonical_missing_sentinel(
+    fake_adapter: HapStoreAdapter,
+) -> None:
+    store = FakeStore(
+        sample_ids=["id1"],
+        positions=[10],
+        refs=["A"],
+        alts=["G"],
+        genotypes=[[0]],
+    )
+    store.attrs = lambda chrom: {"missing_sentinel": 254}  # type: ignore[method-assign]
+    _wire_fake_stores(fake_adapter, {("EUR", 1): store})
+
+    with pytest.raises(ValueError, match="missing_sentinel=254, expected 255"):
+        fake_adapter.export_genotypes_u8(
             sample_ids=["id1"],
             sample_populations=["EUR"],
             variant_ids=["chr1:10"],
