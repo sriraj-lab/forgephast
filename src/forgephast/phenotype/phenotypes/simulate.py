@@ -6,35 +6,47 @@ import logging
 from pathlib import Path
 import time
 from typing import Any, Dict, List
-import json
 
 import numpy as np
 import pandas as pd
-from hapstore.ids import align_by_ids, read_sample_ids
+from hapstore.ids import align_by_ids
 
-from ...local_ancestry import LocalAncestrySource
 from ..architectures.base import ArchitectureInput, create_plugin
 from ..causal.hybrid_sampler import sample_membership_for_replicate
 from ..causal.selection import build_bucketed_pool
 from ..config import GlobalPCConfig, RunConfig
 from ..covariates.model import build_covariate_effects
-from ..data.cohort_support import load_population_labels
 from ..data.genotypes import (
     GenotypeAdapter,
     build_genotype_adapter,
-    check_id_alignment,
 )
 from ..effects.betas import (
     build_variant_scale_by_maf,
     resolve_effect_geometry,
     sample_population_specific_betas,
 )
-from ..local_ancestry.tracts import load_tracts_tsv_gz, rasterize_tracts_to_variant_ancestry
+from .background import (
+    _build_background_component,
+    _exclude_causal_grm_variants,
+    _read_background_variant_ids,
+    _sample_background_from_grm_factor,
+    _standardize_grm_genotypes,
+)
+from .binary import (
+    _admix_alpha_weights_from_local_ancestry,
+    _binary_phenotype_from_liability,
+    _calibrate_logistic_intercept,
+)
+from .components import (
+    _component_variance_diagnostics,
+    _resolve_cohort_component_targets,
+    _scale_component_to_variance,
+    _scale_effects_detail_betas,
+    _scale_factor_to_variance,
+)
+from .cohort_inputs import CohortInputCaches, prepare_cohort_inputs
 
 logger = logging.getLogger(__name__)
-
-_COMPONENT_NAMES = ("genetic_fixed", "genetic_bg", "covariate", "residual")
-_COVARIANCE_WARNING_RELATIVE_THRESHOLD = 0.05
 
 
 def _stable_string_seed(value: str) -> int:
@@ -46,407 +58,6 @@ def _sample_id_prefix(sample_id: str) -> str:
     token = str(sample_id).strip()
     prefix, sep, _ = token.rpartition("_syn")
     return prefix if sep else token
-
-
-def _scale_component_to_variance(component: np.ndarray, target_variance: float) -> np.ndarray:
-    """Scale a component vector to desired variance; returns zeros when impossible."""
-    if target_variance <= 0:
-        return np.zeros_like(component)
-    observed = float(np.var(component))
-    if observed <= 0:
-        return np.zeros_like(component)
-    return component * np.sqrt(target_variance / observed)
-
-
-def _scale_factor_to_variance(component: np.ndarray, target_variance: float) -> float:
-    """Return multiplicative scale factor applied by _scale_component_to_variance."""
-    if target_variance <= 0:
-        return 0.0
-    observed = float(np.var(component))
-    if observed <= 0:
-        return 0.0
-    return float(np.sqrt(float(target_variance) / observed))
-
-
-def _scale_effects_detail_betas(effects_detail: pd.DataFrame, scale_factor: float) -> pd.DataFrame:
-    """Apply one pooled post-h2 scale factor to persisted beta columns."""
-    scaled = effects_detail.copy()
-    for column in ("beta_base", "beta_delta", "beta"):
-        if column not in scaled.columns:
-            continue
-        scaled[column] = pd.to_numeric(scaled[column], errors="coerce") * float(scale_factor)
-    return scaled
-
-
-def _component_variance_diagnostics(
-    *,
-    genetic_fixed: np.ndarray,
-    genetic_bg: np.ndarray,
-    covariate: np.ndarray,
-    residual: np.ndarray,
-    liability: np.ndarray,
-) -> Dict[str, object]:
-    """Summarize realized component covariance without changing the simulation."""
-    components = {
-        "genetic_fixed": np.asarray(genetic_fixed, dtype=float),
-        "genetic_bg": np.asarray(genetic_bg, dtype=float),
-        "covariate": np.asarray(covariate, dtype=float),
-        "residual": np.asarray(residual, dtype=float),
-    }
-    lengths = {values.shape for values in components.values()}
-    if len(lengths) != 1 or any(values.ndim != 1 for values in components.values()):
-        raise ValueError("Phenotype components must be one-dimensional vectors with equal length")
-
-    n_samples = next(iter(components.values())).shape[0]
-    centered = np.column_stack(
-        [components[name] - float(np.mean(components[name])) for name in _COMPONENT_NAMES]
-    )
-    covariance_matrix = (
-        (centered.T @ centered) / float(n_samples)
-        if n_samples
-        else np.zeros((len(_COMPONENT_NAMES), len(_COMPONENT_NAMES)), dtype=float)
-    )
-    liability_variance = float(np.var(np.asarray(liability, dtype=float)))
-    component_variance_sum = float(np.trace(covariance_matrix))
-    covariance_contribution = float(liability_variance - component_variance_sum)
-    relative_contribution = (
-        abs(covariance_contribution) / component_variance_sum
-        if component_variance_sum > 0.0
-        else 0.0
-    )
-
-    pairwise_covariances = {
-        f"{left}|{right}": float(covariance_matrix[left_idx, right_idx])
-        for left_idx, left in enumerate(_COMPONENT_NAMES)
-        for right_idx, right in enumerate(_COMPONENT_NAMES)
-        if right_idx > left_idx
-    }
-    realized_fractions = {
-        name: (
-            float(covariance_matrix[idx, idx]) / liability_variance
-            if liability_variance > 0.0
-            else float("nan")
-        )
-        for idx, name in enumerate(_COMPONENT_NAMES)
-    }
-    realized_fractions["genetic_total"] = (
-        float(np.var(components["genetic_fixed"] + components["genetic_bg"]))
-        / liability_variance
-        if liability_variance > 0.0
-        else float("nan")
-    )
-
-    return {
-        "pairwise_covariances": pairwise_covariances,
-        "component_variance_sum": component_variance_sum,
-        "covariance_contribution": covariance_contribution,
-        "covariance_relative_contribution": float(relative_contribution),
-        "covariance_warning_threshold": _COVARIANCE_WARNING_RELATIVE_THRESHOLD,
-        "covariance_warning": bool(
-            relative_contribution > _COVARIANCE_WARNING_RELATIVE_THRESHOLD
-        ),
-        "realized_fractions": realized_fractions,
-    }
-
-
-def _sigmoid(values: np.ndarray) -> np.ndarray:
-    """Numerically stable-enough sigmoid for phenotype probabilities."""
-    clipped = np.clip(np.asarray(values, dtype=float), -60.0, 60.0)
-    return 1.0 / (1.0 + np.exp(-clipped))
-
-
-def _logit(probability: float) -> float:
-    p = float(probability)
-    if not 0.0 < p < 1.0:
-        raise ValueError("probability must be in (0, 1)")
-    return float(np.log(p) - np.log1p(-p))
-
-
-def _standardize_liability(liability: np.ndarray) -> np.ndarray:
-    values = np.asarray(liability, dtype=float)
-    sd = float(np.std(values))
-    if not np.isfinite(sd) or sd <= 0.0:
-        return np.zeros_like(values, dtype=float)
-    return (values - float(np.mean(values))) / sd
-
-
-def _calibrate_logistic_intercept(
-    standardized_liability: np.ndarray,
-    prevalence: float,
-    liability_logit_scale: float,
-) -> float:
-    """Solve alpha so mean(sigmoid(alpha + gamma * z_liability)) matches prevalence."""
-    z = np.asarray(standardized_liability, dtype=float)
-    if z.size == 0:
-        raise ValueError("standardized_liability cannot be empty")
-    target = float(prevalence)
-    gamma = float(liability_logit_scale)
-    if not 0.0 < target < 1.0:
-        raise ValueError("prevalence must be in (0, 1)")
-    if not np.isfinite(gamma) or gamma < 0.0:
-        raise ValueError("liability_logit_scale must be finite and >= 0")
-    if gamma == 0.0:
-        return _logit(target)
-
-    center = _logit(target)
-    max_abs_z = float(np.max(np.abs(z))) if z.size else 0.0
-    lo = min(center - (abs(gamma) * max_abs_z) - 10.0, -80.0)
-    hi = max(center + (abs(gamma) * max_abs_z) + 10.0, 80.0)
-    for _ in range(200):
-        mid = (lo + hi) / 2.0
-        mean_probability = float(np.mean(_sigmoid(mid + gamma * z)))
-        if mean_probability < target:
-            lo = mid
-        else:
-            hi = mid
-    return float((lo + hi) / 2.0)
-
-
-def _binary_phenotype_from_liability(
-    *,
-    liability: np.ndarray,
-    sample_populations: List[str],
-    prevalence: float,
-    liability_logit_scale: float,
-    prevalence_by_population: Dict[str, float],
-    alpha_by_population: Dict[str, float] | None = None,
-    admix_alpha_weights_by_row: Dict[int, Dict[str, float]] | None = None,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    """Draw binary labels from calibrated logistic probabilities over standardized liability."""
-    values = np.asarray(liability, dtype=float)
-    z = _standardize_liability(values)
-    populations = np.asarray(sample_populations, dtype=object)
-    if populations.shape[0] != values.shape[0]:
-        raise ValueError("sample_populations length must match liability length")
-
-    labels = np.zeros(values.shape[0], dtype=np.int8)
-    probabilities = np.zeros(values.shape[0], dtype=float)
-    alpha_values = np.full(values.shape[0], np.nan, dtype=float)
-    provided_alpha_by_population = dict(alpha_by_population or {})
-    resolved_alpha_by_population: Dict[str, float] = {}
-    prevalence_target_by_population: Dict[str, float] = {}
-    source_alpha_by_population: Dict[str, float] = {}
-    admix_mode = "none"
-    alpha_mode = "shared_cohort"
-
-    pop_labels = populations.astype(str)
-    observed_groups = {
-        str(pop): np.where(pop_labels == str(pop))[0]
-        for pop in sorted({str(pop) for pop in sample_populations})
-    }
-    admix_rows = np.where(np.char.upper(pop_labels) == "ADMIX")[0]
-
-    if prevalence_by_population and provided_alpha_by_population:
-        raise ValueError(
-            "prevalence_by_population and alpha_by_population are alternative source-alpha inputs"
-        )
-    if provided_alpha_by_population:
-        for pop, alpha in provided_alpha_by_population.items():
-            if str(pop).upper() == "ADMIX":
-                continue
-            source_alpha_by_population[str(pop)] = float(alpha)
-            resolved_alpha_by_population[str(pop)] = float(alpha)
-
-    if not prevalence_by_population and not provided_alpha_by_population:
-        row_idx = np.arange(values.shape[0], dtype=np.int64)
-        alpha = _calibrate_logistic_intercept(
-            standardized_liability=z[row_idx],
-            prevalence=float(prevalence),
-            liability_logit_scale=liability_logit_scale,
-        )
-        alpha_values[row_idx] = float(alpha)
-        resolved_alpha_by_population["__cohort__"] = float(alpha)
-        prevalence_target_by_population["__cohort__"] = float(prevalence)
-        if admix_rows.size:
-            admix_mode = "shared_cohort_alpha"
-    else:
-        alpha_mode = "population_specific"
-        for group, row_idx in observed_groups.items():
-            if row_idx.size == 0 or str(group).upper() == "ADMIX":
-                continue
-            if provided_alpha_by_population:
-                if group not in provided_alpha_by_population:
-                    raise ValueError(
-                        f"Missing phenotype.binary.alpha_by_population value for observed population={group}"
-                    )
-                alpha = float(provided_alpha_by_population[group])
-            else:
-                target = float(prevalence_by_population.get(group, prevalence))
-                alpha = _calibrate_logistic_intercept(
-                    standardized_liability=z[row_idx],
-                    prevalence=target,
-                    liability_logit_scale=liability_logit_scale,
-                )
-                prevalence_target_by_population[group] = float(target)
-            alpha_values[row_idx] = float(alpha)
-            resolved_alpha_by_population[group] = float(alpha)
-            source_alpha_by_population[group] = float(alpha)
-
-        if admix_rows.size:
-            explicit_admix_alpha = provided_alpha_by_population.get("ADMIX")
-            if explicit_admix_alpha is not None:
-                alpha_values[admix_rows] = float(explicit_admix_alpha)
-                resolved_alpha_by_population["ADMIX"] = float(explicit_admix_alpha)
-                admix_mode = "explicit_admix_alpha"
-            elif admix_alpha_weights_by_row:
-                missing_rows: list[int] = []
-                for row in admix_rows.astype(int).tolist():
-                    weights = {
-                        str(pop): float(weight)
-                        for pop, weight in admix_alpha_weights_by_row.get(row, {}).items()
-                        if float(weight) > 0.0
-                    }
-                    if not weights:
-                        missing_rows.append(row)
-                        continue
-                    missing_alpha = [pop for pop in weights if pop not in source_alpha_by_population]
-                    if missing_alpha:
-                        raise ValueError(
-                            "ADMIX alpha weights reference source populations without solved/provided alphas: "
-                            f"{missing_alpha}"
-                        )
-                    total_weight = float(sum(weights.values()))
-                    if not np.isfinite(total_weight) or total_weight <= 0.0:
-                        missing_rows.append(row)
-                        continue
-                    alpha_values[row] = float(
-                        sum(
-                            (weight / total_weight) * source_alpha_by_population[pop]
-                            for pop, weight in weights.items()
-                        )
-                    )
-                if missing_rows:
-                    raise ValueError(
-                        "ADMIX samples with population-specific binary alpha require "
-                        f"architecture weights for every ADMIX row; missing_rows={missing_rows[:5]}"
-                    )
-                admix_mode = "causal_architecture_weighted_source_alpha"
-            else:
-                raise ValueError(
-                    "ADMIX samples with population-specific binary alpha require local-ancestry "
-                    "architecture weights or an explicit phenotype.binary.alpha_by_population.ADMIX"
-                )
-
-    if np.any(~np.isfinite(alpha_values)):
-        missing = np.where(~np.isfinite(alpha_values))[0].astype(int).tolist()
-        raise ValueError(f"Binary alpha could not be resolved for sample rows: {missing[:5]}")
-
-    probabilities[:] = _sigmoid(alpha_values + float(liability_logit_scale) * z)
-    labels[:] = rng.binomial(n=1, p=probabilities, size=probabilities.shape[0]).astype(np.int8)
-    n_cases = int(labels.sum())
-    n_total = int(labels.shape[0])
-    if admix_rows.size:
-        admix_labels = labels[admix_rows]
-        admix_probabilities = probabilities[admix_rows]
-        admix_alphas = alpha_values[admix_rows]
-        admix_realized = float(np.mean(admix_labels)) if admix_labels.size else float("nan")
-        admix_mean_probability = (
-            float(np.mean(admix_probabilities)) if admix_probabilities.size else float("nan")
-        )
-        admix_alpha_mean = float(np.mean(admix_alphas)) if admix_alphas.size else float("nan")
-        admix_alpha_min = float(np.min(admix_alphas)) if admix_alphas.size else float("nan")
-        admix_alpha_max = float(np.max(admix_alphas)) if admix_alphas.size else float("nan")
-    else:
-        admix_realized = float("nan")
-        admix_mean_probability = float("nan")
-        admix_alpha_mean = float("nan")
-        admix_alpha_min = float("nan")
-        admix_alpha_max = float("nan")
-    summary: Dict[str, Any] = {
-        "binary_prevalence_target": float(prevalence),
-        "binary_liability_logit_scale": float(liability_logit_scale),
-        "binary_alpha": float(resolved_alpha_by_population.get("__cohort__", float("nan"))),
-        "binary_alpha_by_population": json.dumps(resolved_alpha_by_population, sort_keys=True),
-        "binary_prevalence_target_by_population": json.dumps(
-            prevalence_target_by_population,
-            sort_keys=True,
-        ),
-        "binary_case_count": n_cases,
-        "binary_control_count": n_total - n_cases,
-        "binary_realized_prevalence": float(n_cases / n_total) if n_total else float("nan"),
-        "binary_mean_predicted_probability": float(np.mean(probabilities)) if n_total else float("nan"),
-        "binary_alpha_mode": alpha_mode,
-        "binary_admix_alpha_mode": admix_mode,
-        "binary_admix_sample_count": int(admix_rows.size),
-        "binary_admix_realized_prevalence": admix_realized,
-        "binary_admix_mean_predicted_probability": admix_mean_probability,
-        "binary_admix_alpha_mean": admix_alpha_mean,
-        "binary_admix_alpha_min": admix_alpha_min,
-        "binary_admix_alpha_max": admix_alpha_max,
-    }
-    return labels, probabilities, alpha_values, summary
-
-
-def _admix_alpha_weights_from_local_ancestry(
-    *,
-    admix_row_indices: List[int],
-    admix_local_ancestry_codes: np.ndarray | None,
-    ancestry_order: List[str],
-    effects_detail: pd.DataFrame,
-    variant_ids: List[str],
-    liability: np.ndarray,
-    liability_logit_scale: float,
-) -> Dict[int, Dict[str, float]]:
-    """Compute non-genotype ADMIX alpha weights from local ancestry at causal loci."""
-    if not admix_row_indices or admix_local_ancestry_codes is None:
-        return {}
-    codes = np.asarray(admix_local_ancestry_codes, dtype=np.int64)
-    if codes.ndim != 3 or codes.shape[2] != 2:
-        raise ValueError("admix_local_ancestry_codes must have shape (n_admix, n_variants, 2)")
-    if codes.shape[0] != len(admix_row_indices):
-        raise ValueError("admix_row_indices length must match admix_local_ancestry_codes sample axis")
-    if codes.shape[1] != len(variant_ids):
-        raise ValueError("admix_local_ancestry_codes variant axis must match selected causal variants")
-
-    beta_pivot = effects_detail.pivot(index="variant_id", columns="population", values="beta")
-    missing_variants = [variant_id for variant_id in variant_ids if variant_id not in beta_pivot.index]
-    if missing_variants:
-        raise ValueError(f"Missing effects_detail rows for causal variants: {missing_variants[:5]}")
-    missing_pops = [pop for pop in ancestry_order if pop not in beta_pivot.columns]
-    if missing_pops:
-        raise ValueError(f"Missing effects_detail beta columns for ancestry populations: {missing_pops}")
-
-    liability_sd = float(np.std(np.asarray(liability, dtype=float)))
-    scale = (
-        float(liability_logit_scale) / liability_sd
-        if np.isfinite(liability_sd) and liability_sd > 0.0
-        else 1.0
-    )
-    beta_log_odds = beta_pivot.loc[variant_ids, ancestry_order].to_numpy(dtype=float) * scale
-    beta_weight = np.square(beta_log_odds)
-    n_anc = len(ancestry_order)
-    if np.min(codes) < 0:
-        raise ValueError("admix_local_ancestry_codes contains negative ancestry codes")
-    if np.max(codes) >= n_anc:
-        raise ValueError(
-            f"admix_local_ancestry_codes contains ancestry code >= n_anc "
-            f"(max={int(np.max(codes))}, n_anc={n_anc})"
-        )
-
-    weights_by_row: Dict[int, Dict[str, float]] = {}
-    for local_idx, global_row in enumerate(admix_row_indices):
-        totals = np.zeros(n_anc, dtype=float)
-        count_totals = np.zeros(n_anc, dtype=float)
-        for hap_idx in (0, 1):
-            hap_codes = codes[local_idx, :, hap_idx]
-            for anc_idx in range(n_anc):
-                mask = hap_codes == anc_idx
-                count_totals[anc_idx] += float(np.sum(mask))
-                if np.any(mask):
-                    totals[anc_idx] += float(np.sum(beta_weight[mask, anc_idx]))
-        if float(np.sum(totals)) <= 0.0:
-            totals = count_totals
-        total = float(np.sum(totals))
-        if total <= 0.0:
-            totals = np.ones(n_anc, dtype=float)
-            total = float(n_anc)
-        weights_by_row[int(global_row)] = {
-            str(pop): float(totals[idx] / total)
-            for idx, pop in enumerate(ancestry_order)
-            if totals[idx] > 0.0
-        }
-    return weights_by_row
 
 
 def _required_source_populations(
@@ -463,181 +74,9 @@ def _required_source_populations(
     return sorted({str(pop) for pop in sample_populations if str(pop).upper() != "ADMIX"})
 
 
-def _resolve_cohort_component_targets(
-    run_cfg: RunConfig,
-    architecture_params: Dict[str, float],
-) -> Dict[str, Any]:
-    """Resolve one cohort-level variance budget for an architecture."""
-    target_h2_fixed = float(run_cfg.variance_budget.h2_fixed)
-    if "h2" in architecture_params:
-        target_h2_fixed = float(architecture_params["h2"])
-    target_h2_bg = float(run_cfg.variance_budget.h2_bg)
-    target_covariate = float(
-        run_cfg.covariates.target_variance
-        if run_cfg.covariates.target_variance is not None
-        else run_cfg.variance_budget.covariate
-    )
-    max_h2_fixed = 1.0 - target_h2_bg - target_covariate
-    if not np.isfinite(target_h2_fixed) or target_h2_fixed < 0.0:
-        raise ValueError(
-            f"Cohort-level h2_fixed must be finite and non-negative; got {target_h2_fixed}"
-        )
-    if target_h2_fixed > max_h2_fixed + 1e-12:
-        raise ValueError(
-            "Cohort-level variance targets exceed 1.0: "
-            f"h2_fixed={target_h2_fixed}, h2_bg={target_h2_bg}, "
-            f"covariate={target_covariate}"
-        )
-    target_residual = max(0.0, 1.0 - target_h2_fixed - target_h2_bg - target_covariate)
-    return {
-        "target_h2_fixed": target_h2_fixed,
-        "genetic_fixed": target_h2_fixed,
-        "genetic_bg": target_h2_bg,
-        "genetic_total": target_h2_fixed + target_h2_bg,
-        "covariate": target_covariate,
-        "residual": target_residual,
-    }
-
-
-def _load_precomputed_kinship(
-    kinship_file: str,
-    sample_ids: List[str],
-) -> np.ndarray:
-    """Load an IID-indexed dense kinship matrix and align to sample order."""
-    kin = pd.read_csv(kinship_file, sep="\t")
-    id_col = "IID" if "IID" in kin.columns else "#IID" if "#IID" in kin.columns else None
-    if id_col is None:
-        raise ValueError("precomputed kinship must include IID or #IID column")
-    kin = kin.set_index(id_col)
-
-    missing_rows = [iid for iid in sample_ids if iid not in kin.index]
-    if missing_rows:
-        raise ValueError(
-            f"Kinship matrix missing sample rows; first few: {missing_rows[:5]} (n={len(missing_rows)})"
-        )
-    missing_cols = [iid for iid in sample_ids if iid not in kin.columns]
-    if missing_cols:
-        raise ValueError(
-            f"Kinship matrix missing sample columns; first few: {missing_cols[:5]} (n={len(missing_cols)})"
-        )
-    aligned = kin.loc[sample_ids, sample_ids]
-    arr = aligned.to_numpy(dtype=float)
-    arr = 0.5 * (arr + arr.T)
-    return arr
-
-
-def _read_background_variant_ids(path: str) -> List[str]:
-    """Read one variant ID from the first whitespace-delimited field per line."""
-    variant_ids: List[str] = []
-    with open(path, "r", encoding="utf-8") as handle:
-        for line in handle:
-            token = line.strip()
-            if token and not token.startswith("#"):
-                variant_ids.append(token.split()[0])
-    if variant_ids and variant_ids[0].lower() in {"variant_id", "id"}:
-        variant_ids = variant_ids[1:]
-    if not variant_ids:
-        raise ValueError(f"No background GRM variants found in {path}")
-    if len(set(variant_ids)) != len(variant_ids):
-        raise ValueError(f"Duplicate background GRM variant IDs found in {path}")
-    return variant_ids
-
-
-def _exclude_causal_grm_variants(
-    configured_variant_ids: List[str],
-    causal_variant_ids: List[str],
-) -> tuple[List[str], int]:
-    causal = set(causal_variant_ids)
-    retained = [variant_id for variant_id in configured_variant_ids if variant_id not in causal]
-    excluded_count = len(configured_variant_ids) - len(retained)
-    if not retained:
-        raise ValueError(
-            "No background GRM variants remain after excluding selected causal variants"
-        )
-    return retained, excluded_count
-
-
-def _standardize_grm_genotypes(x: np.ndarray) -> np.ndarray:
-    """Return standardized polymorphic genotypes as the implicit GRM factor."""
-    x = np.array(x, dtype=np.float32, copy=True)
-    if x.ndim != 2 or x.shape[1] == 0:
-        raise ValueError("Cannot compute GRM with zero dosage variants")
-    x -= x.mean(axis=0, keepdims=True, dtype=np.float64).astype(np.float32)
-    std = x.std(axis=0, keepdims=True, dtype=np.float64).astype(np.float32)
-    keep = (std > 1e-12).reshape(-1)
-    if not np.any(keep):
-        raise ValueError("Cannot compute GRM: all dosage variants are monomorphic")
-    x = x[:, keep]
-    x /= std[:, keep]
-    return x.astype(np.float32, copy=False)
-
-
-def _sample_background_from_grm_factor(
-    grm_factor: np.ndarray,
-    seed: int,
-) -> np.ndarray:
-    """Sample N(0, ZZ'/M) without materializing the dense GRM."""
-    z = np.asarray(grm_factor, dtype=np.float32)
-    if z.ndim != 2 or z.shape[1] == 0:
-        raise ValueError("compute_grm mode requires standardized background genotypes")
-    rng = np.random.default_rng(int(seed))
-    marker_effects = rng.normal(
-        0.0,
-        1.0 / np.sqrt(float(z.shape[1])),
-        size=z.shape[1],
-    ).astype(np.float32)
-    return np.asarray(z @ marker_effects, dtype=float)
-
-
 def _sample_frame(sample_ids: List[str]) -> pd.DataFrame:
     """Minimal IID/FID frame for downstream interfaces that require it."""
     return pd.DataFrame({"FID": sample_ids, "IID": sample_ids}, copy=False)
-
-
-def _sample_mvnormal_from_cov(
-    cov: np.ndarray,
-    seed: int,
-) -> np.ndarray:
-    """Sample one vector from N(0, cov) with eigenvalue clipping for PSD safety."""
-    cov = 0.5 * (cov + cov.T)
-    evals, evecs = np.linalg.eigh(cov)
-    evals = np.clip(evals, a_min=0.0, a_max=None)
-    rng = np.random.default_rng(int(seed))
-    z = rng.normal(0.0, 1.0, size=cov.shape[0])
-    return evecs @ (np.sqrt(evals) * z)
-
-
-def _build_background_component(
-    run_cfg: RunConfig,
-    sample_ids: List[str],
-    grm_factor: np.ndarray | None,
-    cache_key: str,
-    replicate_seed: int,
-    kinship_cache: Dict[str, np.ndarray],
-) -> np.ndarray:
-    """Build infinitesimal background genetic effect component."""
-    mode = run_cfg.background_genetic.mode
-    if mode == "none":
-        return np.zeros(len(sample_ids), dtype=float)
-
-    if mode == "precomputed_kinship":
-        if cache_key not in kinship_cache:
-            kinship_cache[cache_key] = _load_precomputed_kinship(
-                kinship_file=str(run_cfg.background_genetic.kinship_file),
-                sample_ids=sample_ids,
-            )
-        cov = kinship_cache[cache_key]
-    elif mode == "compute_grm":
-        if grm_factor is None:
-            raise ValueError("compute_grm mode requires an independent GRM variant set")
-        return _sample_background_from_grm_factor(
-            grm_factor=grm_factor,
-            seed=replicate_seed,
-        )
-    else:
-        raise ValueError(f"Unsupported background_genetic.mode={mode}")
-
-    return _sample_mvnormal_from_cov(cov=cov, seed=replicate_seed)
 
 
 def _parse_chr_pos_variant_id(variant_id: str) -> tuple[int, int]:
@@ -737,52 +176,11 @@ def run_simulation(
         effect_scale_maf_col = run_cfg.causal_selection.maf_columns_by_population[anchor_population]
     if runtime_cache is None:
         kinship_cache: Dict[str, np.ndarray] = {}
-        tracts_cache: Dict[tuple[str, int, str], dict] = {}
-        ancestry_source_cache: Dict[tuple[str, int, str], LocalAncestrySource] = {}
-        sample_ids_cache: Dict[str, List[str]] = {}
-        sample_pops_cache: Dict[str, List[str]] = {}
-        genotype_cache: dict[str, dict[str, Any]] = {}
         effect_geometry_cache: Dict[str, Dict[str, object]] = {}
-        max_cache_bytes: int | None = 0
     else:
         kinship_cache = runtime_cache.setdefault("simulate_kinship_cache", {})
-        tracts_cache = runtime_cache.setdefault("simulate_tracts_cache", {})
-        ancestry_source_cache = runtime_cache.setdefault("simulate_ancestry_source_cache", {})
-        sample_ids_cache = runtime_cache.setdefault("simulate_sample_ids_cache", {})
-        sample_pops_cache = runtime_cache.setdefault("simulate_sample_pops_cache", {})
-        genotype_cache = runtime_cache.setdefault("simulate_genotype_cache", {})
         effect_geometry_cache = runtime_cache.setdefault("simulate_effect_geometry_cache", {})
-        max_cache_bytes = runtime_cache.get("max_cache_bytes")
-        if max_cache_bytes is not None:
-            max_cache_bytes = int(max_cache_bytes)
-
-    def _bump(name: str, hit: bool) -> None:
-        if runtime_cache is None:
-            return
-        bucket_name = "cache_hits" if hit else "cache_misses"
-        counters = runtime_cache.setdefault(bucket_name, {})
-        counters[name] = int(counters.get(name, 0)) + 1
-
-    def _cache_bytes(entry: dict[str, Any]) -> int:
-        total = 0
-        sample_frame = entry.get("sample_frame")
-        if isinstance(sample_frame, pd.DataFrame):
-            total += int(sample_frame.memory_usage(deep=True).sum())
-        genotype_matrix = entry.get("genotype_matrix")
-        if isinstance(genotype_matrix, np.ndarray):
-            total += int(genotype_matrix.nbytes)
-        admix_haplotypes = entry.get("admix_haplotypes")
-        if isinstance(admix_haplotypes, np.ndarray):
-            total += int(admix_haplotypes.nbytes)
-        admix_local_ancestry_codes = entry.get("admix_local_ancestry_codes")
-        if isinstance(admix_local_ancestry_codes, np.ndarray):
-            total += int(admix_local_ancestry_codes.nbytes)
-        la_genotypes_by_population = entry.get("la_genotypes_by_population")
-        if isinstance(la_genotypes_by_population, dict):
-            for value in la_genotypes_by_population.values():
-                if isinstance(value, np.ndarray):
-                    total += int(value.nbytes)
-        return total
+    cohort_input_caches = CohortInputCaches.from_runtime_cache(runtime_cache)
 
     for replicate in range(1, run_cfg.phenotype.n_replicates + 1):
         rep_t0 = time.perf_counter()
@@ -820,323 +218,41 @@ def run_simulation(
 
         for cohort in run_cfg.cohorts:
             cohort_t0 = time.perf_counter()
-            if cohort.name in sample_ids_cache:
-                sample_ids = sample_ids_cache[cohort.name]
-            else:
-                sample_ids = read_sample_ids(cohort.sample_ids_file)
-                sample_ids_cache[cohort.name] = sample_ids
-
-            if cohort.name in sample_pops_cache:
-                sample_populations = sample_pops_cache[cohort.name]
-            else:
-                sample_populations = load_population_labels(
-                    cohort=cohort,
-                    sample_ids=sample_ids,
-                    default_population=default_population,
-                )
-                sample_pops_cache[cohort.name] = sample_populations
-
-            if str(run_cfg.local_ancestry.mode) == "source_zarr":
-                local_ancestry_pattern = cohort.local_ancestry_source_pattern
-            else:
-                local_ancestry_pattern = cohort.local_ancestry_tracts_pattern
-            la_enabled = bool(run_cfg.local_ancestry.enabled and local_ancestry_pattern)
-
-            # Grid groups may set a per-group HapStore I/O thread budget to balance
-            # parallel groups within one scheduler or local CPU allocation.
-            if runtime_cache is not None and hasattr(adapter, "set_io_threads"):
-                adapter.set_io_threads(int(runtime_cache.get("hapstore_io_threads", 1)))
-
-            cohort_tmp = run_dir / "tmp" / "dosages" / f"rep{replicate}" / cohort.name
-            genotype_cache_key = (
-                f"{replicate}|{cohort.name}|{run_cfg.local_ancestry.mode}|{la_enabled}|"
-                f"{'|'.join(variant_ids)}"
+            prepared = prepare_cohort_inputs(
+                run_cfg=run_cfg,
+                cohort=cohort,
+                replicate=replicate,
+                adapter=adapter,
+                run_dir=run_dir,
+                default_population=default_population,
+                variant_ids=variant_ids,
+                variant_indices_by_chrom=variant_indices_by_chrom,
+                variant_pos_bp=variant_pos_bp,
+                configured_background_variant_ids=configured_background_variant_ids,
+                caches=cohort_input_caches,
+                timed=_timed,
             )
-            if genotype_cache_key in genotype_cache:
-                _bump("simulate_genotype", True)
-                cached = genotype_cache[genotype_cache_key]
-                sample_frame = cached["sample_frame"]
-                genotype_matrix = cached.get("genotype_matrix")
-                truth_admix_indices = cached.get("truth_admix_indices")
-                truth_admix_sample_ids = cached.get("truth_admix_sample_ids")
-                admix_haplotypes = cached.get("admix_haplotypes")
-                admix_local_ancestry_codes = cached.get("admix_local_ancestry_codes")
-                donor_fallback_indices = cached.get("donor_fallback_indices")
-                donor_fallback_sample_ids = cached.get("donor_fallback_sample_ids")
-                donor_fallback_sample_pops = cached.get("donor_fallback_sample_pops")
-                la_genotypes_by_population = cached.get("la_genotypes_by_population", {})
-                dosage_effect_allele = dict(cached["dosage_effect_allele"])
-                dosage_other_allele = dict(cached["dosage_other_allele"])
-            else:
-                _bump("simulate_genotype", False)
-                sample_frame = _sample_frame(sample_ids)
-                genotype_matrix = None
-                truth_admix_indices = None
-                truth_admix_sample_ids = None
-                admix_haplotypes = None
-                admix_local_ancestry_codes = None
-                donor_fallback_indices = None
-                donor_fallback_sample_ids = None
-                donor_fallback_sample_pops = None
-                la_genotypes_by_population: dict[str, np.ndarray] = {}
-
-                if la_enabled:
-                    # Local ancestry mode needs phased haplotypes for *admixed* samples only.
-                    # Avoid exporting a full dense dosage table (very expensive at 245k samples).
-                    ancestry_order = list(run_cfg.local_ancestry.ancestry_order)
-                    ancestry_to_index = {a: i for i, a in enumerate(ancestry_order)}
-
-                    fallback_rules_by_prefix = {
-                        str(rule.sample_id_prefix): {
-                            str(pop): float(weight)
-                            for pop, weight in rule.beta_weights.items()
-                        }
-                        for rule in run_cfg.local_ancestry.donor_mixture_fallbacks
-                    }
-                    truth_admix_indices = []
-                    truth_admix_sample_ids = []
-                    truth_admix_sample_pops = []
-                    donor_fallback_indices = []
-                    donor_fallback_sample_ids = []
-                    donor_fallback_sample_pops = []
-                    for idx, population in enumerate(sample_populations):
-                        if str(population).upper() != "ADMIX":
-                            continue
-                        sample_id = str(sample_ids[idx])
-                        sample_population = str(sample_populations[idx])
-                        if _sample_id_prefix(sample_id) in fallback_rules_by_prefix:
-                            donor_fallback_indices.append(int(idx))
-                            donor_fallback_sample_ids.append(sample_id)
-                            donor_fallback_sample_pops.append(sample_population)
-                        else:
-                            truth_admix_indices.append(int(idx))
-                            truth_admix_sample_ids.append(sample_id)
-                            truth_admix_sample_pops.append(sample_population)
-
-                    if truth_admix_sample_ids:
-                        t_hap = time.perf_counter()
-                        admix_haplotypes = adapter.export_haplotypes(
-                            sample_ids=truth_admix_sample_ids,
-                            sample_populations=truth_admix_sample_pops,
-                            variant_ids=variant_ids,
-                            out_dir=cohort_tmp,
-                            chromosomes=run_cfg.chromosomes,
-                        )
-                        _timed(
-                            "simulate.export_haplotypes_admix",
-                            t_hap,
-                            replicate=int(replicate),
-                            cohort=str(cohort.name),
-                            n_samples=int(len(truth_admix_sample_ids)),
-                            n_variants=int(len(variant_ids)),
-                        )
-                        if admix_haplotypes.shape != (len(truth_admix_sample_ids), len(variant_ids), 2):
-                            raise ValueError(
-                                f"Unexpected ADMIX haplotype array shape: {admix_haplotypes.shape} "
-                                f"(expected {(len(truth_admix_sample_ids), len(variant_ids), 2)})"
-                            )
-                        admix_local_ancestry_codes = np.full(
-                            (len(truth_admix_sample_ids), len(variant_ids), 2),
-                            -1,
-                            dtype=np.int8,
-                        )
-
-                        pattern = str(local_ancestry_pattern)
-                        for chrom in run_cfg.chromosomes:
-                            idx_for_chrom = variant_indices_by_chrom[int(chrom)]
-                            if int(idx_for_chrom.shape[0]) == 0:
-                                continue
-                            positions_bp = variant_pos_bp[idx_for_chrom]
-
-                            ancestry_path = (
-                                pattern.format(chrom=int(chrom)) if "{chrom}" in pattern else pattern
-                            )
-                            if str(run_cfg.local_ancestry.mode) == "source_zarr":
-                                cache_key = (cohort.name, int(chrom), ancestry_path)
-                                if cache_key in ancestry_source_cache:
-                                    ancestry_source = ancestry_source_cache[cache_key]
-                                else:
-                                    t_load = time.perf_counter()
-                                    ancestry_source = LocalAncestrySource.open(ancestry_path)
-                                    ancestry_source_cache[cache_key] = ancestry_source
-                                    _timed(
-                                        "simulate.load_ancestry_source",
-                                        t_load,
-                                        replicate=int(replicate),
-                                        cohort=str(cohort.name),
-                                        chrom=int(chrom),
-                                        n_admix_samples=int(len(truth_admix_sample_ids)),
-                                    )
-
-                                t_rast = time.perf_counter()
-                                codes_subset = ancestry_source.rasterize(
-                                    sample_ids=truth_admix_sample_ids,
-                                    positions_bp=positions_bp,
-                                    ancestry_to_index=ancestry_to_index,
-                                    chunk_n_samples=int(run_cfg.local_ancestry.chunk_n_samples),
-                                )
-                                _timed(
-                                    "simulate.rasterize_ancestry_source",
-                                    t_rast,
-                                    replicate=int(replicate),
-                                    cohort=str(cohort.name),
-                                    chrom=int(chrom),
-                                    n_admix_samples=int(len(truth_admix_sample_ids)),
-                                    n_variants=int(len(positions_bp)),
-                                )
-                            else:
-                                cache_key = (cohort.name, int(chrom), ancestry_path)
-                                if cache_key in tracts_cache:
-                                    tracts_by_sample_hap = tracts_cache[cache_key]
-                                else:
-                                    t_load = time.perf_counter()
-                                    tracts_by_sample_hap = load_tracts_tsv_gz(
-                                        ancestry_path,
-                                        sample_ids=truth_admix_sample_ids,
-                                        label_map=dict(run_cfg.local_ancestry.label_map),
-                                    )
-                                    tracts_cache[cache_key] = tracts_by_sample_hap
-                                    _timed(
-                                        "simulate.load_tracts",
-                                        t_load,
-                                        replicate=int(replicate),
-                                        cohort=str(cohort.name),
-                                        chrom=int(chrom),
-                                        n_admix_samples=int(len(truth_admix_sample_ids)),
-                                    )
-
-                                t_rast = time.perf_counter()
-                                codes_subset = rasterize_tracts_to_variant_ancestry(
-                                    sample_ids=truth_admix_sample_ids,
-                                    tracts_by_sample_hap=tracts_by_sample_hap,
-                                    variant_positions_bp=positions_bp,
-                                    ancestry_to_index=ancestry_to_index,
-                                    chunk_n_samples=int(run_cfg.local_ancestry.chunk_n_samples),
-                                    use_numba=bool(run_cfg.local_ancestry.use_numba),
-                                )
-                                _timed(
-                                    "simulate.rasterize_tracts",
-                                    t_rast,
-                                    replicate=int(replicate),
-                                    cohort=str(cohort.name),
-                                    chrom=int(chrom),
-                                    n_admix_samples=int(len(truth_admix_sample_ids)),
-                                    n_variants=int(len(positions_bp)),
-                                )
-                            admix_local_ancestry_codes[:, idx_for_chrom, :] = codes_subset.astype(
-                                np.int8, copy=False
-                            )
-
-                        if np.any(admix_local_ancestry_codes < 0):
-                            bad = np.where(admix_local_ancestry_codes < 0)
-                            first = (int(bad[0][0]), int(bad[1][0]), int(bad[2][0]))
-                            raise ValueError(
-                                "ADMIX local ancestry codes are incomplete after tracts rasterization. "
-                                f"First missing admix_sample_idx={first[0]} variant_idx={first[1]} hap_idx={first[2]}"
-                            )
-                else:
-                    t_export = time.perf_counter()
-                    if hasattr(adapter, "export_genotypes_u8"):
-                        genotype_matrix = adapter.export_genotypes_u8(
-                            sample_ids=sample_ids,
-                            sample_populations=sample_populations,
-                            variant_ids=variant_ids,
-                            out_dir=cohort_tmp,
-                            chromosomes=run_cfg.chromosomes,
-                        )
-                        sample_frame = _sample_frame(sample_ids)
-                        export_stage = "simulate.export_genotypes_u8"
-                    else:
-                        dosage_df = adapter.export_dosages(
-                            sample_ids=sample_ids,
-                            sample_populations=sample_populations,
-                            variant_ids=variant_ids,
-                            out_dir=cohort_tmp,
-                            chromosomes=run_cfg.chromosomes,
-                        )
-                        sample_frame = dosage_df[["FID", "IID"]].copy()
-                        genotype_matrix = dosage_df[variant_ids].to_numpy(
-                            dtype=np.float32, copy=False
-                        )
-                        export_stage = "simulate.export_dosages"
-                    _timed(
-                        export_stage,
-                        t_export,
-                        replicate=int(replicate),
-                        cohort=str(cohort.name),
-                        n_samples=int(len(sample_ids)),
-                        n_variants=int(len(variant_ids)),
-                    )
-                dosage_effect_allele = dict(adapter.last_export_allele_by_variant)
-                dosage_other_allele = dict(adapter.last_export_other_allele_by_variant)
-                cache_entry = {
-                    "sample_frame": sample_frame,
-                    "genotype_matrix": genotype_matrix,
-                    "truth_admix_indices": list(truth_admix_indices) if truth_admix_indices is not None else None,
-                    "truth_admix_sample_ids": list(truth_admix_sample_ids) if truth_admix_sample_ids is not None else None,
-                    "admix_haplotypes": admix_haplotypes,
-                    "admix_local_ancestry_codes": admix_local_ancestry_codes,
-                    "donor_fallback_indices": list(donor_fallback_indices) if donor_fallback_indices is not None else None,
-                    "donor_fallback_sample_ids": list(donor_fallback_sample_ids) if donor_fallback_sample_ids is not None else None,
-                    "donor_fallback_sample_pops": list(donor_fallback_sample_pops) if donor_fallback_sample_pops is not None else None,
-                    "la_genotypes_by_population": la_genotypes_by_population,
-                    "dosage_effect_allele": dict(dosage_effect_allele),
-                    "dosage_other_allele": dict(dosage_other_allele),
-                }
-                entry_bytes = _cache_bytes(cache_entry)
-                if max_cache_bytes is None:
-                    genotype_cache[genotype_cache_key] = cache_entry
-                else:
-                    used_bytes = int(runtime_cache.get("simulate_genotype_cache_bytes", 0)) if runtime_cache is not None else 0
-                    if used_bytes + entry_bytes <= max_cache_bytes:
-                        genotype_cache[genotype_cache_key] = cache_entry
-                        if runtime_cache is not None:
-                            runtime_cache["simulate_genotype_cache_bytes"] = used_bytes + entry_bytes
-
-            check_id_alignment(sample_ids, sample_frame)
-
-            background_grm_factor: np.ndarray | None = None
-            background_grm_variant_count = 0
-            background_grm_excluded_causal_count = 0
-            if run_cfg.background_genetic.mode == "compute_grm":
-                grm_variant_ids, background_grm_excluded_causal_count = (
-                    _exclude_causal_grm_variants(
-                        configured_variant_ids=configured_background_variant_ids,
-                        causal_variant_ids=variant_ids,
-                    )
-                )
-                t_grm_export = time.perf_counter()
-                if hasattr(adapter, "export_genotypes_u8"):
-                    background_genotypes = adapter.export_genotypes_u8(
-                        sample_ids=sample_ids,
-                        sample_populations=sample_populations,
-                        variant_ids=grm_variant_ids,
-                        out_dir=cohort_tmp / "background_grm",
-                    )
-                else:
-                    background_dosages = adapter.export_dosages(
-                        sample_ids=sample_ids,
-                        sample_populations=sample_populations,
-                        variant_ids=grm_variant_ids,
-                        out_dir=cohort_tmp / "background_grm",
-                    )
-                    check_id_alignment(sample_ids, background_dosages)
-                    background_genotypes = background_dosages[grm_variant_ids].to_numpy(
-                        dtype=np.float32,
-                        copy=False,
-                    )
-                background_grm_factor = _standardize_grm_genotypes(background_genotypes)
-                background_grm_variant_count = int(background_grm_factor.shape[1])
-                _timed(
-                    "simulate.prepare_background_grm",
-                    t_grm_export,
-                    replicate=int(replicate),
-                    cohort=str(cohort.name),
-                    n_samples=int(len(sample_ids)),
-                    n_configured_variants=int(len(configured_background_variant_ids)),
-                    n_excluded_causal=int(background_grm_excluded_causal_count),
-                    n_polymorphic_variants=int(background_grm_variant_count),
-                )
+            sample_ids = prepared.sample_ids
+            sample_populations = prepared.sample_populations
+            sample_frame = prepared.sample_frame
+            genotype_matrix = prepared.genotype_matrix
+            truth_admix_indices = prepared.truth_admix_indices
+            truth_admix_sample_ids = prepared.truth_admix_sample_ids
+            admix_haplotypes = prepared.admix_haplotypes
+            admix_local_ancestry_codes = prepared.admix_local_ancestry_codes
+            donor_fallback_indices = prepared.donor_fallback_indices
+            donor_fallback_sample_ids = prepared.donor_fallback_sample_ids
+            donor_fallback_sample_pops = prepared.donor_fallback_sample_pops
+            la_genotypes_by_population = prepared.la_genotypes_by_population
+            dosage_effect_allele = prepared.dosage_effect_allele
+            dosage_other_allele = prepared.dosage_other_allele
+            background_grm_factor = prepared.background_grm_factor
+            background_grm_variant_count = prepared.background_grm_variant_count
+            background_grm_excluded_causal_count = (
+                prepared.background_grm_excluded_causal_count
+            )
+            la_enabled = prepared.la_enabled
+            cohort_tmp = prepared.cohort_tmp
 
             t_cov = time.perf_counter()
             cov_out = build_covariate_effects(
