@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 
 from ...config import RunConfig
-from ..io import haplotypes_to_genotypes_f32
 from ...utils import derived_seed
+from forgephast._internal.qc_kernels import haplotypes_to_genotypes_f32
 from .statistics import auc_from_scores as _auc_from_scores
 
 logger = logging.getLogger(__name__)

@@ -12,8 +12,8 @@ import pandas as pd
 
 from ...config import RunConfig
 from ...maps import interpolate_cm, load_genetic_map
-from ..io import haplotypes_to_genotypes_u8
 
+from forgephast._internal.qc_kernels import haplotypes_to_genotypes_u8
 from forgephast._internal.qc_kernels import roh_metrics as _utils_roh_metrics
 
 logger = logging.getLogger(__name__)

@@ -11,9 +11,9 @@ import numpy as np
 import pandas as pd
 
 from ...config import RunConfig
-from ..io import haplotypes_to_genotypes_u8
 from ...utils import derived_seed
 
+from forgephast._internal.qc_kernels import haplotypes_to_genotypes_u8
 from forgephast._internal.qc_kernels import king_cross_pairs as _utils_king_cross_pairs
 from forgephast._internal.qc_kernels import king_within_pairs as _utils_king_within_pairs
 from .statistics import auc_from_scores as _auc_from_scores

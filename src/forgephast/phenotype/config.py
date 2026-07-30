@@ -26,7 +26,6 @@ from .config_schema import (
     HapStoreInputConfig,
     LocalAncestryConfig,
     MafBucketConfig,
-    MetapopulationJitterConfig,
     PathConfig,
     PgenExportConfig,
     PhenotypeConfig,
@@ -180,10 +179,11 @@ class RunConfig:
         causal_selection = CausalSelectionConfig(**causal_payload)
 
         effect_payload = dict(payload.get("effect_model", {}))
-        effect_payload["metapopulation_jitter"] = [
-            MetapopulationJitterConfig(**item)
-            for item in effect_payload.get("metapopulation_jitter", [])
-        ]
+        if "metapopulation_jitter" in effect_payload:
+            raise ValueError(
+                "effect_model.metapopulation_jitter was removed because it was never "
+                "applied during effect generation"
+            )
         effect_model = EffectModelConfig(**effect_payload)
         local_ancestry_payload = dict(payload.get("local_ancestry", {}))
         local_ancestry_payload["donor_mixture_fallbacks"] = [

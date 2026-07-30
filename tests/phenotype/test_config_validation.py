@@ -218,7 +218,7 @@ def test_config_tightness_maf_columns_fallback_to_population_map() -> None:
     assert cfg.causal_selection.tightness_maf_columns() == {"EUR": "maf_eur", "AFR": "maf_afr"}
 
 
-def test_effect_model_accepts_metapopulation_jitter_placeholder() -> None:
+def test_effect_model_rejects_removed_metapopulation_jitter() -> None:
     payload = _base_payload()
     payload["effect_model"]["metapopulation_jitter"] = [
         {
@@ -233,8 +233,8 @@ def test_effect_model_accepts_metapopulation_jitter_placeholder() -> None:
             ],
         }
     ]
-    cfg = RunConfig.from_dict(payload)
-    assert cfg.effect_model.metapopulation_jitter[0].coarse_label == "AFR"
+    with pytest.raises(ValueError, match="metapopulation_jitter was removed"):
+        RunConfig.from_dict(payload)
 
 
 def test_requires_cohort() -> None:

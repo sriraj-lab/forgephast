@@ -144,6 +144,41 @@ class MsprimePopulationConfig:
 
 @dataclass
 class PopulationSpec:
+    """Configure one synthetic population or one donor-only source panel.
+
+    Attributes:
+        name: Unique population label used in manifests, output paths, and QC
+            group names.
+        n_diploids: Number of synthetic diploid individuals to generate.
+            Active output populations require a positive value. Donor-only
+            populations may use zero because they produce no synthetic output.
+        selector: Donor filter applied to ``input.population_column`` for the
+            ``mosaic`` engine. A scalar requests exact equality, a list selects
+            membership, and a mapping may contain ``values``, ``equals``, or
+            ``regex`` filters, which are combined when more than one is given.
+        selector_weights: Optional aggregate sampling mass for each selected
+            metadata label in a mosaic donor pool. Keys must exactly match the
+            selected labels, values must be positive and sum to one, and each
+            group's mass is divided equally among its donors. These weights do
+            not define ``msprime_tracts`` source-ancestry proportions.
+        engine: Simulation engine, either ``"mosaic"`` or
+            ``"msprime_tracts"``. Mosaic populations copy donor haplotype
+            tracts directly; msprime-tract populations first simulate source
+            ancestry tracts and then copy from their configured source panels.
+        msprime: Source populations, ancestry weights, timing, and ancestry
+            output settings for ``engine="msprime_tracts"``. It is required
+            for that engine and forbidden for ``engine="mosaic"``.
+        donor_only: Keep a mosaic population as a selectable donor/source
+            panel but exclude it from synthetic outputs, merge, and QC. This
+            mode is not valid for ``engine="msprime_tracts"``.
+
+    Notes:
+        ``selector`` is required for mosaic populations. ``selector_weights``
+        affects mosaic donor sampling; when a weighted mosaic population is
+        used as an msprime source, Forgephast warns that within-source donor
+        weights are ignored by the current msprime tract-copying engine.
+    """
+
     name: str
     n_diploids: int
     selector: Any | None = None
@@ -288,15 +323,6 @@ class OutputConfig:
 
 
 @dataclass
-class RuntimeConfig:
-    synthetic_premerge_rr_enabled: bool = False
-
-    def validate(self) -> None:
-        if not isinstance(self.synthetic_premerge_rr_enabled, bool):
-            raise ValueError("runtime.synthetic_premerge_rr_enabled must be a boolean")
-
-
-@dataclass
 class QcConfig:
     pairwise_fst_sets: list[list[str]] | None = None
     within_pop_split_checks: list[str] | None = None
@@ -376,7 +402,6 @@ class QcConfig:
     roh_max_variants: int = 100000
     roh_min_segment_cm: float = 1.5
     roh_max_gap_cm: float = 0.25
-    roh_hist_n_bins: int = 60
 
     engine_aware_gating: bool = True
     msprime_source_weight_abs_tolerance: float = 0.05
@@ -466,8 +491,6 @@ class QcConfig:
         _check_positive(self.roh_max_variants, "qc.roh_max_variants")
         _check_positive(self.roh_min_segment_cm, "qc.roh_min_segment_cm")
         _check_positive(self.roh_max_gap_cm, "qc.roh_max_gap_cm")
-        if self.roh_hist_n_bins < 5:
-            raise ValueError("qc.roh_hist_n_bins must be >= 5")
 
         if self.hwe_min_maf <= 0.0 or self.hwe_min_maf >= 0.5:
             raise ValueError("qc.hwe_min_maf must be in (0.0, 0.5)")
@@ -507,7 +530,6 @@ class RunConfig:
     simulation: SimulationConfig
     outputs: OutputConfig
     qc: QcConfig = field(default_factory=QcConfig)
-    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     def validate(self) -> None:
         if not self.name:
@@ -541,7 +563,6 @@ class RunConfig:
         self.simulation.validate()
         self.outputs.validate()
         self.qc.validate()
-        self.runtime.validate()
 
     @property
     def run_root(self) -> Path:
@@ -656,6 +677,11 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
             f"Unsupported top-level config section(s): {joined}. "
             "Benchmark/calibration were removed from core; use scripts/legacy."
         )
+    if "runtime" in data:
+        raise ValueError(
+            "The top-level runtime section was removed; "
+            "runtime.synthetic_premerge_rr_enabled never controlled Forgephast execution"
+        )
 
     input_cfg = _construct_dataclass("input", InputConfig, data["input"])
     populations_raw = data["populations"]
@@ -715,12 +741,15 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
             "qc.synthetic_rr_min_cpus_per_match was removed; "
             "use qc.synthetic_shard_round_robin_min_cpus_per_match"
         ),
+        "roh_hist_n_bins": (
+            "qc.roh_hist_n_bins was removed because the ROH implementation does not "
+            "produce a configurable histogram"
+        ),
     }
     for key, message in removed_qc_keys.items():
         if key in qc_raw:
             raise ValueError(message)
     qc_cfg = _construct_dataclass("qc", QcConfig, qc_raw)
-    runtime_cfg = _construct_dataclass("runtime", RuntimeConfig, _optional_section(data, "runtime"))
 
     cfg = RunConfig(
         name=data.get("name", "population_amplifier_run"),
@@ -729,7 +758,6 @@ def from_dict(data: dict[str, Any]) -> RunConfig:
         simulation=sim_cfg,
         outputs=outputs_cfg,
         qc=qc_cfg,
-        runtime=runtime_cfg,
     )
     cfg.validate()
     return cfg
