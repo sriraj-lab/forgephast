@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-accel = ["numba>=0.61"]
+accel = ["numba>=0.61", "tbb>=2021.6"]
 msprime = ["msprime>=1.3", "tskit>=0.6"]
 dev = ["pytest>=8.0", "pytest-benchmark>=4.0"]
 

@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 import yaml
-from rajlab_utils.popgen import normalize_chrom
+from hapstore.chrom import normalize_chrom
 
 from ..hapstore_contract import (
     HAPSTORE_MISSING_SENTINEL,

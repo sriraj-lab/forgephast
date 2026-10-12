@@ -12,6 +12,13 @@ import pysam
 
 @dataclass
 class VariantTable:
+    """Aligned, variant-major metadata for one chromosome panel.
+
+    All fields preserve a shared source-variant order. ``pos`` stores integer
+    base-pair positions; ``vid``, ``ref``, and ``alt`` have one entry per
+    position.
+    """
+
     chrom: str
     pos: np.ndarray
     vid: list[str]
@@ -37,7 +44,12 @@ def convert_hapstore_to_pgen(
     chrom: int | str,
     variant_block_size: int = 8192,
 ) -> Path:
-    """Convert HapStore directly to PGEN using hapstore fast path."""
+    """Export one HapStore chromosome directly to a validated PGEN triplet.
+
+    The bridge requires biallelic variants and fails on partially missing
+    genotype pairs. It verifies that ``.pgen``, ``.pvar``, and ``.psam`` were
+    written before returning the output prefix.
+    """
     out_prefix = Path(out_prefix)
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     if int(variant_block_size) <= 0:

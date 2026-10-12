@@ -15,6 +15,15 @@ from .metrics.fst import (
 from .policy_support import pair_key
 
 
+def _fst_donor_population(config: RunConfig, population: str) -> str:
+    """Resolve a single-source msprime output to its actual mosaic donor pool."""
+    for spec in config.populations:
+        if spec.name == population and spec.engine == "msprime_tracts":
+            if spec.msprime is not None and len(spec.msprime.sources) == 1:
+                return str(spec.msprime.sources[0].population)
+    return population
+
+
 def normalized_donor_weights(
     donor_ids: list[str],
     weights_by_donor: dict[str, float] | None,
@@ -119,8 +128,11 @@ def donor_baseline_fst_impl(
     per_pop_genotypes: dict[str, np.ndarray] = {}
     per_pop_weights: dict[str, np.ndarray] = {}
     for pop in needed_pops:
-        donor_ids = list(donors[pop])
-        source_kind, source_path = resolve_donor_panel_source_for_population_fn(config, chrom, pop)
+        donor_pop = _fst_donor_population(config, pop)
+        donor_ids = list(donors.get(donor_pop, []))
+        if not donor_ids:
+            raise ValueError(f"No donor samples for FST baseline population {pop!r} (source {donor_pop!r})")
+        source_kind, source_path = resolve_donor_panel_source_for_population_fn(config, chrom, donor_pop)
         donor_pos, donor_haps = load_sample_haplotypes_from_panel_fn(
             config=config,
             source_path=source_path,
@@ -134,7 +146,8 @@ def donor_baseline_fst_impl(
         )
         per_pop_weights[pop] = normalized_donor_weights(
             donor_ids,
-            donor_weights.get(pop),
+            # msprime copying is uniform within a source, unlike weighted mosaic copying.
+            donor_weights.get(pop) if donor_pop == pop else None,
         )
 
     common_pos = per_pop_pos[needed_pops[0]]
@@ -180,7 +193,8 @@ def resolve_fst_stochastic_gate_activation_impl(
     sampled_diploids: dict[str, int] = {}
     sampled_fraction_by_population: dict[str, float] = {}
     for pop in pop_names:
-        donor_n = len({str(x) for x in donors_by_population.get(pop, [])})
+        donor_pop = _fst_donor_population(config, pop)
+        donor_n = len({str(x) for x in donors_by_population.get(donor_pop, [])})
         synth_n = len({str(x) for x in groups.get(pop, [])})
         sampled_n = min(int(synth_n), int(sampled_cap))
         donor_sizes[pop] = int(donor_n)
@@ -244,7 +258,8 @@ def compute_stochastic_donor_fst_gate_impl(
     per_pop_genotypes: dict[str, np.ndarray] = {}
     per_pop_weights: dict[str, np.ndarray] = {}
     for pop in pop_names:
-        donor_ids_all = sorted({str(x) for x in donors_by_population.get(pop, [])})
+        donor_pop = _fst_donor_population(config, pop)
+        donor_ids_all = sorted({str(x) for x in donors_by_population.get(donor_pop, [])})
         donor_n = len(donor_ids_all)
         donor_sizes[pop] = int(donor_n)
         if donor_n == 0:
@@ -279,7 +294,7 @@ def compute_stochastic_donor_fst_gate_impl(
             }
         n_target_by_pop[pop] = int(n_target)
 
-        source_kind, source_path = resolve_donor_panel_source_for_population_fn(config, chrom, pop)
+        source_kind, source_path = resolve_donor_panel_source_for_population_fn(config, chrom, donor_pop)
         donor_pos, donor_haps = load_sample_haplotypes_from_panel_fn(
             config=config,
             source_path=source_path,
@@ -300,7 +315,7 @@ def compute_stochastic_donor_fst_gate_impl(
         per_pop_genotypes[pop] = np.asarray(donor_genotypes, dtype=np.uint8, copy=False)
         per_pop_weights[pop] = normalized_donor_weights(
             donor_ids_all,
-            donor_weights_by_population.get(pop),
+            donor_weights_by_population.get(pop) if donor_pop == pop else None,
         )
 
     common_pos = per_pop_pos[pop_names[0]]

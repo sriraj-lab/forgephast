@@ -1,4 +1,9 @@
-"""Command-line interface for population-amplifier."""
+"""CLI adapter for the FORGEPHAST amplification workflow.
+
+YAML configuration defines scientific semantics. This layer selects a workflow
+stage, permits narrow runtime overrides, configures logging, and reports
+durable output paths and timings.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +22,6 @@ from .api import (
 from .utils import resolve_log_file_path, setup_logging
 
 logger = logging.getLogger(__name__)
-
 
 
 def _parse_args() -> argparse.Namespace:
@@ -101,6 +105,7 @@ def _parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+
 def _resolve_log_level(value: str | None) -> int | None:
     if value is None:
         return None
@@ -124,8 +129,8 @@ def _resolve_log_level(value: str | None) -> int | None:
         raise ValueError(f"Invalid --log-level: {value!r}") from exc
 
 
-
 def main() -> None:
+    """Run one workflow stage and log its durable result summary."""
     args = _parse_args()
     config_path = getattr(args, "config", None)
     log_file = resolve_log_file_path(

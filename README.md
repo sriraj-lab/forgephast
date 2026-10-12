@@ -27,6 +27,18 @@ Amplifier now has one simulation path: the shard-pool engine.
 - The separate public `simulate-pool` command/API no longer exists.
 - Runtime defaults for shard count, worker count, threads-per-task, and task start method live under `simulation.n_shards`, `simulation.task_workers`, `simulation.threads_per_task`, and `simulation.task_start_method`.
 
+### Numba acceleration and multiprocessing
+
+Install `forgephast[accel]` for Numba acceleration and its TBB threading backend.
+Numba normally prefers TBB when available. Before starting a `fork` worker pool,
+FORGEPHAST checks the actual selected backend and rejects Linux OpenMP, which is
+not fork-safe and can otherwise leave the pool hanging. If OpenMP is already
+initialized, restart Python with `NUMBA_THREADING_LAYER=tbb` after installing
+the extra, or use `simulation.task_start_method: spawn`. Setting
+`NUMBA_THREADING_LAYER=workqueue` before starting Python is also supported.
+TBB-backed `fork` pools must be launched from the main thread. The check does
+not change the configured backend or start method automatically.
+
 ### Publication TODO: `msprime_tracts` shard parallelism
 
 Current limitation:

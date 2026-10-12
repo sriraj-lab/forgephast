@@ -10,6 +10,8 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import shutil
+import sys
+import threading
 from time import perf_counter
 from typing import Any
 
@@ -155,7 +157,7 @@ def _write_vcf_from_hapstore(
     )
 
 try:
-    from numba import njit, prange, set_num_threads
+    from numba import get_num_threads, njit, prange, set_num_threads, threading_layer
 
     HAS_NUMBA = True
 except Exception:  # pragma: no cover - fallback path tested without numba dependency
@@ -163,6 +165,34 @@ except Exception:  # pragma: no cover - fallback path tested without numba depen
     njit = None
     prange = range
     set_num_threads = None
+    get_num_threads = None
+    threading_layer = None
+
+
+def _check_numba_fork_backend(task_start_method: str) -> None:
+    """Reject unsafe Numba/fork combinations before creating pool workers.
+
+    Resolve the actual backend, including a previously initialized runtime;
+    merely having TBB installed does not guarantee that Numba selected it.
+    """
+    if task_start_method != "fork" or not HAS_NUMBA:
+        return
+    get_num_threads()
+    backend = threading_layer()
+    logger.info("simulate-pool numba threading_layer=%s start_method=fork", backend)
+    if backend == "omp" and sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "Numba selected the OpenMP threading layer, which is not fork-safe on Linux. "
+            "Install forgephast[accel] (includes TBB) and restart Python with "
+            "NUMBA_THREADING_LAYER=tbb, or use simulation.task_start_method: spawn. "
+            "NUMBA_THREADING_LAYER=workqueue is another option before starting Python. "
+            "No simulation worker pool was started."
+        )
+    if backend == "tbb" and threading.current_thread() is not threading.main_thread():
+        raise RuntimeError(
+            "Numba/TBB fork workers must be launched from the main thread. "
+            "Use simulation.task_start_method: spawn when calling simulation from another thread."
+        )
 
 
 if HAS_NUMBA:
@@ -1736,6 +1766,7 @@ def simulate_chromosome_population_shard_pool(
             for args in task_args:
                 _record_task_result(_simulate_population_shard_task(args))
         else:
+            _check_numba_fork_backend(task_start_method)
             ctx = mp.get_context(task_start_method)
             root_logger = logging.getLogger()
             queue_listener = None

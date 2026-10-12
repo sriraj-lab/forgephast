@@ -49,6 +49,12 @@ def write_json(path: str | Path, payload: dict[str, Any]) -> None:
 
 
 def apply_selector(series: pd.Series, selector: Any) -> pd.Series:
+    """Return the rows selected by a scalar, membership list, or mapping.
+
+    Mapping ``values``, ``equals``, and ``regex`` constraints are combined with
+    logical AND. A list performs membership selection; a scalar performs exact
+    string equality.
+    """
     values = series.astype(str)
 
     if isinstance(selector, dict):
@@ -70,11 +76,18 @@ def apply_selector(series: pd.Series, selector: Any) -> pd.Series:
 
 
 def derived_seed(base_seed: int, *parts: object) -> int:
+    """Derive a stable 31-bit child seed from a base seed and identity parts."""
     return int(_shared_stable_seed(int(base_seed), *parts, bits=31))
 
 
 
 def shard_bounds(total: int, shard_id: int, n_shards: int) -> tuple[int, int]:
+    """Return zero-based ``(start, size)`` bounds for one exact shard partition.
+
+    Earlier shards receive one extra item when the total is not divisible by
+    ``n_shards``. Across all valid shard IDs, the returned intervals are
+    non-overlapping and cover exactly ``total`` items.
+    """
     if n_shards <= 0:
         raise ValueError("n_shards must be > 0")
     if shard_id < 0 or shard_id >= n_shards:
@@ -113,6 +126,13 @@ def resolve_log_file_path(
     explicit_log_dir: str | Path | None = None,
     disable_file_logging: bool = False,
 ) -> Path | None:
+    """Resolve the dedicated log path using argument, environment, and defaults.
+
+    File logging is disabled by the argument or ``POPAMP_DISABLE_FILE_LOG``.
+    Otherwise an explicit file takes precedence over ``POPAMP_LOG_FILE``;
+    directory selection then uses an explicit directory, ``POPAMP_LOG_DIR``,
+    or the configuration-derived default.
+    """
     if disable_file_logging or os.environ.get("POPAMP_DISABLE_FILE_LOG", "").strip() == "1":
         return None
 

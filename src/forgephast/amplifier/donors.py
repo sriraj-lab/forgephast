@@ -1,4 +1,4 @@
-"""Donor manifest construction from metadata selectors."""
+"""Resolve configured donor populations into reusable run-local artifacts."""
 
 from __future__ import annotations
 
@@ -16,6 +16,19 @@ from .utils import apply_selector, ensure_dir, read_table
 
 @dataclass
 class Manifest:
+    """Resolved donor pools and their persistent manifest artifacts.
+
+    Attributes:
+        manifest_path: Tabular donor membership and sampling-weight artifact.
+        donor_counts_path: Per-configured-population donor counts, including
+            zero-count ``msprime_tracts`` output populations.
+        donor_files: Per-population, one-sample-ID-per-line donor lists.
+        donors_by_population: Sorted donor IDs for each configured population.
+        donor_weights_by_population: Normalized sample-selection weights for
+            each donor pool. ``msprime_tracts`` output populations have empty
+            donor pools; their source pools are represented separately.
+    """
+
     manifest_path: Path
     donor_counts_path: Path
     donor_files: dict[str, Path]
@@ -32,6 +45,7 @@ def _input_fingerprint(path_value: str | None) -> dict[str, object] | None:
 
 
 def _manifest_identity(config: RunConfig) -> str:
+    """Hash the donor-defining configuration and input-file fingerprints."""
     return canonical_hash(
         {
             "input": asdict(config.input),
@@ -59,9 +73,19 @@ def _atomic_write_text(value: str, path: Path) -> None:
     finally:
         tmp_path.unlink(missing_ok=True)
 
-
-
 def build_manifest_from_config(config: RunConfig) -> Manifest:
+    """Resolve donor pools from metadata and persist their run-local manifest.
+
+    Mosaic populations select and weight donor IDs from the metadata table.
+    ``selector_weights`` allocates mass across metadata population groups and
+    assigns equal weight within each group. ``msprime_tracts`` output
+    populations instead validate the named source pools from which ancestry
+    tracts will later copy donor haplotypes.
+
+    The returned artifacts are keyed by a donor-defining identity that includes
+    the relevant configuration and input-file fingerprints. See
+    :func:`load_manifest` for cache reuse and validation behavior.
+    """
     run_root = ensure_dir(config.run_root)
     out_dir = ensure_dir(run_root / "manifests")
     identity_path = out_dir / "donor_manifest.forgephast.json"
@@ -77,6 +101,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
             f"population_column {config.input.population_column!r} not found in metadata"
         )
 
+    # Normalize before selection so persisted IDs and selector inputs agree.
     sample_col = config.input.sample_id_column
     pop_col = config.input.population_column
     metadata[sample_col] = metadata[sample_col].astype("string").fillna("").str.strip()
@@ -105,6 +130,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
     donors_by_population: dict[str, list[str]] = {}
     donor_weights_by_population: dict[str, dict[str, float]] = {}
 
+    # Mosaic populations own donor pools; msprime outputs reference those pools.
     for pop in config.populations:
         donors: list[str]
         if pop.engine == "msprime_tracts":
@@ -131,6 +157,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
                 for _, row in selected_meta.iterrows()
             }
             weights_by_donor: dict[str, float] = {}
+            # Convert group-level selector weights into normalized per-donor sampling weights
             if pop.selector_weights is None:
                 uniform_weight = 1.0 / float(len(donors))
                 weights_by_donor = {sid: uniform_weight for sid in donors}
@@ -178,6 +205,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
             for sid in donors
         )
 
+    # Every msprime ancestry source must resolve to a nonempty donor pool.
     for pop in config.populations:
         if pop.engine != "msprime_tracts":
             continue
@@ -190,6 +218,7 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
                     f"population {pop.name!r}: msprime source population {source_name!r} has zero donors"
                 )
 
+    # Write each artifact atomically, then publish the manifest identity receipt.
     if donor_rows:
         manifest_df = (
             pd.DataFrame(donor_rows)
@@ -237,9 +266,14 @@ def build_manifest_from_config(config: RunConfig) -> Manifest:
         donor_weights_by_population=donor_weights_by_population,
     )
 
-
-
 def load_manifest(config: RunConfig) -> Manifest:
+    """Load a matching donor manifest or rebuild it when its identity is stale.
+
+    A reusable manifest requires the expected schema, all companion artifacts,
+    and an identity matching the donor-defining configuration and input-file
+    fingerprints. Loaded donor weights are normalized again after table parse
+    to preserve their sampling-mass contract.
+    """
     out_dir = config.run_root / "manifests"
     manifest_path = out_dir / "donor_manifest.tsv"
     donor_counts_path = out_dir / "donor_counts.tsv"
