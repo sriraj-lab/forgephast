@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, List
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 
 
@@ -33,6 +34,50 @@ def _write_keep_file(phenotype_df: pd.DataFrame, out_path: Path) -> None:
     """Write normalized FID IID keep file."""
     keep = phenotype_df[["FID", "IID"]].copy()
     _atomic_to_csv(keep, out_path)
+
+
+def pleiotropy_summary(records: List[Dict[str, object]]) -> pd.DataFrame:
+    """Per replicate, cohort and cluster pair: target effect correlation and realized genetic correlation.
+
+    The realized value is the correlation of the two traits' GENETIC_FIXED_COMPONENT
+    over the cohort's samples, after LD and the private parts act.
+    """
+    groups: Dict[tuple, Dict[str, object]] = {}
+    for rec in records:
+        info = rec.get("pleiotropy") or {}
+        if not info:
+            continue
+        key = (int(rec["replicate"]), str(rec["cohort"]), str(info["cluster"]))
+        groups.setdefault(key, {"info": info, "traits": {}})["traits"][str(rec["architecture"])] = rec
+    rows = []
+    for (replicate, cohort, cluster), group in sorted(groups.items()):
+        info, members = group["info"], group["traits"]
+        traits = list(info["traits"])
+        for i, a in enumerate(traits):
+            for j in range(i + 1, len(traits)):
+                b = traits[j]
+                if a not in members or b not in members:
+                    continue
+                pa, pb = members[a]["phenotype_df"], members[b]["phenotype_df"]
+                if list(pa["IID"]) != list(pb["IID"]):
+                    raise ValueError(f"pleiotropy cluster {cluster}: sample order differs between {a} and {b}")
+                ga = pa["GENETIC_FIXED_COMPONENT"].to_numpy(dtype=float)
+                gb = pb["GENETIC_FIXED_COMPONENT"].to_numpy(dtype=float)
+                residual = info.get("residual_correlation")
+                rows.append({
+                    "replicate": replicate, "cohort": cohort, "cluster": cluster,
+                    "trait_a": a, "trait_b": b,
+                    "shared_fraction": info["shared_fraction"],
+                    "n_shared": info["n_shared"],
+                    "n_private_a": members[a]["pleiotropy"]["n_private"],
+                    "n_private_b": members[b]["pleiotropy"]["n_private"],
+                    "target_effect_correlation": float(info["effect_correlation"][i][j]),
+                    "target_residual_correlation": float(residual[i][j]) if residual is not None else 0.0,
+                    "realized_genetic_correlation": float(np.corrcoef(ga, gb)[0, 1]),
+                    "realized_residual_correlation": float(np.corrcoef(
+                        pa["RESIDUAL_COMPONENT"].to_numpy(dtype=float), pb["RESIDUAL_COMPONENT"].to_numpy(dtype=float))[0, 1]),
+                })
+    return pd.DataFrame(rows)
 
 
 def write_simulation_outputs(
@@ -369,6 +414,9 @@ def write_simulation_outputs(
     _atomic_to_csv(effects_df, truth_dir / "effect_sizes.tsv")
     _atomic_to_csv(component_df, truth_dir / "component_summary.tsv")
     _atomic_to_csv(effect_geometry_df, truth_dir / "effect_geometry.tsv")
+    pleiotropy_df = pleiotropy_summary(records)
+    if not pleiotropy_df.empty:
+        _atomic_to_csv(pleiotropy_df, truth_dir / "pleiotropy_summary.tsv")
     _atomic_to_csv(manifest_df, run_dir / "run_manifest.tsv")
     _atomic_write_json(
         {

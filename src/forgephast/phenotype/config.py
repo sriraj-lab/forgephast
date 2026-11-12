@@ -29,6 +29,8 @@ from .config_schema import (
     PathConfig,
     PgenExportConfig,
     PhenotypeConfig,
+    PleiotropyClusterConfig,
+    PleiotropyConfig,
     Plink2EngineConfig,
     RegenieEngineConfig,
     RoundTripPlotConfig,
@@ -54,6 +56,7 @@ class RunConfig:
     phenotype: PhenotypeConfig = field(default_factory=PhenotypeConfig)
     variance_budget: VarianceBudgetConfig = field(default_factory=VarianceBudgetConfig)
     background_genetic: BackgroundGeneticConfig = field(default_factory=BackgroundGeneticConfig)
+    pleiotropy: PleiotropyConfig = field(default_factory=PleiotropyConfig)
     pgen_export: PgenExportConfig = field(default_factory=PgenExportConfig)
     gwas: GwasConfig = field(default_factory=GwasConfig)
     roundtrip_validation: RoundTripValidationConfig = field(default_factory=RoundTripValidationConfig)
@@ -75,6 +78,10 @@ class RunConfig:
             raise ValueError("at least one architecture must be specified")
         for architecture in self.architectures:
             architecture.validate()
+        architecture_names = [architecture.name for architecture in self.architectures]
+        if len(set(architecture_names)) != len(architecture_names):
+            raise ValueError("architecture names must be unique")
+        self.pleiotropy.validate(architecture_names)
 
         self.causal_selection.validate()
 
@@ -233,6 +240,13 @@ class RunConfig:
                 "mode=compute_grm now requires background_genetic.variant_ids_file"
             )
         background_genetic = BackgroundGeneticConfig(**background_payload)
+        pleiotropy_payload = dict(payload.get("pleiotropy", {}))
+        unknown_pleiotropy_keys = sorted(set(pleiotropy_payload).difference({"clusters"}))
+        if unknown_pleiotropy_keys:
+            raise ValueError(f"Unknown pleiotropy config key(s): {unknown_pleiotropy_keys}")
+        pleiotropy = PleiotropyConfig(
+            clusters=[PleiotropyClusterConfig(**item) for item in pleiotropy_payload.get("clusters", [])]
+        )
         pgen_payload = dict(payload.get("pgen_export", {}))
         for legacy_key in ("ld_tag_mode", "ld_window_kb", "ld_r2"):
             if legacy_key in pgen_payload:
@@ -289,6 +303,7 @@ class RunConfig:
             phenotype=phenotype,
             variance_budget=variance_budget,
             background_genetic=background_genetic,
+            pleiotropy=pleiotropy,
             pgen_export=pgen_export,
             gwas=gwas,
             roundtrip_validation=roundtrip_validation,

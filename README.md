@@ -432,6 +432,53 @@ and `run_manifest.tsv`, along with `shift_tightness_tier`,
 `shift_tightness_fold_change_cap`, `shift_tightness_fold_change_max_kept`,
 `shift_tightness_pre_filter_count`, and `shift_tightness_post_filter_count`.
 
+### Pleiotropic trait clusters
+
+Every architecture in a run already draws its effects for the same replicate
+causal set V; without clusters those effects are independent. A `pleiotropy`
+section makes groups of architectures correlated traits:
+
+```yaml
+pleiotropy:
+  clusters:
+    - name: C1
+      traits: [C1_a, C1_b, C1_c]          # architecture names in this run
+      shared_fraction: 0.6                # share of V causal for every trait
+      effect_correlation: [[1, .8, .8], [.8, 1, .8], [.8, .8, 1]]
+      residual_correlation: [[1, .2, .2], [.2, 1, .2], [.2, .2, 1]]   # optional
+      random_seed: 11
+```
+
+Per replicate, V is split into a shared part S (`round(shared_fraction * |V|)`
+variants) and one private part per trait (the rest, dealt out in near-equal
+shares). Trait k is causal on S and its own private part. Each trait first draws
+effects exactly as an unclustered architecture would (same seed, MAF scaling and
+population jitter). On S the draws are then mixed with the lower Cholesky factor
+L of `effect_correlation`, after dividing by each trait's base effect SD:
+`beta_k = sd_k * sum_l L[k, l] * beta_l / sd_l`, for every population column.
+Consequences:
+
+- The first trait listed keeps its own draw; a cluster with
+  `shared_fraction: 1` and an identity matrix reproduces the independent run
+  exactly.
+- Each trait keeps its own effect SD and population geometry; between traits,
+  effects on S correlate at `effect_correlation` (exactly 1 and negative values
+  are allowed).
+- Heritability scaling is one scalar per trait, so it does not change the
+  correlation. Each trait still hits its own `h2`.
+- Each trait has `|S| + |V \ S| / K` causal variants, fewer than |V|. Size the
+  causal buckets so this matches the polygenicity you want.
+- The genetic correlation is roughly `effect_correlation * |S| / (|S| + private)`
+  for equal-variance effects, and shifts with LD. It is reported, not imposed.
+- `residual_correlation` mixes the traits' unit-variance residual draws the same
+  way. The covariate component is shared by every trait in a run.
+
+Outputs: `causal_membership.tsv` and `effect_sizes.tsv` keep only each trait's
+causal variants, with `pleiotropy_cluster` and `pleiotropy_role`
+(`shared`/`private`) in the membership table. `truth/pleiotropy_summary.tsv`
+reports, per replicate, cohort and trait pair, the shared and private counts,
+the targets, and the realized genetic and residual correlations.
+
 ## Phenotype performance TODO
 
 The current phenotype runtime exposes useful I/O and chunking knobs:

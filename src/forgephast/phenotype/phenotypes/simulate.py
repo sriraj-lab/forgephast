@@ -24,7 +24,9 @@ from ..effects.betas import (
     build_variant_scale_by_maf,
     resolve_effect_geometry,
     sample_population_specific_betas,
+    _resolve_base_beta_sd,
 )
+from ..effects.pleiotropy import cluster_roles, mix_cluster_betas, mix_cluster_residuals
 from .background import (
     _build_background_component,
     _exclude_causal_grm_variants,
@@ -216,6 +218,51 @@ def run_simulation(
         )
         _timed("simulate.variant_scale_by_maf", t_membership, replicate=int(replicate))
 
+        def _beta_seed(architecture_name: str) -> int:
+            return (
+                run_cfg.effect_model.random_seed
+                + 1000 * replicate
+                + _stable_string_seed(architecture_name)
+            )
+
+        def _effect_geometry(architecture) -> Dict[str, object]:
+            if architecture.name not in effect_geometry_cache:
+                effect_geometry_cache[architecture.name] = resolve_effect_geometry(run_cfg.effect_model)
+            return effect_geometry_cache[architecture.name]
+
+        # Pleiotropic clusters: one shared/private split per replicate and the
+        # members' effects mixed from their own unclustered draws (same seeds).
+        architecture_by_name = {a.name: a for a in run_cfg.architectures}
+        cluster_by_trait = {t: c for c in run_cfg.pleiotropy.clusters for t in c.traits}
+        roles_by_cluster = {}
+        clustered_betas: Dict[str, pd.DataFrame] = {}
+        for cluster in run_cfg.pleiotropy.clusters:
+            t_cluster = time.perf_counter()
+            roles = cluster_roles(variant_ids, cluster, replicate)
+            roles_by_cluster[cluster.name] = roles
+            members = [architecture_by_name[t] for t in cluster.traits]
+            draws = {
+                a.name: sample_population_specific_betas(
+                    variant_ids=variant_ids,
+                    architecture=a,
+                    effect_model=run_cfg.effect_model,
+                    replicate_seed=_beta_seed(a.name),
+                    variant_scale_by_id=variant_scale_by_id,
+                    resolved_geometry=_effect_geometry(a),
+                )
+                for a in members
+            }
+            sds = {a.name: _resolve_base_beta_sd(a, run_cfg.effect_model) for a in members}
+            clustered_betas.update(mix_cluster_betas(draws, sds, roles, cluster.effect_correlation))
+            _timed(
+                "simulate.pleiotropy_cluster",
+                t_cluster,
+                replicate=int(replicate),
+                cluster=str(cluster.name),
+                n_shared=int(roles.shared.sum()),
+                n_variants=int(len(variant_ids)),
+            )
+
         for cohort in run_cfg.cohorts:
             cohort_t0 = time.perf_counter()
             prepared = prepare_cohort_inputs(
@@ -284,28 +331,36 @@ def run_simulation(
                     chromosomes=run_cfg.chromosomes,
                 )
 
+            def _residual_seed(architecture_name: str) -> int:
+                return run_cfg.phenotype.random_seed + replicate + _stable_string_seed(architecture_name)
+
+            clustered_residual_raw: Dict[str, np.ndarray] = {}
+            for cluster in run_cfg.pleiotropy.clusters:
+                raw_draws = {
+                    t: np.random.default_rng(_residual_seed(t)).normal(0.0, 1.0, size=len(sample_ids))
+                    for t in cluster.traits
+                }
+                clustered_residual_raw.update(
+                    mix_cluster_residuals(raw_draws, cluster.traits, cluster.residual_correlation)
+                )
+
             for architecture in run_cfg.architectures:
                 plugin = create_plugin(architecture.plugin)
-                if architecture.name in effect_geometry_cache:
-                    effect_geometry = effect_geometry_cache[architecture.name]
-                else:
-                    effect_geometry = resolve_effect_geometry(run_cfg.effect_model)
-                    effect_geometry_cache[architecture.name] = effect_geometry
+                effect_geometry = _effect_geometry(architecture)
+                cluster = cluster_by_trait.get(architecture.name)
 
-                beta_seed = (
-                    run_cfg.effect_model.random_seed
-                    + 1000 * replicate
-                    + _stable_string_seed(architecture.name)
-                )
                 t_beta = time.perf_counter()
-                beta_df = sample_population_specific_betas(
-                    variant_ids=variant_ids,
-                    architecture=architecture,
-                    effect_model=run_cfg.effect_model,
-                    replicate_seed=beta_seed,
-                    variant_scale_by_id=variant_scale_by_id,
-                    resolved_geometry=effect_geometry,
-                )
+                if cluster is not None:
+                    beta_df = clustered_betas[architecture.name]
+                else:
+                    beta_df = sample_population_specific_betas(
+                        variant_ids=variant_ids,
+                        architecture=architecture,
+                        effect_model=run_cfg.effect_model,
+                        replicate_seed=_beta_seed(architecture.name),
+                        variant_scale_by_id=variant_scale_by_id,
+                        resolved_geometry=effect_geometry,
+                    )
                 _timed(
                     "simulate.sample_betas",
                     t_beta,
@@ -549,8 +604,11 @@ def run_simulation(
                 )
 
                 t_scale = time.perf_counter()
-                rng = np.random.default_rng(run_cfg.phenotype.random_seed + replicate + _stable_string_seed(architecture.name))
-                residual_raw = rng.normal(0.0, 1.0, size=len(sample_ids))
+                if cluster is not None:
+                    residual_raw = clustered_residual_raw[architecture.name]
+                else:
+                    rng = np.random.default_rng(_residual_seed(architecture.name))
+                    residual_raw = rng.normal(0.0, 1.0, size=len(sample_ids))
                 genetic_bg = _scale_component_to_variance(
                     genetic_bg_raw, targets["genetic_bg"]
                 )
@@ -659,6 +717,28 @@ def run_simulation(
                 membership_out = membership.copy()
                 membership_out["architecture"] = architecture.name
                 membership_out["cohort"] = cohort.name
+                pleiotropy_record: Dict[str, Any] = {}
+                if cluster is not None:
+                    # Persist only this trait's causal variants: shared plus its own private part.
+                    roles = roles_by_cluster[cluster.name]
+                    mask = roles.causal_mask(architecture.name)
+                    causal_ids = set(np.asarray(roles.variant_ids)[mask])
+                    keep = membership_out[variant_col].astype(str).isin(causal_ids).to_numpy()
+                    role_by_id = dict(zip(np.asarray(roles.variant_ids)[mask], roles.role_of(architecture.name)))
+                    membership_out = membership_out.loc[keep].copy()
+                    membership_out["pleiotropy_cluster"] = cluster.name
+                    membership_out["pleiotropy_role"] = membership_out[variant_col].astype(str).map(role_by_id)
+                    effects_out = effects_out.loc[effects_out["variant_id"].astype(str).isin(causal_ids)].copy()
+                    pleiotropy_record = {
+                        "cluster": cluster.name,
+                        "traits": list(cluster.traits),
+                        "shared_fraction": float(cluster.shared_fraction),
+                        "effect_correlation": [list(map(float, r)) for r in cluster.effect_correlation],
+                        "residual_correlation": None if cluster.residual_correlation is None
+                        else [list(map(float, r)) for r in cluster.residual_correlation],
+                        "n_shared": int(roles.shared.sum()),
+                        "n_private": int(mask.sum() - roles.shared.sum()),
+                    }
 
                 records.append(
                     {
@@ -698,6 +778,7 @@ def run_simulation(
                         ),
                         "tightness_summary": dict(bucketed_pool.tightness_summary),
                         "effect_geometry": effect_geometry,
+                        "pleiotropy": pleiotropy_record,
                     }
                 )
 

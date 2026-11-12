@@ -745,6 +745,85 @@ class BackgroundGeneticConfig:
             )
 
 
+def _correlation_matrix(value: Any, size: int, name: str) -> np.ndarray:
+    """Validate a symmetric, unit-diagonal, positive semidefinite correlation matrix."""
+    matrix = np.asarray(value, dtype=float)
+    if matrix.shape != (size, size) or not np.isfinite(matrix).all():
+        raise ValueError(f"{name}: finite {size}x{size} matrix required")
+    if not np.allclose(matrix, matrix.T, atol=1e-12):
+        raise ValueError(f"{name}: matrix must be symmetric")
+    if not np.allclose(np.diag(matrix), 1.0, atol=1e-12) or np.any(np.abs(matrix) > 1.0 + 1e-12):
+        raise ValueError(f"{name}: unit diagonal and entries in [-1, 1] required")
+    if float(np.linalg.eigvalsh(matrix).min()) < -1e-10:
+        raise ValueError(f"{name}: matrix must be positive semidefinite")
+    return matrix
+
+
+@dataclass
+class PleiotropyClusterConfig:
+    """A cluster of architectures that share causal variants and correlated effects.
+
+    Every architecture in one run already draws effects for the same replicate
+    causal set V. For a cluster of K traits, V is split once per replicate into a
+    shared part S (``round(shared_fraction * |V|)`` variants) and K disjoint
+    private parts of near-equal size; trait k is causal on S and its own private
+    part only. Each trait's effects are first drawn exactly as an unclustered
+    architecture would draw them. On S they are then mixed across traits with the
+    lower Cholesky factor L of ``effect_correlation`` after dividing by each
+    trait's base effect SD: beta_k = sd_k * sum_l L[k, l] * beta_l / sd_l, for
+    every population column. The first trait in ``traits`` therefore keeps its own
+    draw, the mixed effects keep each trait's population geometry, and their
+    correlation between traits is ``effect_correlation``. Heritability scaling
+    afterwards is one scalar per trait, so it leaves the correlation unchanged.
+    The genetic correlation also depends on LD and on the private parts; it is
+    reported, not imposed.
+
+    ``residual_correlation`` (optional) mixes the traits' raw residual draws the
+    same way. The covariate component is shared by every trait in a run.
+    """
+
+    name: str
+    traits: List[str]
+    effect_correlation: List[List[float]]
+    shared_fraction: float = 1.0
+    residual_correlation: Optional[List[List[float]]] = None
+    random_seed: int = 42
+
+    def validate(self) -> None:
+        _check_non_empty(self.name, "pleiotropy cluster name")
+        label = f"pleiotropy cluster {self.name}"
+        if len(self.traits) < 2 or len(set(self.traits)) != len(self.traits):
+            raise ValueError(f"{label}: at least two distinct traits required")
+        _check_in_range(float(self.shared_fraction), 0.0, 1.0, f"{label}: shared_fraction")
+        _correlation_matrix(self.effect_correlation, len(self.traits), f"{label}: effect_correlation")
+        if self.residual_correlation is not None:
+            _correlation_matrix(self.residual_correlation, len(self.traits), f"{label}: residual_correlation")
+
+
+@dataclass
+class PleiotropyConfig:
+    """Pleiotropic trait clusters; empty means every architecture is independent."""
+
+    clusters: List[PleiotropyClusterConfig] = field(default_factory=list)
+
+    def validate(self, architecture_names: List[str]) -> None:
+        names = [cluster.name for cluster in self.clusters]
+        if len(set(names)) != len(names):
+            raise ValueError("pleiotropy cluster names must be unique")
+        seen: Dict[str, str] = {}
+        known = set(architecture_names)
+        for cluster in self.clusters:
+            cluster.validate()
+            for trait in cluster.traits:
+                if trait not in known:
+                    raise ValueError(f"pleiotropy cluster {cluster.name}: unknown architecture {trait!r}")
+                if trait in seen:
+                    raise ValueError(
+                        f"architecture {trait!r} is in pleiotropy clusters {seen[trait]} and {cluster.name}"
+                    )
+                seen[trait] = cluster.name
+
+
 @dataclass
 class PgenExportConfig:
     """HapStore->PGEN export settings for downstream GWAS."""
